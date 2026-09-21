@@ -10,7 +10,7 @@ import { MemoryScanner } from '../src/adapters/scanner.ts';
 import { createMemoryStorageAdapter, detectLogosRuntime } from '../src/adapters/storage.ts';
 import { BEARER_SECRET_WARNING } from '../src/browser/purchases.ts';
 import { ConfigError, loadConfig } from '../src/config.ts';
-import type { Invoice, Observation, OrderStatus } from '../src/contracts/types.ts';
+import type { Invoice } from '../src/contracts/types.ts';
 import { startSeller } from '../src/seller/server.ts';
 
 export type CheckStatus = 'PASS' | 'FAIL' | 'SKIP';
@@ -95,6 +95,103 @@ function check(id: string, status: CheckStatus, detail: string): CheckResult {
   return { id, status, detail };
 }
 
+export type PaymentPath = {
+  scannerKind: 'memory' | 'wallet-read';
+  injectedObservation: boolean;
+  outputIndexKnown: boolean;
+};
+
+export function classifyPayment(path: PaymentPath): CheckResult {
+  if (path.scannerKind === 'memory' || path.injectedObservation || !path.outputIndexKnown) {
+    return check(
+      'payment',
+      'SKIP',
+      'MemoryScanner synthetic observation is not in-app settlement; faucet tx is chain evidence only. WalletRead not wired; output index unknown',
+    );
+  }
+  return check('payment', 'PASS', 'WalletRead compact-block settlement with known output index');
+}
+
+export type CheckoutPath = {
+  browserLaunched: boolean;
+  httpOnly: boolean;
+};
+
+export function classifyCheckout(path: CheckoutPath): CheckResult {
+  if (!path.browserLaunched || path.httpOnly) {
+    return check(
+      'checkout',
+      'SKIP',
+      'HTTP checkout is not open browser checkout / reopen same browser; Chromium was not launched',
+    );
+  }
+  return check('checkout', 'PASS', 'opened browser checkout and reopened the same browser');
+}
+
+export type ReplicaRetrievePath = {
+  twoNodesDetected: boolean;
+  originStopped: boolean;
+  retrieved: boolean;
+  reason?: string;
+};
+
+export function classifyReplicaRetrieve(path: ReplicaRetrievePath): CheckResult {
+  if (path.retrieved && path.originStopped) {
+    return check(
+      'replica-retrieve',
+      'PASS',
+      'ciphertext retrieved from independent replica after origin stop',
+    );
+  }
+  if (path.twoNodesDetected) {
+    return check(
+      'replica-retrieve',
+      'SKIP',
+      'two Logos nodes detected; origin was not stopped and replica retrieve was not attempted. Gate B independent retrieval remains 73 ciphertext bytes',
+    );
+  }
+  return check(
+    'replica-retrieve',
+    'SKIP',
+    path.reason ?? 'live two-node Logos is not proven in this run',
+  );
+}
+
+export function classifyReplica(path: ReplicaRetrievePath): CheckResult {
+  return { ...classifyReplicaRetrieve(path), id: 'replica' };
+}
+
+export type ChromiumPath = {
+  path: string | null;
+  launched: boolean;
+};
+
+export function classifyChromium(path: ChromiumPath): CheckResult {
+  if (!path.path) {
+    return check('chromium', 'SKIP', 'chromium not found');
+  }
+  if (!path.launched) {
+    return check('chromium', 'SKIP', `chromium present at ${path.path} but not launched for checkout`);
+  }
+  return check('chromium', 'PASS', path.path);
+}
+
+export type RecoverPath = {
+  usedInjectedObservation: boolean;
+  browserReopened: boolean;
+};
+
+export function classifyRecover(path: RecoverPath): CheckResult {
+  if (path.usedInjectedObservation || !path.browserReopened) {
+    return check(
+      'recover',
+      'SKIP',
+      'HTTP recover after seller restart is not reopen-same-browser; settlement was not observed by WalletRead',
+    );
+  }
+  return check('recover', 'PASS', 'reopened same browser and recovered without re-paying');
+}
+
 function parseNodeMajor(version: string): number {
   const match = /^v?(\d+)/.exec(version);
   return match ? Number(match[1]) : 0;
@@ -159,11 +256,12 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
   }
 
   const logos = input.logos;
-  if (!logos?.ok || logos.independentPeers !== true) {
-    checks.push(check('replica', 'SKIP', logos?.reason ?? 'live two-node Logos is not proven in this run'));
-  } else {
-    checks.push(check('replica', 'PASS', 'two Logos nodes with distinct peer ids (retrieval not yet proven)'));
-  }
+  checks.push(classifyReplica({
+    twoNodesDetected: logos?.ok === true && logos.independentPeers === true,
+    originStopped: false,
+    retrieved: false,
+    reason: logos?.reason,
+  }));
 
   if (input.tlsTerminatedByApp) {
     checks.push(check('origin', 'FAIL', 'this tree does not terminate TLS; do not claim an HTTPS origin'));
@@ -171,11 +269,7 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
     checks.push(check('origin', 'PASS', 'localhost HTTP origin; app does not terminate TLS'));
   }
 
-  if (!input.chromiumPath) {
-    checks.push(check('chromium', 'SKIP', 'chromium not found'));
-  } else {
-    checks.push(check('chromium', 'PASS', input.chromiumPath));
-  }
+  checks.push(classifyChromium({ path: input.chromiumPath ?? null, launched: false }));
 
   const networkLabel = ths?.network === 'Regtest' ? 'zakura/regtest' : 'unproven';
   return {
@@ -491,11 +585,11 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
       return { steps, timings, sizes };
     }
     const invoice = created.json as Invoice;
-    steps.push(check('checkout', 'PASS', 'HTTP checkout issued invoice; not a live Waku session'));
+    steps.push(classifyCheckout({ browserLaunched: false, httpOnly: true }));
 
     const payStarted = Date.now();
     const funded = await faucetOrchard(dashboard, 2, invoice.amountZat, `ssf-demo-${invoice.id}`);
-    let tx = await fetchTransaction(dashboard, funded.txid);
+    const tx = await fetchTransaction(dashboard, funded.txid);
     const faucetConfirmations = tx.confirmations;
     timings.scanMs = Date.now() - payStarted;
     if (tx.vinCount !== 0 || tx.voutCount !== 0 || tx.orchardActions <= 0) {
@@ -506,24 +600,8 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
     const confirmStarted = Date.now();
     if (tx.confirmations < POLICY_MIN_CONFIRMATIONS) {
       await mineBlocks(dashboard, POLICY_MIN_CONFIRMATIONS - tx.confirmations);
-      tx = await fetchTransaction(dashboard, funded.txid);
     }
     timings.confirmMs = Date.now() - confirmStarted;
-    const statusBody = asObject(await dashboardJson(dashboard, '/api/v1/status'), 'zakura status');
-    const node = asObject(statusBody.node, 'status.node');
-    const observation: Observation = {
-      outputId: `${funded.txid}:orchard`,
-      invoiceId: invoice.id,
-      amountZat: invoice.amountZat,
-      confirmations: tx.confirmations,
-      canonical: tx.inActiveChain,
-      receivedAt: Date.now(),
-      revision: {
-        id: tx.blockHash ?? asString(node.bestblockhash, 'bestblockhash'),
-        height: tx.height ?? asNumber(node.blocks, 'node.blocks'),
-      },
-    };
-    scanner.replaceSnapshot([observation], observation.revision, true, Date.now());
 
     const fulfillStarted = Date.now();
     await seller!.close();
@@ -535,18 +613,16 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
       messaging,
       storage,
     });
-    const statusAfterRestart = await postJson(seller.publicUrl, '/api/status', { orderId: invoice.orderId, proof });
-    const recover = await postJson(seller.publicUrl, '/api/recover', { orderId: invoice.orderId, proof });
+    await postJson(seller.publicUrl, '/api/status', { orderId: invoice.orderId, proof });
+    await postJson(seller.publicUrl, '/api/recover', { orderId: invoice.orderId, proof });
     timings.fulfillMs = Date.now() - fulfillStarted;
 
-    const orderStatus = statusAfterRestart.json as OrderStatus | null;
-    if (recover.status !== 200) {
-      steps.push(check('payment', faucetConfirmations >= 1 ? 'FAIL' : 'FAIL', `recover after restart ${recover.status}; faucetConfirmations=${faucetConfirmations} policy=${POLICY_MIN_CONFIRMATIONS} observed=${tx.confirmations}`));
-      steps.push(check('recover', 'FAIL', `buyer closed before delivery; restart recover failed (${recover.status})`));
-    } else {
-      steps.push(check('payment', 'PASS', `zakura/regtest orchard faucet txid recorded; faucetConfirmations=${faucetConfirmations} policy=${POLICY_MIN_CONFIRMATIONS} observed=${tx.confirmations}; destination-UA attribution; WalletRead not wired`));
-      steps.push(check('recover', 'PASS', `restart recover without re-paying; payment=${orderStatus?.payment ?? 'unknown'} delivery=${orderStatus?.delivery ?? 'unknown'}`));
-    }
+    steps.push(classifyPayment({
+      scannerKind: 'memory',
+      injectedObservation: false,
+      outputIndexKnown: false,
+    }));
+    steps.push(classifyRecover({ usedInjectedObservation: false, browserReopened: false }));
 
     const backup = await credentials.exportBackupMaterial(buyer.credentialId);
     if (!BEARER_SECRET_WARNING.includes('bearer secret')) {
@@ -561,13 +637,12 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
     }
     steps.push(check('cleared-recovery', 'SKIP', 'browser clear-state/no false recovery is tests/browser/recovery.spec.ts; this process has no IndexedDB'));
 
-    steps.push(check(
-      'replica-retrieve',
-      'SKIP',
-      preflight.logos?.ok
-        ? 'live new-CID replica retrieval skipped; origin node was not stopped (shared Logos runtime). Gate B independent retrieval remains 73 ciphertext bytes.'
-        : preflight.logos?.reason ?? 'live two-node Logos is not proven in this run',
-    ));
+    steps.push(classifyReplicaRetrieve({
+      twoNodesDetected: preflight.logos?.ok === true && preflight.logos.independentPeers === true,
+      originStopped: false,
+      retrieved: false,
+      reason: preflight.logos?.reason,
+    }));
     return {
       steps,
       timings,
