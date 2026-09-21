@@ -15,7 +15,7 @@ import { MemoryScanner } from '../../src/adapters/scanner.ts';
 import { createMemoryStorageAdapter } from '../../src/adapters/storage.ts';
 import { openPurchaseStore, type IDBFactoryLike } from '../../src/browser/purchases.ts';
 import { loadConfig, type RuntimeConfig } from '../../src/config.ts';
-import type { BrowserPurchase, Invoice } from '../../src/contracts/types.ts';
+import type { BrowserPurchase, Invoice, OrderStatus } from '../../src/contracts/types.ts';
 import { exportSellerBackup, restoreSellerBackup } from '../../src/seller/backup.ts';
 import { startSeller, type SellerServer } from '../../src/seller/server.ts';
 
@@ -350,11 +350,13 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
+  const storage = createMemoryStorageAdapter();
   const seller = await startSeller({
     config: env(dbPath),
     seedProduct: true,
     scanner,
     credentials,
+    storage,
     availability: { storageReplica: false },
   });
   servers.push(seller);
@@ -373,16 +375,92 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
 
   await seller.close();
   servers.pop();
+
+  const live = await startSeller({
+    config: env(dbPath),
+    seedProduct: false,
+    scanner,
+    credentials,
+    storage,
+  });
+  servers.push(live);
+
+  const unpaidCreated = await jsonRequest(live.publicUrl, '/api/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requestId: 'req-unpaid',
+      productVersion: 'book-v1',
+      buyerKeyId: buyer.buyerKeyId,
+      proof,
+    }),
+  });
+  expect(unpaidCreated.status).toBe(200);
+  const unpaidInvoice = JSON.parse(unpaidCreated.body) as Invoice;
+
+  const paidCreated = await jsonRequest(live.publicUrl, '/api/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requestId: 'req-paid-status',
+      productVersion: 'book-v1',
+      buyerKeyId: buyer.buyerKeyId,
+      proof,
+    }),
+  });
+  expect(paidCreated.status).toBe(200);
+  const paidInvoice = JSON.parse(paidCreated.body) as Invoice;
+  scanner.replaceSnapshot([{
+    outputId: 'out-paid-status',
+    invoiceId: paidInvoice.id,
+    amountZat: paidInvoice.amountZat,
+    confirmations: 10,
+    canonical: true,
+    receivedAt: Date.now(),
+    revision: { id: 'rev-10', height: 10 },
+  }], { id: 'rev-10', height: 10 }, true, Date.now());
+  const paidBefore = await jsonRequest(live.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: paidInvoice.orderId, proof }),
+  });
+  expect(paidBefore.status).toBe(200);
+  expect((JSON.parse(paidBefore.body) as OrderStatus).payment).toBe('confirmed');
+
+  scanner.setHealth({ healthy: false, caughtUp: false, checkedAt: Date.now() });
+  await live.close();
+  servers.pop();
   const restarted = await startSeller({
     config: env(dbPath),
     seedProduct: false,
     scanner,
     credentials,
-    availability: { scanner: false },
+    storage,
   });
   servers.push(restarted);
   const availability = await jsonRequest(restarted.publicUrl, '/api/availability');
   expect(JSON.parse(availability.body).scanner).toBe(false);
+
+  const unpaidStatus = await jsonRequest(restarted.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: unpaidInvoice.orderId, proof }),
+  });
+  expect(unpaidStatus.status).toBe(200);
+  const unpaidBody = JSON.parse(unpaidStatus.body) as OrderStatus;
+  expect(unpaidBody.payment).toBe('awaiting');
+  expect(['unavailable', 'stale']).toContain(unpaidBody.verification);
+
+  const paidStatus = await jsonRequest(restarted.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: paidInvoice.orderId, proof }),
+  });
+  expect(paidStatus.status).toBe(200);
+  const paidBody = JSON.parse(paidStatus.body) as OrderStatus;
+  expect(paidBody.payment).not.toBe('awaiting');
+  expect(paidBody.payment).toBe('confirmed');
+  expect(['unavailable', 'stale']).toContain(paidBody.verification);
 });
 
 test('seller backup restores into an isolated instance without spending keys or rewriting the buyer record', async () => {
