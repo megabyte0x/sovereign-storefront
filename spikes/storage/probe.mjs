@@ -3,6 +3,11 @@ import { writeFileSync, readFileSync, chmodSync, existsSync, rmSync, mkdirSync }
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { decrypt, encrypt, exportKey, generateKey } from "./crypto.mjs";
+import {
+  evaluateProbeStatus,
+  listenPortFromInit,
+  requireOriginalNodeStopped,
+} from "./evidence.mjs";
 import { startGateway } from "./gateway.mjs";
 import {
   CHUNK_SIZE,
@@ -241,12 +246,24 @@ async function main() {
   const peerB = resultValue(call(nodeB, "peerId"));
   const dirA = resultValue(call(nodeA, "dataDir"));
   const dirB = resultValue(call(nodeB, "dataDir"));
+  const listenPortA = listenPortFromInit(path.join(nodeA, "storage-init.json"));
+  const listenPortB = listenPortFromInit(path.join(nodeB, "storage-init.json"));
   evidence.module.libstorage = resultValue(call(nodeA, "version"));
   if (peerA === peerB) throw new Error("nodes share peer identity");
   if (dirA === dirB) throw new Error("nodes share data-dir");
   evidence.nodes = {
-    a: { peerIdPrefix: peerA.slice(0, 12), dataDirBasename: path.basename(dirA), listenPort: 18091 },
-    b: { peerIdPrefix: peerB.slice(0, 12), dataDirBasename: path.basename(dirB), listenPort: 18191 },
+    a: {
+      peerIdPrefix: peerA.slice(0, 12),
+      dataDirBasename: path.basename(dirA),
+      listenPort: listenPortA,
+      listenPortSource: "storage-init.json",
+    },
+    b: {
+      peerIdPrefix: peerB.slice(0, 12),
+      dataDirBasename: path.basename(dirB),
+      listenPort: listenPortB,
+      listenPortSource: "storage-init.json",
+    },
     identitySeparated: peerA !== peerB,
     storageSeparated: dirA !== dirB,
   };
@@ -265,9 +282,6 @@ async function main() {
   const cipherDigest = sha256(ciphertext);
   const plainDigest = sha256(PLAINTEXT);
 
-  const sizes = [
-    { label: "fixture", bytes: ciphertext.byteLength },
-  ];
   const memBefore = process.memoryUsage();
   evidence.sizes.push({
     label: "fixture-encrypt",
@@ -322,6 +336,7 @@ async function main() {
     stopWatcher.stop();
   }
   evidence.replica.originalNodeStopped = stopCompleted;
+  requireOriginalNodeStopped(stopCompleted);
 
   const replicaPath2 = path.join(dataDir, "downloads", "from-node-b-after-stop.bin");
   if (existsSync(replicaPath2)) rmSync(replicaPath2);
@@ -366,7 +381,27 @@ async function main() {
     await close();
   }
 
-  evidence.pass = true;
+  const verdict = evaluateProbeStatus({
+    originalNodeStopped: stopCompleted,
+    replicaDigestMatchAfterStop: true,
+    browserMatchesFixture: evidence.browser.matchesFixture === true,
+    localAesGcmMaxPlaintextBytes: evidence.crypto.maxPlaintextBytes,
+    sizeRuns: [
+      {
+        label: "fixture",
+        plaintextBytes: PLAINTEXT.byteLength,
+        ciphertextBytes: ciphertext.byteLength,
+        originUploadAccepted: Boolean(uploaded.acceptedSession),
+        independentReplicaAfterStop: true,
+        browserDecrypt: evidence.browser.decrypted === true,
+      },
+    ],
+  });
+  evidence.pass = verdict.pass;
+  evidence.status = verdict.status;
+  evidence.provenMaxBytes = verdict.provenMaxBytes;
+  evidence.firstReleaseMaxBytes = verdict.firstReleaseMaxBytes;
+  evidence.sizeNotes = verdict.sizeNotes;
   const outPath = path.join(here, "..", "results", "storage.json");
   writeFileSync(outPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o644 });
   console.log(JSON.stringify({ ok: true, outPath, cidPrefix: evidence.replica.upload.cidPrefix }, null, 2));

@@ -26,12 +26,14 @@
     "a": {
       "peerIdPrefix": "16Uiu2HAm93d",
       "dataDirBasename": "node-a",
-      "listenPort": 18091
+      "listenPort": 18091,
+      "listenPortSource": "storage-init.json"
     },
     "b": {
       "peerIdPrefix": "16Uiu2HAmJSS",
       "dataDirBasename": "node-b",
-      "listenPort": 18191
+      "listenPort": 18191,
+      "listenPortSource": "storage-init.json"
     },
     "identitySeparated": true,
     "storageSeparated": true
@@ -44,14 +46,6 @@
       "rssBytes": 57688064
     }
   ],
-  "firstReleaseMaxBytes": 73,
-  "sizeNotes": {
-    "independentRetrievalAndBrowserProvenBytes": 73,
-    "localAesGcmMaxPlaintextBytes": 8388608,
-    "streaming": false,
-    "largerOriginUploadsAcceptedBytes": [4096, 65536],
-    "largerReplicaRetrievalAfterOriginRestart": "not proven"
-  },
   "replica": {
     "connectAccepted": true,
     "upload": {
@@ -87,5 +81,14 @@
     "matchesFixture": true,
     "bytes": 41
   },
-  "pass": true
+  "pass": false,
+  "status": "partial",
+  "provenMaxBytes": 73,
+  "firstReleaseMaxBytes": 73,
+  "sizeNotes": {
+    "independentRetrievalAndBrowserProvenBytes": 73,
+    "localAesGcmMaxPlaintextBytes": 8388608,
+    "streaming": false,
+    "exercisedCiphertextBytes": [73]
+  }
 }

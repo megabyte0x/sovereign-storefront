@@ -40,18 +40,20 @@ $LOGOSCTL --config-dir ./runtime/node-a module load storage_module
 $LOGOSCTL --config-dir ./runtime/node-a call storage_module init @./runtime/node-a/storage-init.json
 $LOGOSCTL --config-dir ./runtime/node-a call storage_module start
 # start() true is acceptance; wait and query peerId/debug for a live node.
+# listen-port is probe-chosen in storage-init.json (node-a 18091, node-b 18191).
+# probe.mjs reads those values from storage-init.json; it does not assume live node status.
 
-node --test crypto.test.mjs gateway.test.mjs
+node --test crypto.test.mjs gateway.test.mjs evidence.test.mjs
 node probe.mjs
 ```
 
-Completion events (not call acceptance): `storageUploadDone`, `storageDownloadDone`, `storageStop`. `fetch()` is acceptance-only and is not used as replica proof.
+Completion events (not call acceptance): `storageUploadDone`, `storageDownloadDone`, `storageStop`. `fetch()` is acceptance-only and is not used as replica proof. If `storageStop` fails or times out, the probe exits without `afterOriginalStopped`.
 
 ## Size limit
 
 First release maximum for the independent-replica + browser path: **73 bytes ciphertext** (41 bytes plaintext). That is what this probe retrieved through node B after node A stopped, then decrypted in Chromium.
 
-Local AES-GCM rejects plaintext above 8 MiB. The implementation does **not** stream. 4 KiB and 64 KiB origin uploads were accepted on node A; replica retrieval of those sizes after origin restart was not proven.
+Local AES-GCM rejects plaintext above 8 MiB. The implementation does **not** stream. The committed probe uploads only the 73-byte fixture; progressive larger replica retrieval after origin stop was not run and is not claimed.
 
 ## Verdict: PARTIAL
 
