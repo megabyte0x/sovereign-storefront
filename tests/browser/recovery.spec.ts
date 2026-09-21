@@ -296,25 +296,42 @@ test('IndexedDB purchase survives closing and reopening a persistent browser con
       await ready(page);
       const recovered = await page.evaluate(async () => {
         const { purchases, fakeCredentials } = window.__ssf;
+        const credentials = fakeCredentials();
         const store = await purchases.openPurchaseStore({
           sellerOrigin: location.origin,
           sellerKeyId: 'seller-key-1',
-          credentials: fakeCredentials(),
+          credentials,
           persist: null,
           dbName: 'ssf-restart',
         });
         const loaded = await store.get('req-restart');
+        if (!loaded?.credentialId || !loaded.invoice) {
+          return {
+            requestId: loaded?.requestId ?? null,
+            productVersion: loaded?.productVersion ?? null,
+            hasInvoice: Boolean(loaded?.invoice),
+            credentialId: loaded?.credentialId ?? null,
+            proofBytes: 0,
+            verified: false,
+          };
+        }
+        const proof = await credentials.provePossession(loaded.credentialId);
+        const verified = await credentials.verifyPossession(loaded.invoice.buyerKeyId, proof);
         return {
-          requestId: loaded?.requestId ?? null,
-          productVersion: loaded?.productVersion ?? null,
-          hasInvoice: Boolean(loaded?.invoice),
-          credentialId: loaded?.credentialId ?? null,
+          requestId: loaded.requestId,
+          productVersion: loaded.productVersion,
+          hasInvoice: true,
+          credentialId: loaded.credentialId,
+          proofBytes: proof.byteLength,
+          verified,
         };
       });
       expect(recovered.requestId).toBe('req-restart');
       expect(recovered.productVersion).toBe('book-v1');
       expect(recovered.hasInvoice).toBe(true);
       expect(recovered.credentialId).toBeTruthy();
+      expect(recovered.proofBytes).toBeGreaterThan(0);
+      expect(recovered.verified).toBe(true);
     } finally {
       await second.close();
     }

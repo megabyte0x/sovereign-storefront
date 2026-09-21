@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { beginCheckout, paymentInstructions } from '../../src/browser/checkout.ts';
+import { openPurchaseStore, type IDBFactoryLike } from '../../src/browser/purchases.ts';
 import type {
   BrowserPurchase,
   CredentialAdapter,
@@ -179,6 +180,112 @@ test('a failed invoice save does not return payment instructions and can be repl
   expect(credentials.createPurchaseCredential).toHaveBeenCalledTimes(1);
   expect(invoice.productVersion).toBe('book-v1');
   expect((await store.get(draft.requestId))?.invoice).toEqual(invoice);
+});
+
+function memoryIndexedDB(): IDBFactoryLike {
+  const dbs = new Map<string, Map<string, unknown>>();
+  return {
+    open(name: string) {
+      if (!dbs.has(name)) {
+        dbs.set(name, new Map());
+      }
+      const rows = dbs.get(name)!;
+      const db = {
+        objectStoreNames: { contains: (storeName: string) => storeName === 'purchases' },
+        createObjectStore() {},
+        transaction() {
+          const tx = {
+            error: null as Error | null,
+            oncomplete: null as ((ev?: unknown) => void) | null,
+            onerror: null as ((ev?: unknown) => void) | null,
+            onabort: null as ((ev?: unknown) => void) | null,
+            objectStore() {
+              return {
+                put(value: { requestId: string }) {
+                  const req = { result: undefined as unknown, error: null, onsuccess: null as ((ev?: unknown) => void) | null, onerror: null as ((ev?: unknown) => void) | null };
+                  queueMicrotask(() => {
+                    rows.set(value.requestId, value);
+                    req.onsuccess?.();
+                    tx.oncomplete?.();
+                  });
+                  return req;
+                },
+                get(key: string) {
+                  const req = { result: rows.get(key) as unknown, error: null, onsuccess: null as ((ev?: unknown) => void) | null, onerror: null as ((ev?: unknown) => void) | null };
+                  queueMicrotask(() => req.onsuccess?.());
+                  return req;
+                },
+                getAll() {
+                  const req = { result: [...rows.values()] as unknown, error: null, onsuccess: null as ((ev?: unknown) => void) | null, onerror: null as ((ev?: unknown) => void) | null };
+                  queueMicrotask(() => req.onsuccess?.());
+                  return req;
+                },
+              };
+            },
+          };
+          return tx;
+        },
+        close() {},
+      };
+      const req = {
+        result: db,
+        error: null,
+        onsuccess: null as ((ev?: unknown) => void) | null,
+        onerror: null as ((ev?: unknown) => void) | null,
+        onupgradeneeded: null as ((ev?: unknown) => void) | null,
+      };
+      queueMicrotask(() => {
+        req.onupgradeneeded?.();
+        req.onsuccess?.();
+      });
+      return req;
+    },
+  };
+}
+
+test('hydrate/get of a mismatched seller row rejects instead of relabeling', async () => {
+  const indexedDB = memoryIndexedDB();
+  const credentials = mockCredentials();
+  const created = await credentials.createPurchaseCredential();
+  const record: BrowserPurchase = {
+    ...draft,
+    credentialId: created.credentialId,
+    orderId: null,
+    invoice: null,
+  };
+  const matching = await openPurchaseStore({
+    sellerOrigin: draft.sellerOrigin,
+    sellerKeyId: draft.sellerKeyId,
+    credentials,
+    indexedDB,
+    persist: null,
+    dbName: 'ssf-seller-mismatch',
+  });
+  await matching.save(record);
+
+  const mismatched = await openPurchaseStore({
+    sellerOrigin: 'http://attacker.example',
+    sellerKeyId: 'attacker-seller',
+    credentials,
+    indexedDB,
+    persist: null,
+    dbName: 'ssf-seller-mismatch',
+  });
+
+  let relabeledSeller: string | null = null;
+  let thrown = '';
+  try {
+    const loaded = await mismatched.get(draft.requestId);
+    relabeledSeller = loaded?.sellerOrigin ?? null;
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  }
+  expect(thrown).toMatch(/seller/i);
+  expect(relabeledSeller).toBeNull();
+
+  const stillOurs = await matching.get(draft.requestId);
+  expect(stillOurs?.sellerOrigin).toBe(draft.sellerOrigin);
+  expect(stillOurs?.sellerKeyId).toBe(draft.sellerKeyId);
 });
 
 test('expired unpaid invoices do not present ordinary payment instructions', () => {

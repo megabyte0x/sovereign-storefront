@@ -281,10 +281,20 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
     await done;
   }
 
+  function assertSameSeller(origin: string, keyId: string): void {
+    if (origin !== options.sellerOrigin) {
+      throw new Error('stored origin does not match this seller');
+    }
+    if (keyId !== options.sellerKeyId) {
+      throw new Error('stored seller identity does not match');
+    }
+  }
+
   async function hydrate(row: StoredPurchase): Promise<BrowserPurchase> {
     if (row.schemaVersion !== IDB_SCHEMA_VERSION) {
       throw new Error('unsupported purchase schema');
     }
+    assertSameSeller(row.sellerOrigin, row.sellerKeyId);
     let credentialId = restored.get(row.requestId) ?? row.credentialId;
     if (!restored.has(row.requestId) && row.credentialMaterial?.length) {
       const imported = await options.credentials.importBackupMaterial(
@@ -293,11 +303,16 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
       credentialId = imported.credentialId;
       restored.set(row.requestId, credentialId);
     }
-    return toPurchase({ ...row, credentialId, sellerOrigin: options.sellerOrigin, sellerKeyId: options.sellerKeyId });
+    return toPurchase({ ...row, credentialId });
   }
 
   const store: PurchaseStore = {
     async save(record: BrowserPurchase): Promise<void> {
+      assertSameSeller(record.sellerOrigin, record.sellerKeyId);
+      const existing = await readStored(record.requestId);
+      if (existing) {
+        assertSameSeller(existing.sellerOrigin, existing.sellerKeyId);
+      }
       const material = await options.credentials.exportBackupMaterial(record.credentialId);
       await writeStored({
         schemaVersion: IDB_SCHEMA_VERSION,
@@ -305,8 +320,8 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         requestId: record.requestId,
         orderId: record.orderId,
         productVersion: record.productVersion,
-        sellerOrigin: options.sellerOrigin,
-        sellerKeyId: options.sellerKeyId,
+        sellerOrigin: record.sellerOrigin,
+        sellerKeyId: record.sellerKeyId,
         credentialId: record.credentialId,
         invoice: record.invoice,
         credentialMaterial: Array.from(material),
