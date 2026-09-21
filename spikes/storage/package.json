@@ -1,0 +1,11 @@
+{
+  "name": "sovereign-storefront-storage-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test crypto.test.mjs gateway.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}
