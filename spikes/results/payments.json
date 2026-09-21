@@ -10,7 +10,7 @@
     "wallet_read_not_wired",
     "ufvk_omitted_from_accounts_0_2_1",
     "no_zip321_wallet_qr_or_open",
-    "zip321_encoder_rejects_uregtest1",
+    "live_output_index_unknown",
     "output_index_not_from_wallet_read",
     "not_public_testnet"
   ],
@@ -23,8 +23,16 @@
       "red": "AssertionError invoiceId inv-zakura-live !== null (amount-only)",
       "green": "pass"
     },
-    "tests": 20,
-    "passed": 20,
+    "uregtestZip321": {
+      "red": "Zip321Error network_forbidden address is not a testnet shielded receiver",
+      "green": "pass"
+    },
+    "liveOutputIndexUnknown": {
+      "red": "Error outputIndex must be a non-negative integer (indexUnknown omitted :0)",
+      "green": "pass"
+    },
+    "tests": 22,
+    "passed": 22,
     "command": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "selected": {
@@ -47,7 +55,8 @@
     "transparentFallback": true,
     "zeroConfirmationRelease": true,
     "zecscopeScannerPrototype": true,
-    "perInvoiceDestinationViaWalletRead": true
+    "perInvoiceDestinationViaWalletRead": true,
+    "fakeOrchardOutputIndexZero": true
   },
   "apiMapping": {
     "ChainRevision.height": ["WalletRead::chain_height", "WalletRead::block_fully_scanned"],
@@ -79,6 +88,8 @@
     "matchedDestinationReleased": true,
     "walletReadWired": false,
     "ufvkFromAccounts": false,
+    "liveOutputId": "txid:orchard",
+    "liveOutputIndexUnknown": true,
     "liveReceiptMapping": [
       "GET /api/v1/status",
       "GET /api/v1/accounts",
@@ -113,7 +124,10 @@
     "zip321EncoderMatchesPublicSpecExample": true,
     "qrObserved": false,
     "walletMemoPreservationObserved": false,
-    "uregtestRejectedByEncoder": true
+    "uregtestRejectedByEncoder": false,
+    "uregtestAcceptedByEncoder": true,
+    "transparentRejectedByEncoder": true,
+    "mainnetRejectedByEncoder": true
   },
   "runtime": {
     "node": "v26.9.0",

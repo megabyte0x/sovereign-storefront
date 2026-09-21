@@ -11,7 +11,7 @@ Can a viewing-only Zcash scanner attribute a shielded payment to one invoice, re
 1. Inspect `WalletRead` (docs.rs 0.24.0) and `ReceivedTransactionOutput` source. Do not invent SDK methods.
 2. Write the unmatched-output contract test first (TDD RED), then the reducer.
 3. Map the selected backend onto replayable snapshots rather than a live-only cursor.
-4. Encode ZIP-321 from the ZIP (testnet shielded only). Refuse transparent and mainnet.
+4. Encode ZIP-321 from the ZIP (testnet and regtest shielded). Refuse transparent and mainnet.
 5. Live zakura/regtest: unmatched equal-amount to the wrong UA must fail before destination matching is implemented.
 
 ## Selected backend
@@ -57,7 +57,7 @@ Seller-owned `ScanCheckpoint` advances only after `commitReconciliation`. Crash-
 
 ## Wallet URI / QR
 
-ZIP-321 encoder matches the public shielded example in ZIP-321. No QR render and no wallet open were observed in this environment.
+ZIP-321 encoder matches the public shielded example in ZIP-321 and accepts zakura/regtest `uregtest1` unified addresses. Transparent and mainnet addresses are still rejected. No QR render and no wallet open were observed in this environment.
 
 ## Rerun
 
@@ -76,19 +76,19 @@ Requires Node 26+ (type stripping). No extra packages. Live tests need a running
 - Probe `minConfirmations`: 1 (app default remains 10). Auto-mine on; extra blocks still increased confirmations.
 - Dashboard faucet accepts a memo; CLI `ths faucet` does not. Memo text is not logged.
 - GET `/accounts` omitted UFVK. WalletRead was not wired (no invented SDK). Receipts mapped through dashboard status/activity/transaction JSON onto `Observation` / `ScanHealth` / `ChainRevision`.
-- Output id uses `txid:orchard:0` because orchard faucet txs are padded; `WalletRead::output_index` was not available.
+- Output id for live receipts is `txid:orchard` with `indexUnknown: true`. Dashboard tx JSON has no `WalletRead::output_index`; the spike does not invent `:0` from orchard padding.
 
 ## Verdict: PASS (zakura/regtest only)
 
 ### What worked
 - Unmatched-output contract: RED (`releaseEligible true !== false`) then GREEN.
-- 18 deterministic tests plus 2 live zakura tests.
+- 20 deterministic tests plus 2 live zakura tests.
 - Live shielded receipt to the invoice UA released; equal amount to another account UA did not.
 - Honest WalletRead mapping, including the enumerate-history and live-wiring gaps.
 
 ### What didn't
 - No public testnet receipt.
-- No ZIP-321 wallet QR/open. Encoder still rejects `uregtest1` (testnet `utest1` only).
+- No ZIP-321 wallet QR/open. Encoder accepts `uregtest1` (zakura/regtest) and `utest1` / `ztestsapling1`; still rejects transparent and mainnet.
 - No UFVK + lightwalletd compact-block scan from this TypeScript spike.
 
 ### Surprises

@@ -4,6 +4,8 @@ import { encodeZip321, parseZip321, Zip321Error } from '../src/zip321.ts';
 
 const sapling =
   'ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez';
+const uregtest =
+  'uregtest1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
 
 test('encodes a testnet shielded ZIP-321 request with amount and memo', () => {
   const uri = encodeZip321({
@@ -20,6 +22,17 @@ test('encodes a testnet shielded ZIP-321 request with amount and memo', () => {
   assert.equal(parsed.address, sapling);
   assert.equal(parsed.amountZat, '100000000');
   assert.equal(parsed.memoUtf8, 'This is a simple memo.');
+});
+
+test('encodes a zakura/regtest unified address ZIP-321 request', () => {
+  const uri = encodeZip321({
+    address: uregtest,
+    amountZat: '1234567',
+  });
+  assert.equal(uri, `zcash:${uregtest}?amount=0.01234567`);
+  const parsed = parseZip321(uri);
+  assert.equal(parsed.address, uregtest);
+  assert.equal(parsed.amountZat, '1234567');
 });
 
 test('rejects transparent addresses; no transparent fallback', () => {

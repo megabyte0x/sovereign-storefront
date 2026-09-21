@@ -29,6 +29,8 @@ export type LiveReceipt = {
   nodeChain: string;
   network: string;
   outputId: string;
+  /** Dashboard tx JSON has no WalletRead output_index; do not invent :0. */
+  indexUnknown: true;
   amountZat: string;
   destinationUa: string;
   memoText: string | null;
@@ -252,8 +254,9 @@ export async function observeActivity(
     outputId: makeOutputId({
       txid: funded.txid,
       pool: 'orchard',
-      outputIndex: 0,
+      indexUnknown: true,
     }),
+    indexUnknown: true,
     amountZat: funded.amountZat,
     destinationUa,
     memoText: memosByTxid.get(funded.txid) ?? null,
@@ -284,6 +287,7 @@ export function attributeLiveOutput(
     canonical: receipt.canonical,
     receivedAt: receipt.receivedAt,
     revision: { ...receipt.revision },
+    indexUnknown: receipt.indexUnknown,
   };
 }
 

@@ -68,7 +68,7 @@ export const WALLET_READ_MAPPING = {
       'ScanHealth.caughtUp': 'wallet_sync.state=ready and fully_scanned_height == observed_height == node.blocks (stand-in for block_fully_scanned == chain_height)',
       'Observation.amountZat': 'POST /api/v1/faucet activity.amount_zatoshi (stand-in for ReceivedTransactionOutput::value)',
       'Observation.confirmations': 'GET /api/v1/transactions/{txid} confirmations (stand-in for get_received_outputs confirmations_policy)',
-      'Observation.outputId': 'txid:orchard:0 — orchard faucet txs are padded to two actions; without WalletRead::output_index the received-note index is not known',
+      'Observation.outputId': 'txid:orchard with indexUnknown=true — GET /api/v1/transactions/{txid} has no WalletRead::output_index; do not invent :0 from orchard padding',
       destination:
         'GET /api/v1/accounts unified_address for activity.to_account. Not a WalletRead ReceivedTransactionOutput field.',
       memo:

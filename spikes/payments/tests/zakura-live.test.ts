@@ -58,6 +58,8 @@ test(
 
     const receipt = await observeActivity(funded, accounts);
     assert.equal(receipt.networkLabel, 'zakura/regtest');
+    assert.equal(receipt.indexUnknown, true);
+    assert.match(receipt.outputId, /^[0-9a-f]{64}:orchard$/);
     assert.notEqual(receipt.destinationUa, invoice.destination);
 
     const observation = attributeLiveOutput(receipt, invoice);
@@ -71,6 +73,7 @@ test(
     );
 
     assert.equal(observation.invoiceId, null);
+    assert.equal(observation.indexUnknown, true);
     assert.equal(settlement.releaseEligible, false);
     assert.equal(settlement.backingOutputIds.length, 0);
     assert.ok(settlement.exceptions.some((record) => record.code === 'unmatched'));
@@ -110,6 +113,8 @@ test(
     assert.equal(receipt.network, 'Regtest');
     assert.equal(receipt.nodeChain, 'test');
     assert.equal(receipt.destinationUa, invoice.destination);
+    assert.equal(receipt.indexUnknown, true);
+    assert.match(receipt.outputId, /^[0-9a-f]{64}:orchard$/);
 
     const observation = attributeLiveOutput(receipt, invoice);
     let health = await loadZakuraHealth();
@@ -122,6 +127,7 @@ test(
     );
     assert.equal(LIVE_PROBE_POLICY.minConfirmations, 1);
     assert.equal(observation.invoiceId, invoice.id);
+    assert.equal(observation.indexUnknown, true);
     assert.equal(first.releaseEligible, true);
     assert.equal(first.payment, 'confirmed');
     assert.deepEqual(first.backingOutputIds, [observation.outputId]);

@@ -42,6 +42,8 @@ export type Observation = {
   canonical: boolean;
   receivedAt: number;
   revision: ChainRevision;
+  /** Set when outputId has no WalletRead output_index. Never invent :0. */
+  indexUnknown?: boolean;
 };
 
 export type ScanHealth = {

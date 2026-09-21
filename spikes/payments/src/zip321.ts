@@ -19,6 +19,7 @@ export type Zip321Request = {
 
 const SAPLING_TEST = /^ztestsapling1[0-9a-z]+$/;
 const UA_TEST = /^utest1[0-9a-z]+$/;
+const UA_REGTEST = /^uregtest1[0-9a-z]+$/;
 const TRANSPARENT = /^(t[13]|tm)[1-9A-HJ-NP-Za-km-z]+$/;
 const MAINNET_SHIELDED = /^(zs1|u1)[0-9a-z]+$/;
 
@@ -29,8 +30,8 @@ function assertTestnetShielded(address: string): void {
   if (MAINNET_SHIELDED.test(address) || address.startsWith('zs1') || address.startsWith('u1')) {
     throw new Zip321Error('network_forbidden', 'mainnet addresses are not allowed');
   }
-  if (!SAPLING_TEST.test(address) && !UA_TEST.test(address)) {
-    throw new Zip321Error('network_forbidden', 'address is not a testnet shielded receiver');
+  if (!SAPLING_TEST.test(address) && !UA_TEST.test(address) && !UA_REGTEST.test(address)) {
+    throw new Zip321Error('network_forbidden', 'address is not a testnet or regtest shielded receiver');
   }
 }
 

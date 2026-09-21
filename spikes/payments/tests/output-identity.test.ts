@@ -15,3 +15,15 @@ test('stable output identity includes pool and output position, not txid alone',
   assert.equal(parseOutputId(orchard1).pool, 'orchard');
   assert.equal(parseOutputId(orchard1).outputIndex, 1);
 });
+
+test('live identity omits output index when WalletRead output_index is unknown', () => {
+  const txid = 'ab'.repeat(32);
+  const id = makeOutputId({ txid, pool: 'orchard', indexUnknown: true });
+  assert.equal(id, `${txid}:orchard`);
+  assert.notEqual(id, `${txid}:orchard:0`);
+  const parsed = parseOutputId(id);
+  assert.equal(parsed.txid, txid);
+  assert.equal(parsed.pool, 'orchard');
+  assert.equal(parsed.indexUnknown, true);
+  assert.equal(parsed.outputIndex, undefined);
+});
