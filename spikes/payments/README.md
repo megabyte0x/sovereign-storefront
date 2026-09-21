@@ -1,6 +1,6 @@
 # Gate C spike: Zcash scanner, invoice attribution, wallet handoff
 
-Deterministic probe of the application `Scanner` / `ScanCheckpoint` / `ChainRevision` contract against documented `zcash_client_backend` 0.24.0 `WalletRead` APIs and ZIP-321. Live shielded testnet settlement was **not** executed.
+Deterministic probe of the application `Scanner` / `ScanCheckpoint` / `ChainRevision` contract against documented `zcash_client_backend` 0.24.0 `WalletRead` APIs and ZIP-321. Live shielded **zakura/regtest** receipts were observed. This is not public testnet evidence. Seed, UFVK, spending keys, payment URIs, and memos are not recorded here.
 
 ## Question
 
@@ -12,7 +12,7 @@ Can a viewing-only Zcash scanner attribute a shielded payment to one invoice, re
 2. Write the unmatched-output contract test first (TDD RED), then the reducer.
 3. Map the selected backend onto replayable snapshots rather than a live-only cursor.
 4. Encode ZIP-321 from the ZIP (testnet shielded only). Refuse transparent and mainnet.
-5. Attempt live testnet payment only if viewing capability, compatible wallet, and test funds exist.
+5. Live zakura/regtest: unmatched equal-amount to the wrong UA must fail before destination matching is implemented.
 
 ## Selected backend
 
@@ -66,27 +66,35 @@ cd spikes/payments
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-Requires Node 26+ (type stripping). No extra packages.
+Requires Node 26+ (type stripping). No extra packages. Live tests need a running thus-spoke-zakura 0.2.1 (`ths status --json`). Do not start or stop the stack from this spike. `ZAKURA_DASHBOARD` defaults to `http://127.0.0.1:32771`.
 
-## Live settlement
+## Live settlement (zakura/regtest)
 
-**BLOCKED.** This host has no zcashd/lightwalletd/zebrad, no testnet funds, no UFVK/viewing-only wallet data, and no Zashi/Zingo/YWallet binary. No fake txids were recorded.
+**Observed.** Fully shielded Orchard faucet payments on thus-spoke-zakura 0.2.1 / zakuracore/zakura 1.4.0. `node.chain` is `test`; `network` is `Regtest`. Not public testnet.
 
-## Verdict: PARTIAL
+- TDD: amount-only live attribution released an equal-amount payment to a different UA (`invoiceId` set). Destination matching then refused that payment and released only the invoice UA.
+- Probe `minConfirmations`: 1 (app default remains 10). Auto-mine on; extra blocks still increased confirmations.
+- Dashboard faucet accepts a memo; CLI `ths faucet` does not. Memo text is not logged.
+- GET `/accounts` omitted UFVK. WalletRead was not wired (no invented SDK). Receipts mapped through dashboard status/activity/transaction JSON onto `Observation` / `ScanHealth` / `ChainRevision`.
+- Output id uses `txid:orchard:0` because orchard faucet txs are padded; `WalletRead::output_index` was not available.
+
+## Verdict: PASS (zakura/regtest only)
 
 ### What worked
 - Unmatched-output contract: RED (`releaseEligible true !== false`) then GREEN.
-- 18 deterministic tests: attribution, checkpoint replay, health/revision gates, synthetic reorg, ZIP-321 testnet-only encoding.
-- Honest WalletRead mapping, including the enumerate-history gap.
+- 18 deterministic tests plus 2 live zakura tests.
+- Live shielded receipt to the invoice UA released; equal amount to another account UA did not.
+- Honest WalletRead mapping, including the enumerate-history and live-wiring gaps.
 
 ### What didn't
-- No real shielded testnet receipt.
-- No wallet memo/receiver preservation check.
-- No viewing-only scan against compact blocks.
+- No public testnet receipt.
+- No ZIP-321 wallet QR/open. Encoder still rejects `uregtest1` (testnet `utest1` only).
+- No UFVK + lightwalletd compact-block scan from this TypeScript spike.
 
 ### Surprises
 - `ReceivedTransactionOutput` does not store txid or recipient; identity and attribution must be assembled by the adapter.
 - `WalletRead` is not a receipt stream.
+- Dashboard `to_account` maps to a UA, which WalletRead received-output fields do not.
 
 ### Recommendation for the real build
-Keep random-memo attribution until a WalletWrite/sqlite probe proves per-invoice destination mapping. Do not treat this spike as Gate C pass. Unblock with testnet TAZ, a UFVK-only scanner process, and one installed ZIP-321 wallet.
+Keep random-memo as the WalletRead-compatible path. Live zakura destination-UA matching is dashboard-wallet evidence, not a WalletRead recipient field. Wire a UFVK-only scanner process before treating compact-block viewing as proven.

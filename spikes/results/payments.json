@@ -1,22 +1,30 @@
 {
   "gate": "C",
-  "status": "BLOCKED",
+  "status": "PASS_ZAKURA_REGTEST",
   "sanitized": true,
-  "liveSettlement": false,
+  "liveSettlement": true,
   "testnetTxidsDisclosed": false,
-  "blocked": [
-    "no_testnet_funds",
-    "no_viewing_only_wallet_data",
-    "no_lightwalletd_or_node",
-    "no_installed_zip321_wallet"
+  "publicTestnet": false,
+  "blocked": [],
+  "limitations": [
+    "wallet_read_not_wired",
+    "ufvk_omitted_from_accounts_0_2_1",
+    "no_zip321_wallet_qr_or_open",
+    "zip321_encoder_rejects_uregtest1",
+    "output_index_not_from_wallet_read",
+    "not_public_testnet"
   ],
   "tdd": {
     "unmatchedOutput": {
       "red": "AssertionError releaseEligible true !== false",
       "green": "pass"
     },
-    "tests": 18,
-    "passed": 18,
+    "liveUnmatchedDestination": {
+      "red": "AssertionError invoiceId inv-zakura-live !== null (amount-only)",
+      "green": "pass"
+    },
+    "tests": 20,
+    "passed": 20,
     "command": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "selected": {
@@ -30,7 +38,8 @@
     "spendingKeysInScanner": false,
     "buyerWalletIntended": "zashi-or-zodl",
     "buyerWalletVerified": false,
-    "attribution": "random-memo"
+    "attribution": "random-memo",
+    "liveAttribution": "destination-ua"
   },
   "rejected": {
     "amountOnlyMatching": true,
@@ -50,6 +59,33 @@
     "memo": "WalletRead::get_memo(NoteId)",
     "enumerateGap": "get_received_outputs requires txid; adapter snapshots scan results then replays from ScanCheckpoint"
   },
+  "liveZakura": {
+    "label": "zakura/regtest",
+    "nodeChain": "test",
+    "network": "Regtest",
+    "launcher": "ths 0.2.1",
+    "images": {
+      "app": "thus-spoke-zakura-app:0.2.1",
+      "lightwalletd": "lightwalletd:0.2.1",
+      "node": "zakuracore/zakura:1.4.0"
+    },
+    "autoMine": true,
+    "walletSyncCaughtUp": true,
+    "minConfirmations": 1,
+    "appDefaultMinConfirmations": 10,
+    "confirmationProgressionRecorded": true,
+    "shieldedOrchard": true,
+    "unmatchedEqualAmountDifferentUaReleased": false,
+    "matchedDestinationReleased": true,
+    "walletReadWired": false,
+    "ufvkFromAccounts": false,
+    "liveReceiptMapping": [
+      "GET /api/v1/status",
+      "GET /api/v1/accounts",
+      "POST /api/v1/faucet",
+      "GET /api/v1/transactions/{txid}"
+    ]
+  },
   "checkpoint": {
     "sellerOwned": true,
     "advanceAfterCommitOnly": true,
@@ -61,6 +97,7 @@
   "policy": {
     "network": "test",
     "minConfirmations": 10,
+    "liveProbeMinConfirmations": 1,
     "maxHealthAgeMs": 120000,
     "invoiceExpiryMs": 86400000,
     "latePayment": "review_required_no_silent_fulfill",
@@ -75,7 +112,8 @@
   "walletHandoff": {
     "zip321EncoderMatchesPublicSpecExample": true,
     "qrObserved": false,
-    "walletMemoPreservationObserved": false
+    "walletMemoPreservationObserved": false,
+    "uregtestRejectedByEncoder": true
   },
   "runtime": {
     "node": "v26.9.0",
