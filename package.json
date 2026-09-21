@@ -13,7 +13,8 @@
     "build:service": "tsc -p tsconfig.build.json && cp src/seller/schema.sql dist/service/seller/schema.sql",
     "test:browser": "playwright test",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "backup-check": "node --experimental-strip-types scripts/backup-check.ts"
+    "backup-check": "node --experimental-strip-types scripts/backup-check.ts",
+    "demo-check": "node --experimental-strip-types scripts/demo-check.ts"
   },
   "dependencies": {
     "@waku/message-encryption": "0.0.38",

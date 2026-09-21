@@ -2,9 +2,17 @@
 
 ## Status
 
-Research and product hypothesis; not an approved implementation plan.
+Research and product hypothesis (sections 1–10 below). A bounded MVP now exists on `feat/mvp-build` against the approved design. **Approval of the plan is not evidence the product works.** The live integrated demo did **not** overall pass. Skipped Waku, replica, and QR checks do not count as passing.
 
-The research inspected official documentation and competitor offerings. No end-to-end checkout, payment, storage failover, security audit, or scale benchmark has been executed. Customer demand, production readiness, and scale remain unvalidated.
+Setup and executed evidence (do not treat the research sections as proof):
+
+- [Runbook](docs/runbook.md) — setup, ports, key ownership, limits
+- [Design](docs/mvp-design.md) · [Design decisions](docs/design-decisions.md)
+- [Build plan](docs/mvp-build-plan.md)
+- [Integration gates A–C](docs/integration-report.md)
+- [Demo results](docs/demo-results.md)
+
+The research inspected official documentation and competitor offerings. Customer demand, production readiness, and scale remain unvalidated. Independent Logos replica retrieval is proven only at 73 ciphertext bytes. Live payments in this tree are zakura/regtest, not public testnet.
 
 ## Recommendation
 
