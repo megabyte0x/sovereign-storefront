@@ -1,0 +1,136 @@
+{
+  "gate": "C",
+  "status": "PASS_ZAKURA_REGTEST",
+  "sanitized": true,
+  "liveSettlement": true,
+  "testnetTxidsDisclosed": false,
+  "publicTestnet": false,
+  "blocked": [],
+  "limitations": [
+    "wallet_read_not_wired",
+    "ufvk_omitted_from_accounts_0_2_1",
+    "no_zip321_wallet_qr_or_open",
+    "live_output_index_unknown",
+    "output_index_not_from_wallet_read",
+    "not_public_testnet"
+  ],
+  "tdd": {
+    "unmatchedOutput": {
+      "red": "AssertionError releaseEligible true !== false",
+      "green": "pass"
+    },
+    "liveUnmatchedDestination": {
+      "red": "AssertionError invoiceId inv-zakura-live !== null (amount-only)",
+      "green": "pass"
+    },
+    "uregtestZip321": {
+      "red": "Zip321Error network_forbidden address is not a testnet shielded receiver",
+      "green": "pass"
+    },
+    "liveOutputIndexUnknown": {
+      "red": "Error outputIndex must be a non-negative integer (indexUnknown omitted :0)",
+      "green": "pass"
+    },
+    "tests": 22,
+    "passed": 22,
+    "command": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "selected": {
+    "scanner": "zcash_client_backend",
+    "scannerVersion": "0.24.0",
+    "persistence": "zcash_client_sqlite",
+    "persistenceVersion": "0.22.0",
+    "zip321Crate": "0.9.0",
+    "license": "MIT OR Apache-2.0",
+    "viewingOnly": true,
+    "spendingKeysInScanner": false,
+    "buyerWalletIntended": "zashi-or-zodl",
+    "buyerWalletVerified": false,
+    "attribution": "random-memo",
+    "liveAttribution": "destination-ua"
+  },
+  "rejected": {
+    "amountOnlyMatching": true,
+    "txidOnlyIdentity": true,
+    "transparentFallback": true,
+    "zeroConfirmationRelease": true,
+    "zecscopeScannerPrototype": true,
+    "perInvoiceDestinationViaWalletRead": true,
+    "fakeOrchardOutputIndexZero": true
+  },
+  "apiMapping": {
+    "ChainRevision.height": ["WalletRead::chain_height", "WalletRead::block_fully_scanned"],
+    "ChainRevision.id": ["WalletRead::get_block_hash", "WalletRead::get_max_height_hash"],
+    "ScanHealth.caughtUp": "block_fully_scanned equals chain_height and suggest_scan_ranges has no Verify gap",
+    "Observation.outputId": "txid + ReceivedTransactionOutput::pool_type + output_index",
+    "Observation.amountZat": "ReceivedTransactionOutput::value",
+    "Observation.confirmations": "get_received_outputs confirmations_policy",
+    "memo": "WalletRead::get_memo(NoteId)",
+    "enumerateGap": "get_received_outputs requires txid; adapter snapshots scan results then replays from ScanCheckpoint"
+  },
+  "liveZakura": {
+    "label": "zakura/regtest",
+    "nodeChain": "test",
+    "network": "Regtest",
+    "launcher": "ths 0.2.1",
+    "images": {
+      "app": "thus-spoke-zakura-app:0.2.1",
+      "lightwalletd": "lightwalletd:0.2.1",
+      "node": "zakuracore/zakura:1.4.0"
+    },
+    "autoMine": true,
+    "walletSyncCaughtUp": true,
+    "minConfirmations": 1,
+    "appDefaultMinConfirmations": 10,
+    "confirmationProgressionRecorded": true,
+    "shieldedOrchard": true,
+    "unmatchedEqualAmountDifferentUaReleased": false,
+    "matchedDestinationReleased": true,
+    "walletReadWired": false,
+    "ufvkFromAccounts": false,
+    "liveOutputId": "txid:orchard",
+    "liveOutputIndexUnknown": true,
+    "liveReceiptMapping": [
+      "GET /api/v1/status",
+      "GET /api/v1/accounts",
+      "POST /api/v1/faucet",
+      "GET /api/v1/transactions/{txid}"
+    ]
+  },
+  "checkpoint": {
+    "sellerOwned": true,
+    "advanceAfterCommitOnly": true,
+    "replay": "authoritative snapshot/rescan",
+    "crashBeforeCommitRecoveredSameOutput": true,
+    "paymentWhileStoppedRecovered": true,
+    "liveOnlyCursor": false
+  },
+  "policy": {
+    "network": "test",
+    "minConfirmations": 10,
+    "liveProbeMinConfirmations": 1,
+    "maxHealthAgeMs": 120000,
+    "invoiceExpiryMs": 86400000,
+    "latePayment": "review_required_no_silent_fulfill",
+    "healthCaughtUpRequiredForRelease": true,
+    "revisionMustCoverReceipt": true
+  },
+  "reorg": {
+    "kind": "synthetic",
+    "nonCanonicalReplacesChainState": true,
+    "publicTestnetReorgObserved": false
+  },
+  "walletHandoff": {
+    "zip321EncoderMatchesPublicSpecExample": true,
+    "qrObserved": false,
+    "walletMemoPreservationObserved": false,
+    "uregtestRejectedByEncoder": false,
+    "uregtestAcceptedByEncoder": true,
+    "transparentRejectedByEncoder": true,
+    "mainnetRejectedByEncoder": true
+  },
+  "runtime": {
+    "node": "v26.9.0",
+    "probeLanguage": "typescript-on-node-strip-types"
+  }
+}
