@@ -1,0 +1,89 @@
+{
+  "probe": "messaging",
+  "status": "passed_with_concerns",
+  "implementation": {
+    "transportPackage": "@waku/sdk",
+    "transportVersion": "0.0.36",
+    "encryptionPackage": "@waku/message-encryption",
+    "encryptionVersion": "0.0.38",
+    "utilsPackage": "@waku/utils",
+    "utilsVersion": "0.0.27",
+    "exportsUsed": [
+      "@waku/sdk:createLightNode",
+      "@waku/sdk:Protocols",
+      "@waku/sdk:DefaultNetworkConfig",
+      "@waku/message-encryption:generatePrivateKey",
+      "@waku/message-encryption:getPublicKey",
+      "@waku/message-encryption/ecies:createEncoder",
+      "@waku/message-encryption/ecies:createDecoder",
+      "DecodedMessage.verifySignature",
+      "@waku/utils:createRoutingInfo",
+      "@waku/utils/bytes:bytesToHex",
+      "@waku/utils/bytes:hexToBytes"
+    ],
+    "network": {
+      "name": "The Waku Network",
+      "clusterId": 1,
+      "numShardsInCluster": 8,
+      "bootstrap": "defaultBootstrap",
+      "buyerTransport": "secure WebSocket light node",
+      "sellerTransport": "same SDK light node (no private HTTP bypass)"
+    },
+    "chatBrowserSdk": null,
+    "credentialStore": "IndexedDB",
+    "credentialExport": "supported",
+    "credentialExportMethod": "JSON with privateKeyHex/publicKeyHex via @waku/utils/bytes"
+  },
+  "tdd": {
+    "red": {
+      "negativeIdentityAndAck": "fail: acceptApplicationResponse stub returned ok=true (expected false)",
+      "routingMarkerOnTopic": "fail: inspectPublicRouting stub returned ok=true for content topic containing ORDER_MARK",
+      "credentialsPersist": "fail: persistPurchaseCredentials stub returned false",
+      "credentialsExport": "fail: exportRecoveryMaterial stub returned object, expected string",
+      "fulfillmentIdempotencyAndReplay": "fail: stub accepted incorrect credentials and did not track logicalCount"
+    },
+    "green": {
+      "unit": "12 passed (identity, ack, routing, IndexedDB, export, fulfillment)",
+      "liveNetwork": "1 passed; lightPushSuccesses=2; latencyMs=2799; contentTopic=/ssf-probe/1/<runId>/proto",
+      "playwright": {
+        "encryptedBrowserExchange": "passed",
+        "reconnectOneLogicalResponse": "passed",
+        "indexedDbRestartAndExportImport": "passed"
+      }
+    }
+  },
+  "routingMarkers": {
+    "markers": ["ORDER_MARK", "BUYER_MARK", "PRODUCT_MARK"],
+    "placement": "encrypted application JSON only",
+    "publicTopicPattern": "/ssf-probe/1/<runId>/proto",
+    "inspectedUnencryptedFields": [
+      "contentTopic",
+      "pubsubTopic",
+      "version",
+      "timestamp",
+      "ephemeral",
+      "meta",
+      "rateLimitProof"
+    ],
+    "result": "pass",
+    "foundInPublicFields": []
+  },
+  "browser": {
+    "restartPossession": true,
+    "exportImportPossession": true,
+    "encryptedRequestOverLogos": true,
+    "reconnectIdempotent": true
+  },
+  "rerun": [
+    "cd spikes/messaging",
+    "npm ci",
+    "npm test",
+    "npm run test:live",
+    "npm run test:e2e"
+  ],
+  "concerns": [
+    "logos-chat has no browser/WASM session SDK; authentication used @waku/message-encryption ECIES+ECDSA, not Chat/de-MLS",
+    "createLightNode health/isConnected can report Unhealthy while Light Push and Filter still work",
+    "Playwright's bundled Chromium download hung on this OS/arch; e2e used /usr/bin/chromium"
+  ]
+}
