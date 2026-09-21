@@ -1,0 +1,94 @@
+{
+  "probe": "encrypted-browser-downloads-independent-storage",
+  "mock": false,
+  "cloudObjectStoreSubstitution": false,
+  "streamingClaimed": false,
+  "module": {
+    "name": "storage_module",
+    "version": "2.1.2",
+    "rootHash": "19b11b153748c30665608c5527776ba2be74f7764481a11d33f687098764b740",
+    "logosctl": "0.2.3",
+    "libstorage": "0.1.0-523c7a51",
+    "methods": {
+      "uploadCompletionEvent": "storageUploadDone",
+      "downloadCompletionEvent": "storageDownloadDone",
+      "startCompletionEvent": "storageStart",
+      "acceptVsComplete": "call result reports command acceptance; storageUploadDone/storageDownloadDone and exists()/manifests() report completion. fetch() is acceptance-only and was not used as replica proof."
+    }
+  },
+  "crypto": {
+    "algorithm": "AES-256-GCM",
+    "implementation": "Web Crypto SubtleCrypto (Node + Chromium)",
+    "format": "SSF1 || 12-byte nonce || ciphertext+tag",
+    "maxPlaintextBytes": 8388608
+  },
+  "nodes": {
+    "a": {
+      "peerIdPrefix": "16Uiu2HAm93d",
+      "dataDirBasename": "node-a",
+      "listenPort": 18091,
+      "listenPortSource": "storage-init.json"
+    },
+    "b": {
+      "peerIdPrefix": "16Uiu2HAmJSS",
+      "dataDirBasename": "node-b",
+      "listenPort": 18191,
+      "listenPortSource": "storage-init.json"
+    },
+    "identitySeparated": true,
+    "storageSeparated": true
+  },
+  "sizes": [
+    {
+      "label": "fixture-encrypt",
+      "plaintextBytes": 41,
+      "ciphertextBytes": 73,
+      "rssBytes": 57688064
+    }
+  ],
+  "replica": {
+    "connectAccepted": true,
+    "upload": {
+      "accepted": true,
+      "acceptedIsNotCompletion": true,
+      "cidPrefix": "zDvZRwzkzXif",
+      "datasetSize": 73,
+      "filename": "fixture.ssf1"
+    },
+    "firstRetrieval": {
+      "via": "node-b downloadToUrl local=false",
+      "digestMatch": true,
+      "bytes": 73
+    },
+    "stopOriginal": {
+      "accepted": true
+    },
+    "originalNodeStopped": true,
+    "afterOriginalStopped": {
+      "via": "node-b downloadToUrl local=true",
+      "digestMatch": true,
+      "didNotUseDecoyPlaintext": true
+    }
+  },
+  "gateway": {
+    "urlHost": "127.0.0.1",
+    "served": "ciphertext-only",
+    "objectId": "fixture-v1"
+  },
+  "browser": {
+    "decrypted": true,
+    "plaintextSha256": "1a8af969ed1373d26d79a7c7f1606a3aeab22dfdb9699c544e53c9fae8637271",
+    "matchesFixture": true,
+    "bytes": 41
+  },
+  "pass": false,
+  "status": "partial",
+  "provenMaxBytes": 73,
+  "firstReleaseMaxBytes": 73,
+  "sizeNotes": {
+    "independentRetrievalAndBrowserProvenBytes": 73,
+    "localAesGcmMaxPlaintextBytes": 8388608,
+    "streaming": false,
+    "exercisedCiphertextBytes": [73]
+  }
+}
