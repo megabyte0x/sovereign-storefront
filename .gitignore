@@ -1,0 +1,17 @@
+.worktrees/
+.superpowers/
+node_modules/
+dist/
+.env
+.env.*
+*.key
+*.pem
+*.sqlite
+*.sqlite-*
+seller-data/
+spikes/**/data/
+spikes/**/runtime/
+spikes/**/wallets/
+playwright-report/
+test-results/
+coverage/
