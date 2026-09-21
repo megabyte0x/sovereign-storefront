@@ -171,11 +171,13 @@ export function createBuyerSession({
   const accepted = [];
   const routingInspections = [];
   let lastTransportAck = null;
+  let consumed = 0;
 
   return {
     contentTopic,
     buyerIdentity,
     sellerPublicKey,
+    accepted,
     routingInspections,
     get lastTransportAck() {
       return lastTransportAck;
@@ -221,8 +223,10 @@ export function createBuyerSession({
     async waitAccepted(timeoutMs = 90_000) {
       const started = Date.now();
       while (Date.now() - started < timeoutMs) {
-        if (accepted.length) {
-          return accepted[0];
+        if (accepted.length > consumed) {
+          const next = accepted[consumed];
+          consumed += 1;
+          return next;
         }
         await new Promise((r) => setTimeout(r, 100));
       }

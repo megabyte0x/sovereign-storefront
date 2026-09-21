@@ -71,6 +71,7 @@ test(
   });
   assert.ok(retryAck.successCount > 0);
   const retried = await buyer.waitAccepted(120_000);
+  assert.notEqual(retried, accepted, "retry must observe a new accepted message");
   assert.equal(retried.payload.responseId, accepted.payload.responseId);
   assert.equal(retried.payload.logicalCount, 1);
 
