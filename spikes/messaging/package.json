@@ -1,0 +1,25 @@
+{
+  "name": "sovereign-storefront-messaging-spike",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tests/negative.test.js tests/accept-valid.test.js tests/routing.test.js tests/credentials.test.js tests/fulfillment.test.js tests/wait-accepted.test.js",
+    "test:live": "node --test --test-force-exit --test-timeout=180000 tests/live-network.test.js",
+    "test:e2e": "playwright test",
+    "test:all": "npm test && npm run test:live && npm run test:e2e",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort"
+  },
+  "dependencies": {
+    "@waku/message-encryption": "0.0.38",
+    "@waku/sdk": "0.0.36",
+    "@waku/utils": "0.0.27"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.0",
+    "fake-indexeddb": "6.2.2",
+    "vite": "7.1.5"
+  }
+}
