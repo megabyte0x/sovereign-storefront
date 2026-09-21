@@ -1,0 +1,33 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  line-height: 1.4;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+}
+
+main {
+  max-width: 40rem;
+}
+
+button,
+a {
+  display: inline-block;
+  margin: 0.25rem 0.5rem 0.25rem 0;
+}
+
+#testnet-badge {
+  font-weight: 700;
+}
+
+#zip321-uri {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+[data-zip321-qr] svg {
+  border: 1px solid currentColor;
+}
