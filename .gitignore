@@ -9,6 +9,7 @@ dist/
 *.sqlite
 *.sqlite-*
 seller-data/
+seller-identity.json
 spikes/**/data/
 spikes/**/runtime/
 spikes/**/wallets/

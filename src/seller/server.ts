@@ -8,6 +8,7 @@ import { createMemoryMessaging, type FulfillmentMessaging } from '../adapters/me
 import { MemoryScanner } from '../adapters/scanner.ts';
 import { createMemoryStorageAdapter } from '../adapters/storage.ts';
 import { ConfigError, type RuntimeConfig } from '../config.ts';
+import { silentLogger, type OperationalLogger } from '../ops/log.ts';
 import type {
   CredentialAdapter,
   DeliveryPackage,
@@ -23,6 +24,7 @@ import { publishProduct } from './admin.ts';
 import { openCatalogue } from './catalogue.ts';
 import { openStore } from './db.ts';
 import { createFulfillment } from './fulfillment.ts';
+import { loadOrCreateSellerIdentity } from './identity.ts';
 import { createPayments } from './payments.ts';
 
 const CSP = [
@@ -54,6 +56,7 @@ export type SellerOptions = {
   scanner?: Scanner;
   credentials?: CredentialAdapter;
   messaging?: FulfillmentMessaging;
+  logger?: OperationalLogger;
 };
 
 function listen(server: Server, host: string, port: number): Promise<{ url: string; port: number }> {
@@ -193,6 +196,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     throw new ConfigError('real messaging adapter required; refusing fixture fallback');
   }
   const messaging = options.messaging ?? createMemoryMessaging();
+  const logger = options.logger ?? silentLogger;
 
   if (scanner instanceof MemoryScanner && !options.scanner) {
     scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
@@ -213,6 +217,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   }
 
   const availabilityOverride = options.availability ?? {};
+  loadOrCreateSellerIdentity(config.dbPath);
   const catalogue = openCatalogue({
     dbPath: config.dbPath,
     storage,
@@ -223,6 +228,9 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         const health = await scanner.health();
         return health.healthy && health.caughtUp;
       },
+      ...(availabilityOverride.storageReplica === undefined
+        ? {}
+        : { storageReplica: async () => availabilityOverride.storageReplica === true }),
     },
   });
 
@@ -261,20 +269,54 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     void handleAdmin(req, res);
   });
 
+  function requestPath(req: IncomingMessage): string {
+    return (req.url ?? '/').split('?')[0] ?? '/';
+  }
+
+  function logRequest(req: IncomingMessage): void {
+    logger.log({
+      event: 'http.request',
+      method: req.method ?? 'GET',
+      path: requestPath(req),
+    });
+  }
+
+  function logResponse(req: IncomingMessage, status: number): void {
+    logger.log({
+      event: 'http.response',
+      method: req.method ?? 'GET',
+      path: requestPath(req),
+      status,
+      ok: status < 400,
+    });
+  }
+
+  const sendPublic = (req: IncomingMessage, res: ServerResponse, status: number, body: string | Uint8Array, headers: Record<string, string> = {}): void => {
+    logResponse(req, status);
+    send(res, status, body, headers);
+  };
+
+  const sendPublicJson = (req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void => {
+    logResponse(req, status);
+    sendJson(res, status, body);
+  };
+
   async function handlePublic(req: IncomingMessage, res: ServerResponse): Promise<void> {
     applySecurityHeaders(res);
-    const path = (req.url ?? '/').split('?')[0] ?? '/';
+    logRequest(req);
+    const path = requestPath(req);
     try {
       if (path.startsWith('/admin')) {
-        send(res, 404, 'not found');
+        sendPublic(req, res, 404, 'not found');
         return;
       }
       if (path === '/api/payment-override' || path === '/api/mark-paid') {
-        send(res, 404, 'not found');
+        sendPublic(req, res, 404, 'not found');
         return;
       }
       if (path.startsWith('/ciphertext/')) {
         ciphertext(req, res);
+        logResponse(req, 0);
         return;
       }
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
@@ -282,25 +324,25 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         const html = existsSync(indexPath)
           ? readFileSync(indexPath, 'utf8')
           : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sovereign Storefront</title></head><body><main id="app"></main></body></html>';
-        send(res, 200, html, { 'content-type': 'text/html; charset=utf-8' });
+        sendPublic(req, res, 200, html, { 'content-type': 'text/html; charset=utf-8' });
         return;
       }
       if (req.method === 'GET' && (path.startsWith('/assets/') || path.startsWith('/src/'))) {
         const filePath = safeJoin(publicDir, path);
         if (!filePath || !existsSync(filePath)) {
-          send(res, 404, 'not found');
+          sendPublic(req, res, 404, 'not found');
           return;
         }
-        send(res, 200, readFileSync(filePath), { 'content-type': contentTypeFor(filePath) });
+        sendPublic(req, res, 200, readFileSync(filePath), { 'content-type': contentTypeFor(filePath) });
         return;
       }
       if (req.method === 'GET' && path === '/api/product') {
         const published = catalogue.listPublished()[0];
         if (!published) {
-          sendJson(res, 404, { error: 'unpublished product' });
+          sendPublicJson(req, res, 404, { error: 'unpublished product' });
           return;
         }
-        sendJson(res, 200, {
+        sendPublicJson(req, res, 200, {
           version: published.version,
           description: published.description,
           amountZat: published.amountZat,
@@ -312,7 +354,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         return;
       }
       if (req.method === 'GET' && path === '/api/availability') {
-        sendJson(res, 200, await catalogue.currentAvailability());
+        sendPublicJson(req, res, 200, await catalogue.currentAvailability());
         return;
       }
       if (req.method === 'POST' && path === '/api/orders') {
@@ -323,13 +365,13 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           proof?: string;
         };
         if (!payload.requestId || !payload.productVersion || !payload.buyerKeyId) {
-          sendJson(res, 400, { error: 'malformed payload' });
+          sendPublicJson(req, res, 400, { error: 'malformed payload' });
           return;
         }
         const proof = decodeProof(payload.proof);
         const ok = await credentials.verifyPossession(payload.buyerKeyId, proof);
         if (!ok) {
-          sendJson(res, 403, { error: 'proof rejected' });
+          sendPublicJson(req, res, 403, { error: 'proof rejected' });
           return;
         }
         const availability = await catalogue.currentAvailability();
@@ -346,36 +388,37 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           availability,
         });
         payments.cacheInvoice(invoice);
-        sendJson(res, 200, invoice);
+        logger.log({ event: 'invoice.issued' });
+        sendPublicJson(req, res, 200, invoice);
         return;
       }
       if (req.method === 'POST' && (path === '/api/status' || path === '/api/recover')) {
         const payload = JSON.parse(await readBody(req)) as { orderId?: string; proof?: string };
         if (!payload.orderId) {
-          sendJson(res, 400, { error: 'malformed payload' });
+          sendPublicJson(req, res, 400, { error: 'malformed payload' });
           return;
         }
         const invoice = await store.getInvoice(payload.orderId);
         if (!invoice) {
-          sendJson(res, 404, { error: 'order not found' });
+          sendPublicJson(req, res, 404, { error: 'order not found' });
           return;
         }
         const proof = decodeProof(payload.proof);
         const ok = await credentials.verifyPossession(invoice.buyerKeyId, proof);
         if (!ok) {
-          sendJson(res, 403, { error: 'proof rejected' });
+          sendPublicJson(req, res, 403, { error: 'proof rejected' });
           return;
         }
         payments.cacheInvoice(invoice);
         await payments.reconcileFromScanner();
         if (path === '/api/status') {
           const status: OrderStatus = await payments.orderStatus(payload.orderId);
-          sendJson(res, 200, status);
+          sendPublicJson(req, res, 200, status);
           return;
         }
         const decision = await payments.authorizeRelease(payload.orderId);
         if (!decision.disclose || !decision.package) {
-          sendJson(res, 403, { error: 'not eligible' });
+          sendPublicJson(req, res, 403, { error: 'not eligible' });
           return;
         }
         try {
@@ -383,10 +426,10 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         } catch {
           // Send failure does not withhold the recovery package.
         }
-        sendJson(res, 200, serializeDeliveryPackage(decision.package));
+        sendPublicJson(req, res, 200, serializeDeliveryPackage(decision.package));
         return;
       }
-      send(res, 404, 'not found');
+      sendPublic(req, res, 404, 'not found');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'error';
       const status = /checkout unavailable/i.test(message)
@@ -394,22 +437,29 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         : /proof|own order/i.test(message)
           ? 403
           : 400;
-      sendJson(res, status, { error: message });
+      logger.log({ event: 'error', code: status });
+      sendPublicJson(req, res, status, { error: message });
     }
   }
 
   async function handleAdmin(req: IncomingMessage, res: ServerResponse): Promise<void> {
     applySecurityHeaders(res);
+    logRequest(req);
     const header = req.headers.authorization ?? '';
-    if (header !== `Bearer ${config.adminToken}`) {
+    const authorized = header === `Bearer ${config.adminToken}`;
+    logger.log({ event: 'admin.auth', ok: authorized });
+    if (!authorized) {
+      logResponse(req, 401);
       send(res, 401, 'unauthorized');
       return;
     }
-    const path = (req.url ?? '/').split('?')[0] ?? '/';
+    const path = requestPath(req);
     if (req.method === 'GET' && path === '/admin/health') {
+      logResponse(req, 200);
       sendJson(res, 200, { ok: true, mode: config.mode });
       return;
     }
+    logResponse(req, 404);
     send(res, 404, 'not found');
   }
 
