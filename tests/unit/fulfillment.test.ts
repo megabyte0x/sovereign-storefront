@@ -310,3 +310,34 @@ test('concurrent reconciliation cannot sneak a reorg between eligibility and aut
     expect(status.payment).toBe('reorged');
   }
 });
+
+test('restart recaches invoices and rescans before authorizeRelease and dispatchPending succeed', async () => {
+  const { invoice, scanner, credentials } = await paidSetup();
+  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
+  await store.close();
+
+  store = await openStore(dbPath);
+  const restarted = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  expect(restarted.knownOrderIds()).toEqual([]);
+  restarted.cacheInvoice(invoice);
+  await restarted.reconcileFromScanner();
+  const messaging = createMemoryMessaging();
+  const fulfillment = createFulfillment({
+    store,
+    payments: restarted,
+    messaging,
+    credentials,
+  });
+  const decision = await restarted.authorizeRelease(invoice.orderId);
+  expect(decision.disclose).toBe(true);
+  expect(decision.reason).toBe('first_release');
+  await fulfillment.dispatchPending();
+  expect(messaging.sent).toHaveLength(1);
+  expect(messaging.sent[0].orderId).toBe(invoice.orderId);
+  expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
+});

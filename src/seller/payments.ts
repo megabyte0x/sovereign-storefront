@@ -276,14 +276,18 @@ export function createPayments(deps: PaymentDeps): Payments {
     return settlement;
   }
 
-  async function reconcileObservationLocked(observation: Observation): Promise<void> {
+  async function reconcileObservationLocked(observation: Observation): Promise<boolean> {
+    const invoice = observation.invoiceId ? invoicesById.get(observation.invoiceId) ?? null : null;
+    if (observation.invoiceId && !invoice) {
+      return false;
+    }
+
     const at = now();
     const health = await scanner.health();
     const verification = classifyVerification(health, policy, at);
     const pending = new Map(receipts);
     applyReceipt(pending, observation);
 
-    const invoice = observation.invoiceId ? invoicesById.get(observation.invoiceId) ?? null : null;
     const settlements: InvoiceSettlement[] = [];
     if (invoice) {
       settlements.push(await settleInvoice(invoice, pending, health, at));
@@ -308,6 +312,7 @@ export function createPayments(deps: PaymentDeps): Payments {
         await persistPreparedPackage(store, invoice, health.revision, preparePackage);
       }
     }
+    return true;
   }
 
   async function authorizeReleaseLocked(orderId: string): Promise<ReleaseDecision> {
@@ -354,7 +359,9 @@ export function createPayments(deps: PaymentDeps): Payments {
       return [...invoicesByOrder.keys()];
     },
     reconcileObservation(observation) {
-      return lock(() => reconcileObservationLocked(observation));
+      return lock(async () => {
+        await reconcileObservationLocked(observation);
+      });
     },
     reconcileFromScanner() {
       return lock(async () => {
@@ -364,7 +371,8 @@ export function createPayments(deps: PaymentDeps): Payments {
           items.push(item);
         }
         for (const item of items) {
-          await reconcileObservationLocked(item);
+          const advanced = await reconcileObservationLocked(item);
+          if (!advanced) break;
         }
       });
     },

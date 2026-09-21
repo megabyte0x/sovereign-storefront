@@ -236,3 +236,75 @@ test('payments module does not offer automatic refunds', async () => {
   expect('refund' in payments).toBe(false);
   expect('requestRefund' in payments).toBe(false);
 });
+
+test('does not advance checkpoint when invoiceId is set but the invoice is unknown', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const receipt = observation(invoice);
+  const later: Observation = {
+    outputId: 'out-later',
+    invoiceId: null,
+    amountZat: invoice.amountZat,
+    confirmations: 0,
+    canonical: true,
+    receivedAt: 1000,
+    revision: { id: 'rev-11', height: 11 },
+  };
+  scanner.replaceSnapshot([receipt, later], later.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  await payments.reconcileFromScanner();
+  expect(await store.getCheckpoint()).toBeNull();
+  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
+
+  payments.cacheInvoice(invoice);
+  await payments.reconcileFromScanner();
+  expect(await store.getCheckpoint()).toEqual({ revision: later.revision });
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
+  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
+});
+
+test('crash after commit re-prepares on recache and rescan without disclosing', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const receipt = observation(invoice);
+  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+    hooks: {
+      crashAfterCommit: () => {
+        throw new Error('injected crash after commit');
+      },
+    },
+  });
+  payments.cacheInvoice(invoice);
+  await expect(payments.reconcileObservation(receipt)).rejects.toThrow(/after commit/);
+  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
+  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
+  expect(await store.getPreparedPackage(invoice.orderId)).toBeNull();
+  await store.close();
+
+  store = await openStore(dbPath);
+  const restarted = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  restarted.cacheInvoice(invoice);
+  await restarted.reconcileFromScanner();
+  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
+  expect(await store.getPreparedPackage(invoice.orderId)).toEqual(envelope(invoice));
+  const beforeRelease = await restarted.authorizeRelease(invoice.orderId);
+  expect(beforeRelease.disclose).toBe(true);
+  expect(beforeRelease.reason).toBe('first_release');
+});
