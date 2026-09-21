@@ -23,6 +23,8 @@ async function persistSentUnacknowledged(store: SellerStore, orderId: string): P
 }
 
 export function createFulfillment(deps: FulfillmentDeps) {
+  const sentThisProcess = new Set<string>();
+
   async function assertBuyer(orderId: string, credentialId: string): Promise<void> {
     if (!credentialId) {
       throw new Error('credential required');
@@ -67,12 +69,14 @@ export function createFulfillment(deps: FulfillmentDeps) {
 
     async dispatchPending(): Promise<void> {
       for (const orderId of deps.payments.knownOrderIds()) {
+        if (sentThisProcess.has(orderId)) continue;
         const decision = await deps.payments.authorizeRelease(orderId);
         if (!decision.disclose || !decision.package) continue;
         if (decision.delivery === 'acknowledged') continue;
         const pkg: DeliveryPackage = decision.package;
         try {
           await deps.messaging.send(pkg);
+          sentThisProcess.add(orderId);
           await deps.store.recordSendAttempt(orderId);
           await persistSentUnacknowledged(deps.store, orderId);
         } catch (error) {

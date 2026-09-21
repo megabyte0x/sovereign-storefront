@@ -100,6 +100,17 @@ test('worker send path authorizes, sends, then records the attempt as possible d
   expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
 });
 
+test('two dispatchPending calls after one successful send do not double-send', async () => {
+  const { invoice, payments } = await paidSetup();
+  const messaging = createMemoryMessaging();
+  const fulfillment = createFulfillment({ store, payments, messaging });
+  await fulfillment.dispatchPending();
+  expect(messaging.sent).toHaveLength(1);
+  await fulfillment.dispatchPending();
+  expect(messaging.sent).toHaveLength(1);
+  expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
+});
+
 test('crash before send does not authorize a second payment; crash after send persists sent_unacknowledged', async () => {
   const { invoice, payments, scanner } = await paidSetup();
   let crashBefore = true;
