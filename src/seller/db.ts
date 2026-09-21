@@ -26,10 +26,6 @@ import { createOrder, getOrder } from './orders.ts';
 
 const SCHEMA = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'), 'utf8');
 
-export const sellerStoreTestHooks = {
-  crashAfterObservations: false,
-};
-
 type ObservationRow = {
   output_id: string;
   invoice_id: string | null;
@@ -173,7 +169,10 @@ function persistCheckpoint(db: DatabaseSync, checkpoint: ScanCheckpoint): void {
   ).run(checkpoint.revision.id, checkpoint.revision.height);
 }
 
-export async function openStore(path: string): Promise<SellerStore> {
+export async function openStore(
+  path: string,
+  options: { crashAfterObservations?: () => void } = {},
+): Promise<SellerStore> {
   assertRequiredString(path, 'path');
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -210,9 +209,7 @@ export async function openStore(path: string): Promise<SellerStore> {
         for (const observation of input.observations) {
           persistObservation(db, observation);
         }
-        if (sellerStoreTestHooks.crashAfterObservations) {
-          throw new Error('injected crash after observations');
-        }
+        options.crashAfterObservations?.();
         for (const settlement of input.settlements) {
           persistSettlement(db, settlement, input.observations);
         }

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
-import { openStore, sellerStoreTestHooks } from '../../src/seller/db.ts';
+import { openStore } from '../../src/seller/db.ts';
 import type { Observation } from '../../src/contracts/types.ts';
 
 const scratchRoot = process.env.TMPDIR ?? tmpdir();
@@ -12,13 +12,11 @@ let scratchDir = '';
 let store: Awaited<ReturnType<typeof openStore>>;
 
 beforeEach(() => {
-  sellerStoreTestHooks.crashAfterObservations = false;
   scratchDir = mkdtempSync(join(scratchRoot, 'ssf-invoices-'));
   dbPath = join(scratchDir, 'seller.sqlite');
 });
 
 afterEach(async () => {
-  sellerStoreTestHooks.crashAfterObservations = false;
   await store?.close().catch(() => undefined);
   rmSync(scratchDir, { recursive: true, force: true });
 });
@@ -100,14 +98,21 @@ test('commitReconciliation is atomic and unique output claims cannot move invoic
 });
 
 test('crash after observations and before commit leaves the previous checkpoint unchanged', async () => {
-  store = await openStore(dbPath);
+  let crashAfterObservations = false;
+  store = await openStore(dbPath, {
+    crashAfterObservations: () => {
+      if (crashAfterObservations) {
+        throw new Error('injected crash after observations');
+      }
+    },
+  });
   const firstRevision = { id: 'rev-1', height: 10 };
   await store.commitReconciliation({
     checkpoint: { revision: firstRevision },
     observations: [],
     settlements: [],
   });
-  sellerStoreTestHooks.crashAfterObservations = true;
+  crashAfterObservations = true;
   await expect(store.commitReconciliation({
     checkpoint: { revision: { id: 'rev-2', height: 11 } },
     observations: [{
@@ -121,7 +126,7 @@ test('crash after observations and before commit leaves the previous checkpoint 
     }],
     settlements: [],
   })).rejects.toThrow(/injected crash/);
-  sellerStoreTestHooks.crashAfterObservations = false;
+  crashAfterObservations = false;
   await store.close();
   store = await openStore(dbPath);
   expect(await store.getCheckpoint()).toEqual({ revision: firstRevision });
