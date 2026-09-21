@@ -1,12 +1,12 @@
 import { Blob } from 'node:buffer';
-import type { DeliveryPackage } from '../contracts/types.ts';
+import type { CryptoAdapter, DeliveryPackage } from '../contracts/types.ts';
 import {
   DecryptionFailed,
   createManifestVerifier,
   decryptSsf1,
   encodeManifest,
   importAesKey,
-  openDisclosedEnvelope,
+  splitDeliveryEnvelope,
 } from '../adapters/crypto.ts';
 
 export const ATTACHMENT_CONTENT_TYPE = 'application/octet-stream';
@@ -19,21 +19,23 @@ export function attachmentDisposition(filename: string): string {
 export async function decryptDownload(
   pkg: DeliveryPackage,
   ciphertext: Uint8Array,
+  access: { crypto: Pick<CryptoAdapter, 'openDelivery'>; credentialId: string },
 ): Promise<Blob> {
-  const opened = await openDisclosedEnvelope(pkg.encryptedEnvelope);
-  if (opened.header.productVersion !== pkg.productVersion) {
+  const { header } = splitDeliveryEnvelope(pkg.encryptedEnvelope);
+  if (header.productVersion !== pkg.productVersion) {
     throw new DecryptionFailed('product version mismatch');
   }
+  const { productKey } = await access.crypto.openDelivery(pkg.encryptedEnvelope, access.credentialId);
   const manifest = encodeManifest({
     productVersion: pkg.productVersion,
-    digestHex: opened.header.digestHex,
+    digestHex: header.digestHex,
     fileSize: ciphertext.byteLength,
   });
   const verified = await createManifestVerifier().verify(manifest, ciphertext);
   if (!verified) {
     throw new DecryptionFailed('manifest mismatch');
   }
-  const key = await importAesKey(opened.productKey);
+  const key = await importAesKey(productKey);
   const plaintext = await decryptSsf1(key, ciphertext);
   return new Blob([plaintext], { type: ATTACHMENT_CONTENT_TYPE });
 }

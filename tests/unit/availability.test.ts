@@ -11,6 +11,7 @@ import {
 } from '../../src/adapters/crypto.ts';
 import { createMemoryStorageAdapter } from '../../src/adapters/storage.ts';
 import { decryptDownload } from '../../src/browser/download.ts';
+import { createCredentialAdapter } from '../../src/adapters/credentials.ts';
 import { allowNewCheckout } from '../../src/contracts/types.ts';
 import { publishProduct } from '../../src/seller/admin.ts';
 import { openCatalogue } from '../../src/seller/catalogue.ts';
@@ -204,34 +205,36 @@ test('deletion is refused while required references exist', async () => {
 });
 
 test('decryptDownload rejects corruption before plaintext and returns an attachment blob', async () => {
-  const storage = createMemoryStorageAdapter();
-  const crypto = createCryptoAdapter();
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const crypto = createCryptoAdapter({ credentials });
   const { ciphertext, keyRef } = await crypto.encryptProduct(FIXTURE_V1);
   const envelope = await crypto.sealDelivery({
     orderId: 'order-1',
     productVersion: 'book-v1',
-    buyerKeyId: 'buyer-a',
+    buyerKeyId: buyer.buyerKeyId,
     productKeyRef: keyRef,
   });
   const pkg = {
     orderId: 'order-1',
     productVersion: 'book-v1',
-    buyerKeyId: 'buyer-a',
+    buyerKeyId: buyer.buyerKeyId,
     encryptedEnvelope: envelope,
   };
+  const access = { crypto, credentialId: buyer.credentialId };
   const corrupted = new Uint8Array(ciphertext);
   corrupted[corrupted.length - 1] ^= 0xff;
-  await expect(decryptDownload(pkg, corrupted)).rejects.toMatchObject({
+  await expect(decryptDownload(pkg, corrupted, access)).rejects.toMatchObject({
     name: 'DecryptionFailed',
     plaintextExposed: false,
   });
 
-  const blob = await decryptDownload(pkg, ciphertext);
+  const blob = await decryptDownload(pkg, ciphertext, access);
   expect(blob.type).toBe('application/octet-stream');
   expect(blob.type).not.toMatch(/html/i);
   expect(new Uint8Array(await blob.arrayBuffer())).toEqual(FIXTURE_V1);
   expect(createManifestVerifier()).toBeTruthy();
-  const key = await importAesKey(await crypto.openDelivery(envelope, 'cred-1').then((o) => o.productKey));
+  const key = await importAesKey(await crypto.openDelivery(envelope, buyer.credentialId).then((o) => o.productKey));
   expect(await decryptSsf1(key, ciphertext)).toEqual(FIXTURE_V1);
 });
 
@@ -253,4 +256,24 @@ test('publish rejects oversize plaintext before upload', async () => {
   })).rejects.toThrow();
   expect(catalogue.listPublished()).toEqual([]);
   expect(storage.uploaded).toEqual([]);
+});
+
+test('openDelivery fails for the wrong credentialId', async () => {
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const other = await credentials.createPurchaseCredential();
+  const crypto = createCryptoAdapter({ credentials });
+  const { keyRef } = await crypto.encryptProduct(FIXTURE_V1);
+  const envelope = await crypto.sealDelivery({
+    orderId: 'order-1',
+    productVersion: 'book-v1',
+    buyerKeyId: buyer.buyerKeyId,
+    productKeyRef: keyRef,
+  });
+  await expect(crypto.openDelivery(envelope, other.credentialId)).rejects.toMatchObject({
+    name: 'DecryptionFailed',
+    plaintextExposed: false,
+  });
+  const opened = await crypto.openDelivery(envelope, buyer.credentialId);
+  expect(opened.productKey.byteLength).toBe(32);
 });

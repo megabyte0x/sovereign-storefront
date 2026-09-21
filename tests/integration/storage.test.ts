@@ -7,6 +7,7 @@ import {
   FIRST_RELEASE_MAX_PLAINTEXT_BYTES,
   createCryptoAdapter,
 } from '../../src/adapters/crypto.ts';
+import { createCredentialAdapter } from '../../src/adapters/credentials.ts';
 import {
   LOGOSCTL_VERSION,
   STORAGE_MODULE,
@@ -42,17 +43,18 @@ test('pins logosctl 0.2.3 / storage_module 2.1.2 and first-release size', () => 
   expect(FIRST_RELEASE_MAX_CIPHERTEXT_BYTES).toBe(73);
 });
 
-test('live Logos origin upload uses completion, not fetch(); replica proof is not faked', async () => {
+test('live Logos origin upload uses completion, not fetch(); replica proof is not faked', async (ctx) => {
   const detected = detectLogosRuntime();
   if (!detected.ok) {
-    expect(detected.reason.length).toBeGreaterThan(0);
-    expect(detected.ok, `replica proof not claimed: ${detected.reason}`).toBe(false);
+    ctx.skip();
     return;
   }
 
   scratchDir = mkdtempSync(join(scratchRoot, 'ssf-storage-int-'));
   const storage = createLogosStorageAdapter(detected.runtime, scratchDir);
-  const crypto = createCryptoAdapter();
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const crypto = createCryptoAdapter({ credentials });
   const { ciphertext, keyRef } = await crypto.encryptProduct(PLAINTEXT);
   expect(ciphertext.byteLength).toBe(FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
 
@@ -61,9 +63,10 @@ test('live Logos origin upload uses completion, not fetch(); replica proof is no
 
   const replicaOk = await storage.verifyReplica(cid, detected.runtime.replicaConfigDir);
   if (!replicaOk) {
-    expect(replicaOk, 'independent replica retrieval did not complete; proof not claimed').toBe(false);
+    ctx.skip();
     return;
   }
+  expect(replicaOk).toBe(true);
 
   const dbPath = join(scratchDir, 'seller.sqlite');
   catalogue = openCatalogue({ dbPath, storage });
@@ -83,15 +86,15 @@ test('live Logos origin upload uses completion, not fetch(); replica proof is no
   const sealed = await crypto.sealDelivery({
     orderId: 'live-order',
     productVersion: 'fixture-v1',
-    buyerKeyId: 'buyer-live',
+    buyerKeyId: buyer.buyerKeyId,
     productKeyRef: published.sellerKeyRef as string,
   });
   const blob = await decryptDownload({
     orderId: 'live-order',
     productVersion: 'fixture-v1',
-    buyerKeyId: 'buyer-live',
+    buyerKeyId: buyer.buyerKeyId,
     encryptedEnvelope: sealed,
-  }, fetched);
+  }, fetched, { crypto, credentialId: buyer.credentialId });
   expect(blob.type).toBe('application/octet-stream');
   expect(new Uint8Array(await blob.arrayBuffer())).toEqual(PLAINTEXT);
   expect(keyRef.length).toBeGreaterThan(0);

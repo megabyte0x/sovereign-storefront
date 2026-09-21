@@ -1,5 +1,8 @@
 import { createHash, randomBytes, webcrypto } from 'node:crypto';
-import type { CryptoAdapter, ManifestVerifier } from '../contracts/types.ts';
+import { getPublicKey } from '@waku/message-encryption';
+import { ecies } from '@waku/message-encryption/crypto';
+import { bytesToHex, hexToBytes } from '@waku/utils/bytes';
+import type { CredentialAdapter, CryptoAdapter, ManifestVerifier } from '../contracts/types.ts';
 
 type AesKey = webcrypto.CryptoKey;
 
@@ -97,14 +100,6 @@ type KeyRecord = {
   digestHex: string;
 };
 
-async function deriveDeliveryKey(header: DeliveryHeader): Promise<AesKey> {
-  const material = new TextEncoder().encode(
-    `ssf-delivery-v1:${header.orderId}:${header.productVersion}:${header.buyerKeyId}`,
-  );
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', material));
-  return importAesKey(digest);
-}
-
 export function encodeDeliveryEnvelope(header: DeliveryHeader, wrappedKey: Uint8Array): Uint8Array {
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
   const out = new Uint8Array(ENVELOPE_MAGIC.length + 2 + headerBytes.length + wrappedKey.length);
@@ -162,16 +157,6 @@ export function splitDeliveryEnvelope(envelope: Uint8Array): { header: DeliveryH
   };
 }
 
-export async function openDisclosedEnvelope(envelope: Uint8Array): Promise<{
-  header: DeliveryHeader;
-  productKey: Uint8Array;
-}> {
-  const split = splitDeliveryEnvelope(envelope);
-  const kek = await deriveDeliveryKey(split.header);
-  const productKey = await decryptSsf1(kek, split.wrappedKey);
-  return { header: split.header, productKey };
-}
-
 export function encodeManifest(input: {
   productVersion: string;
   digestHex: string;
@@ -214,11 +199,12 @@ export function createManifestVerifier(): ManifestVerifier {
   };
 }
 
-export function createCryptoAdapter(): CryptoAdapter & {
+export function createCryptoAdapter(options?: { credentials?: CredentialAdapter }): CryptoAdapter & {
   decryptProduct(keyRef: string, ciphertext: Uint8Array): Promise<Uint8Array>;
   exportProductKey(keyRef: string): Promise<Uint8Array>;
 } {
   const keys = new Map<string, KeyRecord>();
+  const credentials = options?.credentials;
 
   return {
     async encryptProduct(plaintext) {
@@ -243,13 +229,30 @@ export function createCryptoAdapter(): CryptoAdapter & {
         buyerKeyId: input.buyerKeyId,
         digestHex: record.digestHex,
       };
-      const kek = await deriveDeliveryKey(header);
-      const wrappedKey = await encryptSsf1(kek, record.raw);
+      const recipient = hexToBytes(input.buyerKeyId);
+      const wrappedKey = await ecies.encrypt(recipient, record.raw);
       return encodeDeliveryEnvelope(header, wrappedKey);
     },
-    async openDelivery(envelope, _credentialId) {
-      const opened = await openDisclosedEnvelope(envelope);
-      return { productKey: opened.productKey };
+    async openDelivery(envelope, credentialId) {
+      if (!credentials) {
+        throw new DecryptionFailed('credentials required');
+      }
+      const split = splitDeliveryEnvelope(envelope);
+      let privateKey: Uint8Array;
+      try {
+        privateKey = await credentials.provePossession(credentialId);
+      } catch {
+        throw new DecryptionFailed('unknown credential');
+      }
+      if (bytesToHex(getPublicKey(privateKey)) !== split.header.buyerKeyId) {
+        throw new DecryptionFailed('credential does not match delivery');
+      }
+      try {
+        const productKey = await ecies.decrypt(privateKey, split.wrappedKey);
+        return { productKey };
+      } catch {
+        throw new DecryptionFailed();
+      }
     },
     async decryptProduct(keyRef, ciphertext) {
       const record = keys.get(keyRef);
