@@ -3,13 +3,15 @@ import {
   allowNewCheckout,
   type BrowserPurchase,
   type CredentialAdapter,
+  type DeliveryPackage,
   type Invoice,
   type OrderStatus,
   type OrderTransport,
+  type PurchaseStore,
   type ServiceAvailability,
 } from '../contracts/types.ts';
-import { paymentInstructions, renderPaymentInstructions } from './checkout.ts';
-import { BEARER_SECRET_WARNING, renderBackupGuidance } from './purchases.ts';
+import { beginCheckout, paymentInstructions, renderPaymentInstructions } from './checkout.ts';
+import { BEARER_SECRET_WARNING, openPurchaseStore, renderBackupGuidance } from './purchases.ts';
 
 export type ProductViewModel = {
   version: string;
@@ -138,6 +140,40 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function parseDeliveryPackage(body: unknown): DeliveryPackage {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('recover failed: missing envelope');
+  }
+  const row = body as {
+    orderId?: unknown;
+    productVersion?: unknown;
+    buyerKeyId?: unknown;
+    encryptedEnvelope?: unknown;
+  };
+  if (
+    typeof row.orderId !== 'string'
+    || typeof row.productVersion !== 'string'
+    || typeof row.buyerKeyId !== 'string'
+    || typeof row.encryptedEnvelope !== 'string'
+    || row.encryptedEnvelope.length === 0
+  ) {
+    throw new Error('recover failed: missing envelope');
+  }
+  return {
+    orderId: row.orderId,
+    productVersion: row.productVersion,
+    buyerKeyId: row.buyerKeyId,
+    encryptedEnvelope: base64ToBytes(row.encryptedEnvelope),
+  };
+}
+
 export function createBrowserTransport(
   credentials: CredentialAdapter,
   origin = '',
@@ -187,9 +223,13 @@ export function createBrowserTransport(
       if (!response.ok) {
         throw new Error(`recover failed: ${response.status}`);
       }
-      return await response.json() as never;
+      return parseDeliveryPackage(await response.json());
     },
   };
+}
+
+function navPurchasesMarkup(): string {
+  return '<button type="button" id="nav-purchases">My purchases</button>';
 }
 
 function qrMarkup(uri: string): string {
@@ -241,6 +281,7 @@ export function renderCheckoutView(root: RenderRoot, input: {
         <h1>Checkout</h1>
         <p>Saving this purchase locally before any wallet request.</p>
         <div id="payment" data-wallet-request="blocked"></div>
+        ${navPurchasesMarkup()}
       </section>
     `;
     return;
@@ -250,6 +291,7 @@ export function renderCheckoutView(root: RenderRoot, input: {
       <section id="view-checkout">
         <h1>Checkout</h1>
         <div id="payment"></div>
+        ${navPurchasesMarkup()}
       </section>
     `;
     const payment = (root as { querySelector(selector: string): { textContent: string | null; dataset: Record<string, string> } | null }).querySelector('#payment');
@@ -269,6 +311,7 @@ export function renderCheckoutView(root: RenderRoot, input: {
       <button type="button" id="copy-uri">Copy payment URI</button>
       <a id="open-uri" href="${escapedUri}" data-wallet-request="ready">Open payment URI</a>
       <p>Payment URI is shown exactly. Wallet memo and receiver preservation has not been verified in this browser.</p>
+      ${navPurchasesMarkup()}
     </section>
   `;
 }
@@ -286,6 +329,7 @@ export function renderStatusView(root: RenderRoot, orderStatus: OrderStatus): vo
       <p id="verification-label" data-verification="${escapeHtml(orderStatus.verification)}">${escapeHtml(visible.verificationLabel)}</p>
       <p role="note">This status is informational until confirmed by a seller-authenticated response.</p>
       ${exceptionText}
+      ${navPurchasesMarkup()}
     </section>
   `;
 }
@@ -334,6 +378,57 @@ function exposeHooks(): void {
   };
 }
 
+function pageOrigin(): string {
+  return (globalThis as { location?: { origin?: string } }).location?.origin ?? '';
+}
+
+function newRequestId(): string {
+  const id = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto?.randomUUID?.();
+  return id ?? `req-${Date.now()}`;
+}
+
+function closestAttribute(target: unknown, name: string): string | null {
+  let node = target as { getAttribute?(attr: string): string | null; id?: string; parentElement?: unknown } | null;
+  while (node) {
+    const value = node.getAttribute?.(name);
+    if (value) return value;
+    if (name === 'id' && node.id) return node.id;
+    node = (node.parentElement as typeof node) ?? null;
+  }
+  return null;
+}
+
+function setDataAttribute(target: unknown, id: string, name: string, value: string): void {
+  let node = target as { id?: string; setAttribute?(n: string, v: string): void; parentElement?: unknown } | null;
+  while (node) {
+    if (node.id === id) {
+      node.setAttribute?.(name, value);
+      return;
+    }
+    node = (node.parentElement as typeof node) ?? null;
+  }
+}
+
+function downloadBytes(filename: string, data: Uint8Array): void {
+  const g = globalThis as unknown as {
+    Blob?: new (parts: Uint8Array[], options?: { type?: string }) => object;
+    URL?: { createObjectURL(blob: object): string; revokeObjectURL(url: string): void };
+    document?: { createElement(tag: string): { href: string; download: string; click(): void } };
+  };
+  if (!g.Blob || !g.URL || !g.document) return;
+  const blob = new g.Blob([data], { type: 'application/octet-stream' });
+  const url = g.URL.createObjectURL(blob);
+  const anchor = g.document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  g.URL.revokeObjectURL(url);
+}
+
+type AppRoot = RenderRoot & {
+  addEventListener(type: string, listener: (event: { target: unknown }) => unknown): void;
+};
+
 async function startBrowserApp(root: RenderRoot): Promise<void> {
   exposeHooks();
   let product: ProductViewModel = {
@@ -365,19 +460,117 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
   } catch {
     // Product metadata is informational until the seller answers.
   }
-  renderProductView(root, {
-    product,
-    availability,
+
+  const credentials = createCredentialAdapter();
+  const transport = createBrowserTransport(credentials);
+  const origin = pageOrigin();
+  const storePromise: Promise<PurchaseStore> = openPurchaseStore({
+    sellerOrigin: origin,
     sellerKeyId: product.sellerKeyId,
+    credentials,
   });
-  const doc = globalThis as unknown as {
-    document: {
-      getElementById(id: string): { addEventListener(type: string, listener: () => void): void } | null;
-    };
+
+  const showProduct = (): void => {
+    renderProductView(root, {
+      product,
+      availability,
+      sellerKeyId: product.sellerKeyId,
+    });
   };
-  doc.document.getElementById('nav-purchases')?.addEventListener('click', () => {
-    renderPurchasesView(root, { purchases: [] });
+
+  const showCheckout = (purchase: BrowserPurchase): void => {
+    renderCheckoutView(root, {
+      purchase,
+      now: Date.now(),
+      persisted: true,
+    });
+  };
+
+  const showPurchases = async (): Promise<void> => {
+    const store = await storePromise;
+    renderPurchasesView(root, { purchases: await store.list() });
+  };
+
+  const onBuy = async (): Promise<void> => {
+    if (!allowNewCheckout(availability)) return;
+    const store = await storePromise;
+    const draft = {
+      version: 1 as const,
+      requestId: newRequestId(),
+      productVersion: product.version,
+      sellerOrigin: origin,
+      sellerKeyId: product.sellerKeyId,
+    };
+    await beginCheckout(store, transport, credentials, draft);
+    const saved = await store.get(draft.requestId);
+    if (!saved) {
+      throw new Error('purchase draft was not persisted');
+    }
+    showCheckout(saved);
+  };
+
+  const onCopy = async (target: unknown): Promise<void> => {
+    const uriEl = root.querySelector('#zip321-uri') as { textContent?: string | null } | null;
+    const uri = uriEl?.textContent ?? '';
+    if (!uri) return;
+    const nav = (globalThis as { navigator?: { clipboard?: { writeText(text: string): Promise<void> } } }).navigator;
+    try {
+      await nav?.clipboard?.writeText(uri);
+    } catch {
+      // Copy/link alternatives remain visible if the clipboard API is blocked.
+    }
+    setDataAttribute(target, 'copy-uri', 'data-copied', 'true');
+  };
+
+  const onExport = async (target: unknown): Promise<void> => {
+    const store = await storePromise;
+    const purchases = await store.list();
+    for (const item of purchases) {
+      const data = await store.exportBackup(item.requestId);
+      downloadBytes(`purchase-${item.requestId}.backup`, data);
+    }
+    setDataAttribute(target, 'export-backup', 'data-exported', 'true');
+  };
+
+  const onOpenPurchase = async (requestId: string): Promise<void> => {
+    const store = await storePromise;
+    const purchase = await store.get(requestId);
+    if (!purchase?.orderId) return;
+    const orderStatus = await transport.status(purchase.orderId, purchase.credentialId);
+    renderStatusView(root, orderStatus);
+    try {
+      await transport.recover(purchase.orderId, purchase.credentialId);
+    } catch {
+      // Status is informational; recovery may be ineligible until payment confirms.
+    }
+  };
+
+  (root as AppRoot).addEventListener('click', (event) => {
+    const id = closestAttribute(event.target, 'id');
+    if (id === 'buy') {
+      void onBuy();
+      return;
+    }
+    if (id === 'copy-uri') {
+      void onCopy(event.target);
+      return;
+    }
+    if (id === 'nav-purchases') {
+      void showPurchases();
+      return;
+    }
+    if (id === 'export-backup') {
+      void onExport(event.target);
+      return;
+    }
+    const requestId = closestAttribute(event.target, 'data-request-id');
+    if (requestId) {
+      void onOpenPurchase(requestId);
+    }
   });
+
+  showProduct();
+  void storePromise;
 }
 
 exposeHooks();

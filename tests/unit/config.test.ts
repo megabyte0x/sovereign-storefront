@@ -126,3 +126,9 @@ test('fixture mode loads a complete public and admin bind', () => {
   expect(cfg.maxCiphertextBytes).toBe(73);
   expect(cfg.destination).toBe(DESTINATION);
 });
+
+test('real messaging adapter does not fall back to fixture memory', async () => {
+  const { startSeller } = await import('../../src/seller/server.ts');
+  const cfg = loadConfig(validEnv({ SSF_ADAPTER_MESSAGING: 'real' }));
+  await expect(startSeller({ config: cfg, seedProduct: false })).rejects.toThrow(/fixture|real messaging/i);
+});

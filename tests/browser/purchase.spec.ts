@@ -3,6 +3,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
+import { createCredentialAdapter } from '../../src/adapters/credentials.ts';
+import { createMemoryMessaging } from '../../src/adapters/messaging.ts';
+import { MemoryScanner } from '../../src/adapters/scanner.ts';
 import { loadConfig } from '../../src/config.ts';
 import { startSeller, type SellerServer } from '../../src/seller/server.ts';
 import {
@@ -36,6 +39,8 @@ const CHROMIUM_ARGS = ['--no-sandbox', '--disable-dev-shm-usage'];
 
 const DESTINATION =
   'uregtest1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
+const CONFIG_DESTINATION =
+  'uregtest1zconfigdestinationqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
 
 test.use({
   launchOptions: {
@@ -48,6 +53,8 @@ test.describe.configure({ mode: 'serial' });
 
 let vite: ViteDevServer;
 let seller: SellerServer;
+let scanner: MemoryScanner;
+let messaging: ReturnType<typeof createMemoryMessaging>;
 
 const invoice: Invoice = {
   id: 'inv-1',
@@ -86,15 +93,20 @@ test.beforeAll(async () => {
     SSF_ADMIN_PORT: '0',
     SSF_DB_PATH: join(ROOT, '.tmp-purchase-spec.sqlite'),
     SSF_SELLER_KEY_ID: 'seller-key-1',
-    SSF_DESTINATION: DESTINATION,
+    SSF_DESTINATION: CONFIG_DESTINATION,
     SSF_ADAPTER_MESSAGING: 'fixture',
     SSF_ADAPTER_STORAGE: 'fixture',
     SSF_ADAPTER_SCANNER: 'fixture',
     SSF_ADMIN_TOKEN: 'admin-secret-not-for-browser',
   });
+  scanner = new MemoryScanner();
+  scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
+  messaging = createMemoryMessaging();
   seller = await startSeller({
     config,
     seedProduct: true,
+    scanner,
+    messaging,
   });
   vite = await createServer({
     root: ROOT,
@@ -424,4 +436,88 @@ test('ciphertext download is offered as an attachment', async ({ page }) => {
   expect(res.status()).toBe(200);
   expect(res.headers()['content-disposition'] ?? '').toMatch(/attachment/);
   expect(res.headers()['content-type'] ?? '').toMatch(/octet-stream/);
+});
+
+test('Buy click persists checkout through DOM handlers and lists the purchase', async ({ page }) => {
+  await ready(page);
+  await expect(page.locator('#buy')).toBeEnabled();
+  await page.locator('#buy').click();
+  await expect(page.locator('#view-checkout')).toBeVisible();
+  await expect(page.locator('#zip321-uri')).toContainText(`zcash:${CONFIG_DESTINATION}`);
+  await expect(page.locator('#copy-uri')).toBeVisible();
+  await page.locator('#copy-uri').click();
+  await expect(page.locator('#copy-uri')).toHaveAttribute('data-copied', 'true');
+  await page.locator('#nav-purchases').click();
+  await expect(page.locator('#view-purchases')).toBeVisible();
+  await expect(page.locator('button[data-request-id]')).toHaveCount(1);
+  await page.locator('#export-backup').click();
+  await expect(page.locator('#export-backup')).toHaveAttribute('data-exported', 'true');
+  await page.locator('button[data-request-id]').click();
+  await expect(page.locator('#view-status')).toBeVisible();
+});
+
+test('recover returns the delivery package envelope to an authenticated buyer', async ({ page }) => {
+  const credentials = createCredentialAdapter();
+  const created = await credentials.createPurchaseCredential();
+  const proof = Buffer.from(await credentials.provePossession(created.credentialId)).toString('base64');
+  const orderRes = await page.request.post(`${seller.publicUrl}/api/orders`, {
+    data: {
+      requestId: `req-recover-${Date.now()}`,
+      productVersion: 'book-v1',
+      buyerKeyId: created.buyerKeyId,
+      proof,
+    },
+  });
+  expect(orderRes.ok()).toBe(true);
+  const createdInvoice = await orderRes.json() as Invoice;
+  scanner.replaceSnapshot([{
+    outputId: 'out-recover-envelope',
+    invoiceId: createdInvoice.id,
+    amountZat: createdInvoice.amountZat,
+    confirmations: 10,
+    canonical: true,
+    receivedAt: Date.now(),
+    revision: { id: 'rev-10', height: 10 },
+  }], { id: 'rev-10', height: 10 }, true, Date.now());
+
+  const recoverRes = await page.request.post(`${seller.publicUrl}/api/recover`, {
+    data: { orderId: createdInvoice.orderId, proof },
+  });
+  expect(recoverRes.status()).toBe(200);
+  const body = await recoverRes.json() as {
+    orderId?: string;
+    productVersion?: string;
+    buyerKeyId?: string;
+    encryptedEnvelope?: string;
+  };
+  expect(body.orderId).toBe(createdInvoice.orderId);
+  expect(body.productVersion).toBe('book-v1');
+  expect(body.buyerKeyId).toBe(created.buyerKeyId);
+  expect(typeof body.encryptedEnvelope).toBe('string');
+  expect(Buffer.from(body.encryptedEnvelope ?? '', 'base64').byteLength).toBeGreaterThan(0);
+  expect(messaging.sent.some((pkg) => pkg.orderId === createdInvoice.orderId)).toBe(true);
+});
+
+test('browser recover decodes the delivery envelope bytes', async ({ page }) => {
+  await ready(page);
+  await page.route('**/api/recover', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        orderId: 'ord-env',
+        productVersion: 'book-v1',
+        buyerKeyId: 'buyer',
+        encryptedEnvelope: Buffer.from([7, 7, 7]).toString('base64'),
+      }),
+    });
+  });
+  const bytes = await page.evaluate(async () => {
+    const credentials = window.__ssf.createCredentialAdapter();
+    const transport = window.__ssf.createBrowserTransport(credentials);
+    const created = await credentials.createPurchaseCredential();
+    const pkg = await transport.recover('ord-env', created.credentialId);
+    return Array.from(pkg.encryptedEnvelope);
+  });
+  expect(bytes).toEqual([7, 7, 7]);
 });

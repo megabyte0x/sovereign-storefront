@@ -1,14 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createCredentialAdapter } from '../adapters/credentials.ts';
 import { createCryptoAdapter } from '../adapters/crypto.ts';
-import { createMemoryMessaging } from '../adapters/messaging.ts';
+import { createMemoryMessaging, type FulfillmentMessaging } from '../adapters/messaging.ts';
 import { MemoryScanner } from '../adapters/scanner.ts';
 import { createMemoryStorageAdapter } from '../adapters/storage.ts';
 import { ConfigError, type RuntimeConfig } from '../config.ts';
 import type {
   CredentialAdapter,
+  DeliveryPackage,
   OrderStatus,
   Scanner,
   SellerStore,
@@ -51,6 +53,7 @@ export type SellerOptions = {
   storage?: StorageAdapter;
   scanner?: Scanner;
   credentials?: CredentialAdapter;
+  messaging?: FulfillmentMessaging;
 };
 
 function listen(server: Server, host: string, port: number): Promise<{ url: string; port: number }> {
@@ -120,6 +123,35 @@ function decodeProof(value: unknown): Uint8Array {
   return new Uint8Array(Buffer.from(value, 'base64'));
 }
 
+function serializeDeliveryPackage(pkg: DeliveryPackage): {
+  orderId: string;
+  productVersion: string;
+  buyerKeyId: string;
+  encryptedEnvelope: string;
+} {
+  return {
+    orderId: pkg.orderId,
+    productVersion: pkg.productVersion,
+    buyerKeyId: pkg.buyerKeyId,
+    encryptedEnvelope: Buffer.from(pkg.encryptedEnvelope).toString('base64'),
+  };
+}
+
+function applyStoreSettings(dbPath: string, destination: string, invoiceTtlMs: number): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const upsert = db.prepare(
+      `INSERT INTO store_settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    );
+    upsert.run('destination', destination);
+    upsert.run('invoice_ttl_ms', String(invoiceTtlMs));
+  } finally {
+    db.close();
+  }
+}
+
 function contentTypeFor(filePath: string): string {
   switch (extname(filePath)) {
     case '.html': return 'text/html; charset=utf-8';
@@ -149,7 +181,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     ) {
       throw new ConfigError('real-demo mode rejects fixture adapters');
     }
-    if (!options.storage || !options.scanner) {
+    if (!options.storage || !options.scanner || !options.messaging) {
       throw new ConfigError('real-demo mode requires real adapters; refusing fixture fallback');
     }
   }
@@ -157,7 +189,10 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const storage = options.storage ?? createMemoryStorageAdapter();
   const scanner = options.scanner ?? new MemoryScanner();
   const credentials = options.credentials ?? createCredentialAdapter();
-  const messaging = createMemoryMessaging();
+  if (config.adapters.messaging === 'real' && !options.messaging) {
+    throw new ConfigError('real messaging adapter required; refusing fixture fallback');
+  }
+  const messaging = options.messaging ?? createMemoryMessaging();
 
   if (scanner instanceof MemoryScanner && !options.scanner) {
     scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
@@ -192,6 +227,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   });
 
   const store: SellerStore = await openStore(config.dbPath);
+  applyStoreSettings(config.dbPath, config.destination, config.invoiceTtlMs);
   const payments = createPayments({
     store,
     scanner,
@@ -200,7 +236,13 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       maxHealthAgeMs: config.maxHealthAgeMs,
     },
   });
-  createFulfillment({ store, payments, messaging, credentials });
+  const fulfillment = createFulfillment({ store, payments, messaging, credentials });
+  const dispatchTimer = setInterval(() => {
+    void payments.reconcileFromScanner()
+      .then(() => fulfillment.dispatchPending())
+      .catch(() => undefined);
+  }, 2_000);
+  dispatchTimer.unref();
 
   const publicDir = options.publicDir
     ?? (existsSync(join(process.cwd(), 'dist/browser/index.html'))
@@ -324,6 +366,8 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           sendJson(res, 403, { error: 'proof rejected' });
           return;
         }
+        payments.cacheInvoice(invoice);
+        await payments.reconcileFromScanner();
         if (path === '/api/status') {
           const status: OrderStatus = await payments.orderStatus(payload.orderId);
           sendJson(res, 200, status);
@@ -334,10 +378,12 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           sendJson(res, 403, { error: 'not eligible' });
           return;
         }
-        sendJson(res, 200, {
-          orderId: decision.package.orderId,
-          productVersion: decision.package.productVersion,
-        });
+        try {
+          await fulfillment.dispatchPending();
+        } catch {
+          // Send failure does not withhold the recovery package.
+        }
+        sendJson(res, 200, serializeDeliveryPackage(decision.package));
         return;
       }
       send(res, 404, 'not found');
@@ -374,6 +420,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     publicUrl: publicBind.url,
     adminUrl: adminBind.url,
     async close() {
+      clearInterval(dispatchTimer);
       catalogue.close();
       await store.close();
       await closeServer(publicServer);
