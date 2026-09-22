@@ -4,6 +4,8 @@ import {
   createTestCredentialAdapter,
 } from '../../src/adapters/credentials.ts';
 
+const challenge = { orderId: 'ord-1' };
+
 test('two createPurchaseCredential calls yield different credential and buyer keys', async () => {
   const adapter = createCredentialAdapter();
   const first = await adapter.createPurchaseCredential();
@@ -17,9 +19,10 @@ test('prove/verify fails for a different key', async () => {
   const adapter = createCredentialAdapter();
   const first = await adapter.createPurchaseCredential();
   const second = await adapter.createPurchaseCredential();
-  const proof = await adapter.provePossession(first.credentialId);
-  expect(await adapter.verifyPossession(first.buyerKeyId, proof)).toBe(true);
-  expect(await adapter.verifyPossession(second.buyerKeyId, proof)).toBe(false);
+  const proof = await adapter.provePossession(first.credentialId, challenge);
+  expect(await adapter.verifyPossession(first.buyerKeyId, proof, challenge)).toBe(true);
+  expect(await adapter.verifyPossession(second.buyerKeyId, proof, challenge)).toBe(false);
+  expect(await adapter.verifyPossession(first.buyerKeyId, proof, { orderId: 'other' })).toBe(false);
 });
 
 test('test double isolates keys the same way', async () => {
@@ -27,9 +30,23 @@ test('test double isolates keys the same way', async () => {
   const first = await adapter.createPurchaseCredential();
   const second = await adapter.createPurchaseCredential();
   expect(first.credentialId).not.toBe(second.credentialId);
-  const proof = await adapter.provePossession(first.credentialId);
-  expect(await adapter.verifyPossession(first.buyerKeyId, proof)).toBe(true);
-  expect(await adapter.verifyPossession(second.buyerKeyId, proof)).toBe(false);
+  const proof = await adapter.provePossession(first.credentialId, challenge);
+  expect(await adapter.verifyPossession(first.buyerKeyId, proof, challenge)).toBe(true);
+  expect(await adapter.verifyPossession(second.buyerKeyId, proof, challenge)).toBe(false);
+});
+
+test('raw 32-byte private key is not a valid possession proof', async () => {
+  const adapter = createCredentialAdapter();
+  const created = await adapter.createPurchaseCredential();
+  const backup = JSON.parse(new TextDecoder().decode(await adapter.exportBackupMaterial(created.credentialId))) as {
+    privateKeyHex: string;
+  };
+  const rawKey = Uint8Array.from(Buffer.from(backup.privateKeyHex, 'hex'));
+  expect(rawKey.byteLength).toBe(32);
+  expect(await adapter.verifyPossession(created.buyerKeyId, rawKey, challenge)).toBe(false);
+  const proof = await adapter.provePossession(created.credentialId, challenge);
+  expect(proof.byteLength).not.toBe(32);
+  expect(await adapter.verifyPossession(created.buyerKeyId, proof, challenge)).toBe(true);
 });
 
 test('hex export/import restores possession', async () => {
@@ -45,6 +62,6 @@ test('hex export/import restores possession', async () => {
   const other = createCredentialAdapter();
   const imported = await other.importBackupMaterial(backup);
   expect(imported.buyerKeyId).toBe(created.buyerKeyId);
-  const proof = await other.provePossession(imported.credentialId);
-  expect(await other.verifyPossession(created.buyerKeyId, proof)).toBe(true);
+  const proof = await other.provePossession(imported.credentialId, challenge);
+  expect(await other.verifyPossession(created.buyerKeyId, proof, challenge)).toBe(true);
 });

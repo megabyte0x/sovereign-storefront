@@ -55,6 +55,7 @@ function mockCredentials(): CredentialAdapter {
     }),
     provePossession: vi.fn(async () => new Uint8Array([1])),
     verifyPossession: vi.fn(async () => true),
+    decryptWrapped: vi.fn(async () => new Uint8Array(32)),
     exportBackupMaterial: vi.fn(async () => new Uint8Array()),
     importBackupMaterial: vi.fn(async () => ({
       credentialId: 'cred-new',

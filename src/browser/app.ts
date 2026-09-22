@@ -1,4 +1,5 @@
 import { createCredentialAdapter } from '../adapters/credentials.ts';
+import { createCryptoAdapter } from '../adapters/crypto.ts';
 import {
   allowNewCheckout,
   type BrowserPurchase,
@@ -11,6 +12,7 @@ import {
   type ServiceAvailability,
 } from '../contracts/types.ts';
 import { beginCheckout, paymentInstructions, renderPaymentInstructions } from './checkout.ts';
+import { decryptDownload } from './download.ts';
 import { BEARER_SECRET_WARNING, openPurchaseStore, renderBackupGuidance } from './purchases.ts';
 
 export type ProductViewModel = {
@@ -188,7 +190,9 @@ export function createBrowserTransport(
 
   return {
     async create(record) {
-      const proof = await credentials.provePossession(record.credentialId);
+      const proof = await credentials.provePossession(record.credentialId, {
+        orderId: record.requestId,
+      });
       const material = JSON.parse(new TextDecoder().decode(await credentials.exportBackupMaterial(record.credentialId))) as {
         publicKeyHex: string;
       };
@@ -204,7 +208,7 @@ export function createBrowserTransport(
       return await response.json() as Invoice;
     },
     async status(orderId, credentialId) {
-      const proof = await credentials.provePossession(credentialId);
+      const proof = await credentials.provePossession(credentialId, { orderId });
       const response = await post('/api/status', {
         orderId,
         proof: bytesToBase64(proof),
@@ -215,7 +219,7 @@ export function createBrowserTransport(
       return await response.json() as OrderStatus;
     },
     async recover(orderId, credentialId) {
-      const proof = await credentials.provePossession(credentialId);
+      const proof = await credentials.provePossession(credentialId, { orderId });
       const response = await post('/api/recover', {
         orderId,
         proof: bytesToBase64(proof),
@@ -361,6 +365,7 @@ export type BrowserHooks = {
   renderPurchasesView: typeof renderPurchasesView;
   createBrowserTransport: typeof createBrowserTransport;
   createCredentialAdapter: typeof createCredentialAdapter;
+  decryptDownload: typeof decryptDownload;
 };
 
 function exposeHooks(): void {
@@ -375,6 +380,7 @@ function exposeHooks(): void {
     renderPurchasesView,
     createBrowserTransport,
     createCredentialAdapter,
+    decryptDownload,
   };
 }
 
@@ -539,7 +545,15 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
     const orderStatus = await transport.status(purchase.orderId, purchase.credentialId);
     renderStatusView(root, orderStatus);
     try {
-      await transport.recover(purchase.orderId, purchase.credentialId);
+      const pkg = await transport.recover(purchase.orderId, purchase.credentialId);
+      const cipherRes = await fetch(`/ciphertext/${encodeURIComponent(pkg.productVersion)}`);
+      if (!cipherRes.ok) return;
+      const ciphertext = new Uint8Array(await cipherRes.arrayBuffer());
+      const blob = await decryptDownload(pkg, ciphertext, {
+        crypto: createCryptoAdapter({ credentials }),
+        credentialId: purchase.credentialId,
+      });
+      downloadBytes(`${pkg.productVersion}.bin`, new Uint8Array(await blob.arrayBuffer()));
     } catch {
       // Status is informational; recovery may be ineligible until payment confirms.
     }

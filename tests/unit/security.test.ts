@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
 import { createCredentialAdapter } from '../../src/adapters/credentials.ts';
+import { createCryptoAdapter } from '../../src/adapters/crypto.ts';
 import {
   ROUTING_MARKERS,
   applicationContentTopic,
@@ -13,9 +14,10 @@ import {
 } from '../../src/adapters/messaging.ts';
 import { MemoryScanner } from '../../src/adapters/scanner.ts';
 import { createMemoryStorageAdapter } from '../../src/adapters/storage.ts';
+import { decryptDownload } from '../../src/browser/download.ts';
 import { openPurchaseStore, type IDBFactoryLike } from '../../src/browser/purchases.ts';
 import { loadConfig, type RuntimeConfig } from '../../src/config.ts';
-import type { BrowserPurchase, Invoice, OrderStatus } from '../../src/contracts/types.ts';
+import type { BrowserPurchase, DeliveryPackage, Invoice, OrderStatus } from '../../src/contracts/types.ts';
 import { exportSellerBackup, restoreSellerBackup } from '../../src/seller/backup.ts';
 import { startSeller, type SellerServer } from '../../src/seller/server.ts';
 
@@ -138,6 +140,14 @@ async function jsonRequest(
   return { status: res.status, body: await res.text(), headers: res.headers };
 }
 
+async function possessionProof(
+  credentials: ReturnType<typeof createCredentialAdapter>,
+  credentialId: string,
+  orderId: string,
+): Promise<string> {
+  return Buffer.from(await credentials.provePossession(credentialId, { orderId })).toString('base64');
+}
+
 test('wired adapter keeps ORDER_MARK BUYER_MARK PRODUCT_MARK in encrypted JSON only', () => {
   const payload = encodeApplicationPayload({
     ORDER_MARK: 'ORDER_MARK',
@@ -219,8 +229,6 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
   const credentials = createCredentialAdapter();
   const buyerA = await credentials.createPurchaseCredential();
   const buyerB = await credentials.createPurchaseCredential();
-  const proofA = Buffer.from(await credentials.provePossession(buyerA.credentialId)).toString('base64');
-  const proofB = Buffer.from(await credentials.provePossession(buyerB.credentialId)).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   const storage = createMemoryStorageAdapter();
@@ -267,7 +275,7 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
       requestId: 'req-a',
       productVersion: 'book-v1',
       buyerKeyId: buyerA.buyerKeyId,
-      proof: proofA,
+      proof: await possessionProof(credentials, buyerA.credentialId, 'req-a'),
     }),
   });
   expect(createdA.status).toBe(200);
@@ -280,7 +288,7 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
       requestId: 'req-b',
       productVersion: 'book-v1',
       buyerKeyId: buyerB.buyerKeyId,
-      proof: proofB,
+      proof: await possessionProof(credentials, buyerB.credentialId, 'req-b'),
     }),
   });
   expect(createdB.status).toBe(200);
@@ -289,20 +297,29 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
   const wrongProof = await jsonRequest(seller.publicUrl, '/api/status', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceA.orderId, proof: proofB }),
+    body: JSON.stringify({
+      orderId: invoiceA.orderId,
+      proof: await possessionProof(credentials, buyerB.credentialId, invoiceA.orderId),
+    }),
   });
   expect(wrongProof.status).toBe(403);
 
   const crossStatus = await jsonRequest(seller.publicUrl, '/api/status', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceB.orderId, proof: proofA }),
+    body: JSON.stringify({
+      orderId: invoiceB.orderId,
+      proof: await possessionProof(credentials, buyerA.credentialId, invoiceB.orderId),
+    }),
   });
   expect(crossStatus.status).toBe(403);
   const crossRecover = await jsonRequest(seller.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceB.orderId, proof: proofA }),
+    body: JSON.stringify({
+      orderId: invoiceB.orderId,
+      proof: await possessionProof(credentials, buyerA.credentialId, invoiceB.orderId),
+    }),
   });
   expect(crossRecover.status).toBe(403);
 
@@ -319,19 +336,28 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
   const firstRecover = await jsonRequest(seller.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceA.orderId, proof: proofA }),
+    body: JSON.stringify({
+      orderId: invoiceA.orderId,
+      proof: await possessionProof(credentials, buyerA.credentialId, invoiceA.orderId),
+    }),
   });
   expect(firstRecover.status).toBe(200);
   const replayRecover = await jsonRequest(seller.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceA.orderId, proof: proofA }),
+    body: JSON.stringify({
+      orderId: invoiceA.orderId,
+      proof: await possessionProof(credentials, buyerA.credentialId, invoiceA.orderId),
+    }),
   });
   expect(replayRecover.status).toBe(200);
   const replayWrong = await jsonRequest(seller.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoiceA.orderId, proof: proofB }),
+    body: JSON.stringify({
+      orderId: invoiceA.orderId,
+      proof: await possessionProof(credentials, buyerB.credentialId, invoiceA.orderId),
+    }),
   });
   expect(replayWrong.status).toBe(403);
 
@@ -347,7 +373,6 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   const dbPath = join(scratchDir, 'seller.sqlite');
   const credentials = createCredentialAdapter();
   const buyer = await credentials.createPurchaseCredential();
-  const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   const storage = createMemoryStorageAdapter();
@@ -368,7 +393,7 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
       requestId: 'req-down',
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
-      proof,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-down'),
     }),
   });
   expect(blocked.status).toBe(503);
@@ -392,7 +417,7 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
       requestId: 'req-unpaid',
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
-      proof,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-unpaid'),
     }),
   });
   expect(unpaidCreated.status).toBe(200);
@@ -405,7 +430,7 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
       requestId: 'req-paid-status',
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
-      proof,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-paid-status'),
     }),
   });
   expect(paidCreated.status).toBe(200);
@@ -422,7 +447,10 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   const paidBefore = await jsonRequest(live.publicUrl, '/api/status', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: paidInvoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: paidInvoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, paidInvoice.orderId),
+    }),
   });
   expect(paidBefore.status).toBe(200);
   expect((JSON.parse(paidBefore.body) as OrderStatus).payment).toBe('confirmed');
@@ -444,7 +472,10 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   const unpaidStatus = await jsonRequest(restarted.publicUrl, '/api/status', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: unpaidInvoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: unpaidInvoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, unpaidInvoice.orderId),
+    }),
   });
   expect(unpaidStatus.status).toBe(200);
   const unpaidBody = JSON.parse(unpaidStatus.body) as OrderStatus;
@@ -454,7 +485,10 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   const paidStatus = await jsonRequest(restarted.publicUrl, '/api/status', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: paidInvoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: paidInvoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, paidInvoice.orderId),
+    }),
   });
   expect(paidStatus.status).toBe(200);
   const paidBody = JSON.parse(paidStatus.body) as OrderStatus;
@@ -470,7 +504,6 @@ test('seller backup restores into an isolated instance without spending keys or 
   const originDb = join(originDir, 'seller.sqlite');
   const credentials = createCredentialAdapter();
   const buyer = await credentials.createPurchaseCredential();
-  const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   const origin = await startSeller({
@@ -488,7 +521,7 @@ test('seller backup restores into an isolated instance without spending keys or 
       requestId: 'req-paid',
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
-      proof,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-paid'),
     }),
   });
   const invoice = JSON.parse(created.body) as Invoice;
@@ -504,7 +537,10 @@ test('seller backup restores into an isolated instance without spending keys or 
   const recovered = await jsonRequest(origin.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: invoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, invoice.orderId),
+    }),
   });
   expect(recovered.status).toBe(200);
 
@@ -555,8 +591,143 @@ test('seller backup restores into an isolated instance without spending keys or 
   const again = await jsonRequest(isolated.publicUrl, '/api/recover', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: invoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, invoice.orderId),
+    }),
   });
   expect(again.status).toBe(200);
   expect(JSON.parse(again.body).orderId).toBe(invoice.orderId);
+});
+
+test('composed seller seals a real delivery envelope, not the dummy [1] byte', async () => {
+  scratchDir = mkdtempSync(join(scratchRoot, 'ssf-seal-'));
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const scanner = new MemoryScanner();
+  scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
+  const storage = createMemoryStorageAdapter();
+  const seller = await startSeller({
+    config: env(join(scratchDir, 'seller.sqlite')),
+    seedProduct: true,
+    scanner,
+    credentials,
+    storage,
+  });
+  servers.push(seller);
+
+  const created = await jsonRequest(seller.publicUrl, '/api/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requestId: 'req-seal',
+      productVersion: 'book-v1',
+      buyerKeyId: buyer.buyerKeyId,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-seal'),
+    }),
+  });
+  expect(created.status).toBe(200);
+  const invoice = JSON.parse(created.body) as Invoice;
+  scanner.replaceSnapshot([{
+    outputId: 'out-seal',
+    invoiceId: invoice.id,
+    amountZat: invoice.amountZat,
+    confirmations: 10,
+    canonical: true,
+    receivedAt: Date.now(),
+    revision: { id: 'rev-10', height: 10 },
+  }], { id: 'rev-10', height: 10 }, true, Date.now());
+
+  const recovered = await jsonRequest(seller.publicUrl, '/api/recover', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      orderId: invoice.orderId,
+      proof: await possessionProof(credentials, buyer.credentialId, invoice.orderId),
+    }),
+  });
+  expect(recovered.status).toBe(200);
+  const body = JSON.parse(recovered.body) as {
+    orderId: string;
+    productVersion: string;
+    buyerKeyId: string;
+    encryptedEnvelope: string;
+  };
+  const envelope = Buffer.from(body.encryptedEnvelope, 'base64');
+  expect(Array.from(envelope)).not.toEqual([1]);
+  expect(envelope.subarray(0, 4).toString()).toBe('SSDL');
+
+  const ciphertextRes = await fetch(`${seller.publicUrl}/ciphertext/book-v1`);
+  expect(ciphertextRes.ok).toBe(true);
+  const ciphertext = new Uint8Array(await ciphertextRes.arrayBuffer());
+  const pkg: DeliveryPackage = {
+    orderId: body.orderId,
+    productVersion: body.productVersion,
+    buyerKeyId: body.buyerKeyId,
+    encryptedEnvelope: new Uint8Array(envelope),
+  };
+  const blob = await decryptDownload(pkg, ciphertext, {
+    crypto: createCryptoAdapter({ credentials }),
+    credentialId: buyer.credentialId,
+  });
+  expect(blob.type).toBe('application/octet-stream');
+  expect(new TextDecoder().decode(await blob.arrayBuffer())).toContain('sovereign-storefront harmless fixture');
+});
+
+test('raw buyer key in possession proof is rejected; wrong buyer still 403', async () => {
+  scratchDir = mkdtempSync(join(scratchRoot, 'ssf-raw-proof-'));
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const other = await credentials.createPurchaseCredential();
+  const scanner = new MemoryScanner();
+  scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
+  const seller = await startSeller({
+    config: env(join(scratchDir, 'seller.sqlite')),
+    seedProduct: true,
+    scanner,
+    credentials,
+  });
+  servers.push(seller);
+
+  const created = await jsonRequest(seller.publicUrl, '/api/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requestId: 'req-raw-proof',
+      productVersion: 'book-v1',
+      buyerKeyId: buyer.buyerKeyId,
+      proof: await possessionProof(credentials, buyer.credentialId, 'req-raw-proof'),
+    }),
+  });
+  expect(created.status).toBe(200);
+  const invoice = JSON.parse(created.body) as Invoice;
+  const backup = JSON.parse(new TextDecoder().decode(await credentials.exportBackupMaterial(buyer.credentialId))) as {
+    privateKeyHex: string;
+  };
+  const rawKeyProof = Buffer.from(backup.privateKeyHex, 'hex').toString('base64');
+  expect(Buffer.from(rawKeyProof, 'base64').byteLength).toBe(32);
+
+  const rawStatus = await jsonRequest(seller.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: invoice.orderId, proof: rawKeyProof }),
+  });
+  expect(rawStatus.status).toBe(403);
+
+  const rawRecover = await jsonRequest(seller.publicUrl, '/api/recover', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: invoice.orderId, proof: rawKeyProof }),
+  });
+  expect(rawRecover.status).toBe(403);
+
+  const wrong = await jsonRequest(seller.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      orderId: invoice.orderId,
+      proof: await possessionProof(credentials, other.credentialId, invoice.orderId),
+    }),
+  });
+  expect(wrong.status).toBe(403);
 });

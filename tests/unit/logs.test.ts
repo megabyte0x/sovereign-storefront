@@ -122,7 +122,6 @@ test('service, adapter, scanner and HTTP paths drop synthetic invoice, memo and 
   const log = sinkLogger();
   const credentials = createCredentialAdapter();
   const buyer = await credentials.createPurchaseCredential();
-  const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   const config = loadConfig({
@@ -161,7 +160,7 @@ test('service, adapter, scanner and HTTP paths drop synthetic invoice, memo and 
       requestId: 'req-logs-1',
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
-      proof,
+      proof: Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: 'req-logs-1' })).toString('base64'),
     }),
   });
   expect(created.status).toBe(200);
@@ -213,7 +212,10 @@ test('service, adapter, scanner and HTTP paths drop synthetic invoice, memo and 
   const okStatus = await fetch(`${seller.publicUrl}/api/status`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ orderId: invoice.orderId, proof }),
+    body: JSON.stringify({
+      orderId: invoice.orderId,
+      proof: Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: invoice.orderId })).toString('base64'),
+    }),
   });
   expect(okStatus.status).toBe(200);
 

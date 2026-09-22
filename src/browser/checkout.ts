@@ -37,7 +37,7 @@ async function requireUsableCredential(
   credentials: CredentialAdapter,
   credentialId: string,
 ): Promise<void> {
-  const proof = await credentials.provePossession(credentialId);
+  const proof = await credentials.provePossession(credentialId, { orderId: credentialId });
   if (!(proof instanceof Uint8Array) || proof.byteLength === 0) {
     throw new Error('credential is not usable');
   }
@@ -81,8 +81,12 @@ export async function beginCheckout(
 
   if (savedDraft.invoice) {
     assertInvoiceBinding(savedDraft, savedDraft.invoice);
-    const proof = await credentials.provePossession(savedDraft.credentialId);
-    if (!await credentials.verifyPossession(savedDraft.invoice.buyerKeyId, proof)) {
+    const proof = await credentials.provePossession(savedDraft.credentialId, {
+      orderId: savedDraft.invoice.orderId,
+    });
+    if (!await credentials.verifyPossession(savedDraft.invoice.buyerKeyId, proof, {
+      orderId: savedDraft.invoice.orderId,
+    })) {
       throw new Error('invoice is not bound to this buyer');
     }
     return savedDraft.invoice;
@@ -90,8 +94,10 @@ export async function beginCheckout(
 
   const invoice = await transport.create(savedDraft);
   assertInvoiceBinding(savedDraft, invoice);
-  const proof = await credentials.provePossession(savedDraft.credentialId);
-  if (!await credentials.verifyPossession(invoice.buyerKeyId, proof)) {
+  const proof = await credentials.provePossession(savedDraft.credentialId, {
+    orderId: invoice.orderId,
+  });
+  if (!await credentials.verifyPossession(invoice.buyerKeyId, proof, { orderId: invoice.orderId })) {
     throw new Error('invoice is not bound to this buyer');
   }
 

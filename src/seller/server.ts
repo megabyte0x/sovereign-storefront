@@ -192,6 +192,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const storage = options.storage ?? createMemoryStorageAdapter();
   const scanner = options.scanner ?? new MemoryScanner();
   const credentials = options.credentials ?? createCredentialAdapter();
+  const crypto = createCryptoAdapter({ credentials });
   if (config.adapters.messaging === 'real' && !options.messaging) {
     throw new ConfigError('real messaging adapter required; refusing fixture fallback');
   }
@@ -210,7 +211,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       amountZat: '100000000',
       network: config.productNetwork,
       plaintext: FIXTURE_PLAINTEXT,
-      crypto: createCryptoAdapter(),
+      crypto,
       storage,
       replicaId: 'replica',
     });
@@ -236,12 +237,34 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
 
   const store: SellerStore = await openStore(config.dbPath);
   applyStoreSettings(config.dbPath, config.destination, config.invoiceTtlMs);
+  for (const key of catalogue.listProductKeys()) {
+    const raw = key.rawKey instanceof Uint8Array ? key.rawKey : new Uint8Array(key.rawKey);
+    await crypto.importProductKey(key.keyRef, raw, key.digestHex);
+  }
   const payments = createPayments({
     store,
     scanner,
     policy: {
       minConfirmations: config.minConfirmations,
       maxHealthAgeMs: config.maxHealthAgeMs,
+    },
+    preparePackage: async (invoice) => {
+      const manifest = catalogue.getManifest(invoice.productVersion);
+      if (!manifest?.sellerKeyRef) {
+        throw new Error('unpublished product');
+      }
+      const sealed = await crypto.sealDelivery({
+        orderId: invoice.orderId,
+        productVersion: invoice.productVersion,
+        buyerKeyId: invoice.buyerKeyId,
+        productKeyRef: manifest.sellerKeyRef,
+      });
+      return {
+        orderId: invoice.orderId,
+        productVersion: invoice.productVersion,
+        buyerKeyId: invoice.buyerKeyId,
+        encryptedEnvelope: sealed,
+      };
     },
   });
   const fulfillment = createFulfillment({ store, payments, messaging, credentials });
@@ -369,7 +392,9 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           return;
         }
         const proof = decodeProof(payload.proof);
-        const ok = await credentials.verifyPossession(payload.buyerKeyId, proof);
+        const ok = await credentials.verifyPossession(payload.buyerKeyId, proof, {
+          orderId: payload.requestId,
+        });
         if (!ok) {
           sendPublicJson(req, res, 403, { error: 'proof rejected' });
           return;
@@ -404,7 +429,9 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           return;
         }
         const proof = decodeProof(payload.proof);
-        const ok = await credentials.verifyPossession(invoice.buyerKeyId, proof);
+        const ok = await credentials.verifyPossession(invoice.buyerKeyId, proof, {
+          orderId: payload.orderId,
+        });
         if (!ok) {
           sendPublicJson(req, res, 403, { error: 'proof rejected' });
           return;

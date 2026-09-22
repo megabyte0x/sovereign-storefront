@@ -1,6 +1,11 @@
 import { generatePrivateKey, getPublicKey } from '@waku/message-encryption';
+import { ecies, sha256, sign } from '@waku/message-encryption/crypto';
+import { recoverPublicKey } from '@noble/secp256k1';
 import { bytesToHex, hexToBytes } from '@waku/utils/bytes';
-import type { CredentialAdapter } from '../contracts/types.ts';
+import type { CredentialAdapter, PossessionChallenge } from '../contracts/types.ts';
+
+const PROOF_MAGIC = new TextEncoder().encode('SSPF');
+const NONCE_BYTES = 16;
 
 function randomBytes(size: number): Uint8Array {
   const bytes = new Uint8Array(size);
@@ -42,6 +47,30 @@ function decodeBackup(data: Uint8Array): { privateKeyHex: string; publicKeyHex: 
   return { privateKeyHex: parsed.privateKeyHex, publicKeyHex: parsed.publicKeyHex };
 }
 
+function challengeBytes(challenge: PossessionChallenge, nonce: Uint8Array): Uint8Array {
+  return new TextEncoder().encode(`ssf-possess-v1|${challenge.orderId}|${bytesToHex(nonce)}`);
+}
+
+function encodeProof(nonce: Uint8Array, signature: Uint8Array): Uint8Array {
+  const out = new Uint8Array(PROOF_MAGIC.length + nonce.length + signature.length);
+  out.set(PROOF_MAGIC, 0);
+  out.set(nonce, PROOF_MAGIC.length);
+  out.set(signature, PROOF_MAGIC.length + nonce.length);
+  return out;
+}
+
+function splitProof(proof: Uint8Array): { nonce: Uint8Array; signature: Uint8Array } | null {
+  const header = PROOF_MAGIC.length + NONCE_BYTES;
+  if (proof.byteLength <= header) return null;
+  for (let i = 0; i < PROOF_MAGIC.length; i += 1) {
+    if (proof[i] !== PROOF_MAGIC[i]) return null;
+  }
+  return {
+    nonce: proof.subarray(PROOF_MAGIC.length, header),
+    signature: proof.subarray(header),
+  };
+}
+
 function createStoredAdapter(options: {
   generate: () => { privateKey: Uint8Array; publicKeyHex: string };
   publicKeyFromPrivate: (privateKey: Uint8Array) => string;
@@ -68,19 +97,37 @@ function createStoredAdapter(options: {
         exportable: true,
       };
     },
-    async provePossession(credentialId) {
+    async provePossession(credentialId, challenge) {
       const record = byId.get(credentialId);
       if (!record) {
         throw new Error('unknown credential');
       }
-      return new Uint8Array(record.privateKey);
+      const nonce = randomBytes(NONCE_BYTES);
+      const digest = await sha256(challengeBytes(challenge, nonce));
+      const signature = await sign(digest, record.privateKey);
+      return encodeProof(nonce, signature);
     },
-    async verifyPossession(buyerKeyId, proof) {
+    async verifyPossession(buyerKeyId, proof, challenge) {
+      const split = splitProof(proof);
+      if (!split || split.signature.byteLength < 65) return false;
       try {
-        return options.publicKeyFromPrivate(proof) === buyerKeyId;
+        const digest = await sha256(challengeBytes(challenge, split.nonce));
+        const recovered = recoverPublicKey(
+          digest,
+          split.signature.subarray(0, 64),
+          split.signature[64] ?? 0,
+        );
+        return bytesToHex(recovered) === buyerKeyId;
       } catch {
         return false;
       }
+    },
+    async decryptWrapped(credentialId, wrappedKey) {
+      const record = byId.get(credentialId);
+      if (!record) {
+        throw new Error('unknown credential');
+      }
+      return ecies.decrypt(record.privateKey, wrappedKey);
     },
     async exportBackupMaterial(credentialId) {
       const record = byId.get(credentialId);
@@ -115,20 +162,5 @@ export function createCredentialAdapter(): CredentialAdapter {
 }
 
 export function createTestCredentialAdapter(): CredentialAdapter {
-  const publicFromPrivate = new Map<string, string>();
-  return createStoredAdapter({
-    generate() {
-      const privateKey = randomBytes(32);
-      const publicKeyHex = bytesToHex(randomBytes(32));
-      publicFromPrivate.set(bytesToHex(privateKey), publicKeyHex);
-      return { privateKey, publicKeyHex };
-    },
-    publicKeyFromPrivate(privateKey) {
-      const publicKeyHex = publicFromPrivate.get(bytesToHex(privateKey));
-      if (!publicKeyHex) {
-        throw new Error('unknown key');
-      }
-      return publicKeyHex;
-    },
-  });
+  return createCredentialAdapter();
 }

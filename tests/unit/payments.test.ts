@@ -259,11 +259,6 @@ test('does not advance checkpoint when invoiceId is set but the invoice is unkno
     preparePackage: async (inv) => envelope(inv),
   });
   await payments.reconcileFromScanner();
-  expect(await store.getCheckpoint()).toBeNull();
-  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
-
-  payments.cacheInvoice(invoice);
-  await payments.reconcileFromScanner();
   expect(await store.getCheckpoint()).toEqual({ revision: later.revision });
   expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
   expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
@@ -307,4 +302,121 @@ test('crash after commit re-prepares on recache and rescan without disclosing', 
   const beforeRelease = await restarted.authorizeRelease(invoice.orderId);
   expect(beforeRelease.disclose).toBe(true);
   expect(beforeRelease.reason).toBe('first_release');
+});
+
+test('authorizeRelease prepares a paid-but-locked order then queues it', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const receipt = observation(invoice);
+  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+    hooks: {
+      crashAfterCommit: () => {
+        throw new Error('injected crash after commit');
+      },
+    },
+  });
+  payments.cacheInvoice(invoice);
+  await expect(payments.reconcileObservation(receipt)).rejects.toThrow(/after commit/);
+  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
+  expect(await store.getPreparedPackage(invoice.orderId)).toBeNull();
+
+  const decision = await payments.authorizeRelease(invoice.orderId);
+  expect(decision.disclose).toBe(true);
+  expect(decision.reason).toBe('first_release');
+  expect(decision.package).toEqual(envelope(invoice));
+  expect(await store.getDelivery(invoice.orderId)).toBe('queued');
+});
+
+test('hydrate invoices and observations from sqlite after restart', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const receipt = observation(invoice);
+  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  payments.cacheInvoice(invoice);
+  await payments.reconcileObservation(receipt);
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
+  await store.close();
+
+  store = await openStore(dbPath);
+  const restarted = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  expect(await restarted.knownOrderIds()).toContain(invoice.orderId);
+  const status = await restarted.orderStatus(invoice.orderId);
+  expect(status.payment).toBe('confirmed');
+  await restarted.reconcileFromScanner();
+  const decision = await restarted.authorizeRelease(invoice.orderId);
+  expect(decision.disclose).toBe(true);
+});
+
+test('unknown invoiceId does not abort later observations', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const unknown: Observation = {
+    outputId: 'out-unknown',
+    invoiceId: 'inv-missing',
+    amountZat: invoice.amountZat,
+    confirmations: DEFAULT_POLICY.minConfirmations,
+    canonical: true,
+    receivedAt: 1000,
+    revision: { id: 'rev-9', height: 9 },
+  };
+  const receipt = observation(invoice, { revision: { id: 'rev-11', height: 11 } });
+  scanner.replaceSnapshot([unknown, receipt], receipt.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  payments.cacheInvoice(invoice);
+  await payments.reconcileFromScanner();
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
+  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
+});
+
+test('checkpoint does not move backwards when a later observation has a lower height', async () => {
+  store = await openStore(dbPath);
+  const { invoice } = await seed(store);
+  const scanner = new MemoryScanner();
+  const high = observation(invoice, { revision: { id: 'rev-20', height: 20 } });
+  scanner.replaceSnapshot([high], high.revision, true, 1000);
+  const payments = createPayments({
+    store,
+    scanner,
+    now: () => 1000,
+    preparePackage: async (inv) => envelope(inv),
+  });
+  payments.cacheInvoice(invoice);
+  await payments.reconcileObservation(high);
+  expect(await store.getCheckpoint()).toEqual({ revision: high.revision });
+
+  const low: Observation = {
+    outputId: 'out-older',
+    invoiceId: null,
+    amountZat: invoice.amountZat,
+    confirmations: 0,
+    canonical: true,
+    receivedAt: 1000,
+    revision: { id: 'rev-5', height: 5 },
+  };
+  await payments.reconcileObservation(low);
+  expect(await store.getCheckpoint()).toEqual({ revision: high.revision });
 });

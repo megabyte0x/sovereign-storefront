@@ -111,6 +111,36 @@ test('two dispatchPending calls after one successful send do not double-send', a
   expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
 });
 
+test('overlapping dispatchPending ticks do not double-send', async () => {
+  const { invoice, payments } = await paidSetup();
+  let releaseSend: (() => void) | undefined;
+  const holdSend = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  let startedSend: (() => void) | undefined;
+  const sendStarted = new Promise<void>((resolve) => {
+    startedSend = resolve;
+  });
+  const inner = createMemoryMessaging();
+  const messaging = {
+    sent: inner.sent,
+    sendInitiatedFor: inner.sendInitiatedFor,
+    async send(pkg: Parameters<typeof inner.send>[0]) {
+      startedSend?.();
+      await holdSend;
+      return inner.send(pkg);
+    },
+  };
+  const fulfillment = createFulfillment({ store, payments, messaging });
+  const first = fulfillment.dispatchPending();
+  await sendStarted;
+  const second = fulfillment.dispatchPending();
+  releaseSend?.();
+  await Promise.all([first, second]);
+  expect(inner.sent).toHaveLength(1);
+  expect(inner.sent[0].orderId).toBe(invoice.orderId);
+});
+
 test('crash before send does not authorize a second payment; crash after send persists sent_unacknowledged', async () => {
   const { invoice, payments, scanner } = await paidSetup();
   let crashBefore = true;
@@ -334,8 +364,7 @@ test('restart recaches invoices and rescans before authorizeRelease and dispatch
     now: () => 1000,
     preparePackage: async (inv) => envelope(inv),
   });
-  expect(restarted.knownOrderIds()).toEqual([]);
-  restarted.cacheInvoice(invoice);
+  expect(await restarted.knownOrderIds()).toContain(invoice.orderId);
   await restarted.reconcileFromScanner();
   const messaging = createMemoryMessaging();
   const fulfillment = createFulfillment({

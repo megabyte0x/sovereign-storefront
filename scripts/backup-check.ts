@@ -60,7 +60,7 @@ const result: Record<string, unknown> = {
 try {
   const credentials = createCredentialAdapter();
   const buyer = await credentials.createPurchaseCredential();
-  const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
+  const proof = Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: 'backup-check-1' })).toString('base64');
   const scanner = new MemoryScanner();
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
 
@@ -93,7 +93,7 @@ try {
 
   const first = await postJson(origin.publicUrl, '/api/recover', {
     orderId: invoice.orderId,
-    proof,
+    proof: Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: invoice.orderId })).toString('base64'),
   });
   if (first.status !== 200) {
     throw new Error(`origin recover failed: ${first.status}`);
@@ -140,7 +140,7 @@ try {
 
   const again = await postJson(isolated.publicUrl, '/api/recover', {
     orderId: invoice.orderId,
-    proof,
+    proof: Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: invoice.orderId })).toString('base64'),
   });
   await isolated.close();
   if (again.status !== 200) {

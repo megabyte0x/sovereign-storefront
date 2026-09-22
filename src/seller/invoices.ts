@@ -60,6 +60,15 @@ export function readInvoiceByOrder(db: DatabaseSync, orderId: string): Invoice |
   return row ? rowToInvoice(row) : null;
 }
 
+export function listInvoices(db: DatabaseSync): Invoice[] {
+  const rows = db.prepare(
+    `SELECT id, order_id, product_version, buyer_key_id, network, amount_zat,
+            destination, attribution_ref, expires_at
+     FROM invoices ORDER BY created_at ASC`,
+  ).all() as InvoiceRow[];
+  return rows.map(rowToInvoice);
+}
+
 export function getOrCreateInvoice(
   db: DatabaseSync,
   input: {

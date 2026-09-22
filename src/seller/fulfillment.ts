@@ -24,6 +24,7 @@ async function persistSentUnacknowledged(store: SellerStore, orderId: string): P
 
 export function createFulfillment(deps: FulfillmentDeps) {
   const sentThisProcess = new Set<string>();
+  let inFlight: Promise<void> | null = null;
 
   async function assertBuyer(orderId: string, credentialId: string): Promise<void> {
     if (!credentialId) {
@@ -36,8 +37,8 @@ export function createFulfillment(deps: FulfillmentDeps) {
     if (!invoice) {
       throw new Error('order not found');
     }
-    const proof = await deps.credentials.provePossession(credentialId);
-    const ok = await deps.credentials.verifyPossession(invoice.buyerKeyId, proof);
+    const proof = await deps.credentials.provePossession(credentialId, { orderId });
+    const ok = await deps.credentials.verifyPossession(invoice.buyerKeyId, proof, { orderId });
     if (!ok) {
       throw new Error('buyer does not own order');
     }
@@ -68,24 +69,32 @@ export function createFulfillment(deps: FulfillmentDeps) {
     },
 
     async dispatchPending(): Promise<void> {
-      for (const orderId of deps.payments.knownOrderIds()) {
-        if (sentThisProcess.has(orderId)) continue;
-        const decision = await deps.payments.authorizeRelease(orderId);
-        if (!decision.disclose || !decision.package) continue;
-        if (decision.delivery === 'acknowledged') continue;
-        const pkg: DeliveryPackage = decision.package;
+      if (inFlight) return inFlight;
+      inFlight = (async () => {
         try {
-          await deps.messaging.send(pkg);
-          sentThisProcess.add(orderId);
-          await deps.store.recordSendAttempt(orderId);
-          await persistSentUnacknowledged(deps.store, orderId);
-        } catch (error) {
-          if (deps.messaging.sendInitiatedFor.includes(orderId)) {
-            await persistSentUnacknowledged(deps.store, orderId);
+          for (const orderId of await deps.payments.knownOrderIds()) {
+            if (sentThisProcess.has(orderId)) continue;
+            const decision = await deps.payments.authorizeRelease(orderId);
+            if (!decision.disclose || !decision.package) continue;
+            if (decision.delivery === 'acknowledged') continue;
+            const pkg: DeliveryPackage = decision.package;
+            try {
+              await deps.messaging.send(pkg);
+              sentThisProcess.add(orderId);
+              await deps.store.recordSendAttempt(orderId);
+              await persistSentUnacknowledged(deps.store, orderId);
+            } catch (error) {
+              if (deps.messaging.sendInitiatedFor.includes(orderId)) {
+                await persistSentUnacknowledged(deps.store, orderId);
+              }
+              throw error;
+            }
           }
-          throw error;
+        } finally {
+          inFlight = null;
         }
-      }
+      })();
+      return inFlight;
     },
   };
 }

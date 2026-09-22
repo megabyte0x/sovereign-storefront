@@ -1,4 +1,3 @@
-import { Blob } from 'node:buffer';
 import type { CryptoAdapter, DeliveryPackage } from '../contracts/types.ts';
 import {
   DecryptionFailed,

@@ -459,13 +459,14 @@ test('Buy click persists checkout through DOM handlers and lists the purchase', 
 test('recover returns the delivery package envelope to an authenticated buyer', async ({ page }) => {
   const credentials = createCredentialAdapter();
   const created = await credentials.createPurchaseCredential();
-  const proof = Buffer.from(await credentials.provePossession(created.credentialId)).toString('base64');
+  const requestId = `req-recover-${Date.now()}`;
+  const createProof = Buffer.from(await credentials.provePossession(created.credentialId, { orderId: requestId })).toString('base64');
   const orderRes = await page.request.post(`${seller.publicUrl}/api/orders`, {
     data: {
-      requestId: `req-recover-${Date.now()}`,
+      requestId,
       productVersion: 'book-v1',
       buyerKeyId: created.buyerKeyId,
-      proof,
+      proof: createProof,
     },
   });
   expect(orderRes.ok()).toBe(true);
@@ -481,7 +482,10 @@ test('recover returns the delivery package envelope to an authenticated buyer', 
   }], { id: 'rev-10', height: 10 }, true, Date.now());
 
   const recoverRes = await page.request.post(`${seller.publicUrl}/api/recover`, {
-    data: { orderId: createdInvoice.orderId, proof },
+    data: {
+      orderId: createdInvoice.orderId,
+      proof: Buffer.from(await credentials.provePossession(created.credentialId, { orderId: createdInvoice.orderId })).toString('base64'),
+    },
   });
   expect(recoverRes.status()).toBe(200);
   const body = await recoverRes.json() as {
@@ -494,7 +498,10 @@ test('recover returns the delivery package envelope to an authenticated buyer', 
   expect(body.productVersion).toBe('book-v1');
   expect(body.buyerKeyId).toBe(created.buyerKeyId);
   expect(typeof body.encryptedEnvelope).toBe('string');
-  expect(Buffer.from(body.encryptedEnvelope ?? '', 'base64').byteLength).toBeGreaterThan(0);
+  const envelope = Buffer.from(body.encryptedEnvelope ?? '', 'base64');
+  expect(envelope.byteLength).toBeGreaterThan(0);
+  expect(Array.from(envelope)).not.toEqual([1]);
+  expect(envelope.subarray(0, 4).toString()).toBe('SSDL');
   expect(messaging.sent.some((pkg) => pkg.orderId === createdInvoice.orderId)).toBe(true);
 });
 

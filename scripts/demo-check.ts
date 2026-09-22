@@ -621,9 +621,10 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
     }
 
     const buyer = await credentials.createPurchaseCredential();
-    const proof = Buffer.from(await credentials.provePossession(buyer.credentialId)).toString('base64');
+    const requestId = `demo-${Date.now()}`;
+    const proof = Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: requestId })).toString('base64');
     const created = await postJson(seller!.publicUrl, '/api/orders', {
-      requestId: `demo-${Date.now()}`,
+      requestId,
       productVersion: 'book-v1',
       buyerKeyId: buyer.buyerKeyId,
       proof,
@@ -661,8 +662,9 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
       messaging,
       storage,
     });
-    await postJson(seller.publicUrl, '/api/status', { orderId: invoice.orderId, proof });
-    await postJson(seller.publicUrl, '/api/recover', { orderId: invoice.orderId, proof });
+    const recoverProof = Buffer.from(await credentials.provePossession(buyer.credentialId, { orderId: invoice.orderId })).toString('base64');
+    await postJson(seller.publicUrl, '/api/status', { orderId: invoice.orderId, proof: recoverProof });
+    await postJson(seller.publicUrl, '/api/recover', { orderId: invoice.orderId, proof: recoverProof });
     timings.fulfillMs = Date.now() - fulfillStarted;
 
     steps.push(classifyPayment({
@@ -677,8 +679,8 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
       steps.push(check('backup', 'FAIL', 'bearer-secret warning missing'));
     } else {
       const restored = await credentials.importBackupMaterial(backup);
-      const restoredProof = await credentials.provePossession(restored.credentialId);
-      const ok = await credentials.verifyPossession(buyer.buyerKeyId, restoredProof);
+      const restoredProof = await credentials.provePossession(restored.credentialId, { orderId: invoice.orderId });
+      const ok = await credentials.verifyPossession(buyer.buyerKeyId, restoredProof, { orderId: invoice.orderId });
       steps.push(ok
         ? check('backup', 'PASS', 'exportable Gate A hex backup restores possession; bearer-secret warning present')
         : check('backup', 'FAIL', 'imported backup did not restore possession'));

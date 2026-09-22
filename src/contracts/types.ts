@@ -94,10 +94,13 @@ export interface OrderTransport {
   status(orderId: string, credentialId: string): Promise<OrderStatus>;
   recover(orderId: string, credentialId: string): Promise<DeliveryPackage>;
 }
+export type PossessionChallenge = { orderId: string };
+
 export interface CredentialAdapter {
   createPurchaseCredential(): Promise<{ credentialId: string; buyerKeyId: string; exportable: boolean }>;
-  provePossession(credentialId: string): Promise<Uint8Array>;
-  verifyPossession(buyerKeyId: string, proof: Uint8Array): Promise<boolean>;
+  provePossession(credentialId: string, challenge: PossessionChallenge): Promise<Uint8Array>;
+  verifyPossession(buyerKeyId: string, proof: Uint8Array, challenge: PossessionChallenge): Promise<boolean>;
+  decryptWrapped(credentialId: string, wrappedKey: Uint8Array): Promise<Uint8Array>;
   exportBackupMaterial(credentialId: string): Promise<Uint8Array>;
   importBackupMaterial(data: Uint8Array): Promise<{ credentialId: string; buyerKeyId: string }>;
 }
@@ -120,6 +123,8 @@ export interface SellerStore {
     availability: ServiceAvailability;
   }): Promise<Invoice>;
   getInvoice(orderId: string): Promise<Invoice | null>;
+  listInvoices(): Promise<Invoice[]>;
+  listObservations(): Promise<Observation[]>;
   getCheckpoint(): Promise<ScanCheckpoint | null>;
   commitReconciliation(input: {
     checkpoint: ScanCheckpoint;

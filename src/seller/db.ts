@@ -21,7 +21,7 @@ import {
   assertPaymentState,
   assertRequiredString,
 } from '../contracts/validation.ts';
-import { DEFAULT_AMOUNT_ZAT, DEFAULT_DESTINATION, getOrCreateInvoice, readInvoiceByOrder } from './invoices.ts';
+import { DEFAULT_AMOUNT_ZAT, DEFAULT_DESTINATION, getOrCreateInvoice, listInvoices, readInvoiceByOrder } from './invoices.ts';
 import { createOrder, getOrder } from './orders.ts';
 
 const SCHEMA = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'), 'utf8');
@@ -165,7 +165,8 @@ function persistCheckpoint(db: DatabaseSync, checkpoint: ScanCheckpoint): void {
      VALUES (1, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        revision_id = excluded.revision_id,
-       revision_height = excluded.revision_height`,
+       revision_height = excluded.revision_height
+     WHERE excluded.revision_height >= scan_checkpoints.revision_height`,
   ).run(checkpoint.revision.id, checkpoint.revision.height);
 }
 
@@ -196,6 +197,25 @@ export async function openStore(
     },
     async getInvoice(orderId) {
       return readInvoiceByOrder(db, orderId);
+    },
+    async listInvoices() {
+      return listInvoices(db);
+    },
+    async listObservations() {
+      const rows = db.prepare(
+        `SELECT output_id, invoice_id, amount_zat, confirmations, canonical,
+                received_at, revision_id, revision_height
+         FROM observations`,
+      ).all() as ObservationRow[];
+      return rows.map((row) => ({
+        outputId: row.output_id,
+        invoiceId: row.invoice_id,
+        amountZat: row.amount_zat,
+        confirmations: Number(row.confirmations),
+        canonical: row.canonical === 1,
+        receivedAt: Number(row.received_at),
+        revision: { id: row.revision_id, height: Number(row.revision_height) },
+      }));
     },
     async getCheckpoint() {
       const row = db.prepare(

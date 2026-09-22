@@ -190,7 +190,7 @@ export type PaymentDeps = {
 
 export type Payments = {
   cacheInvoice(invoice: Invoice): void;
-  knownOrderIds(): string[];
+  knownOrderIds(): Promise<string[]>;
   reconcileObservation(observation: Observation): Promise<void>;
   reconcileFromScanner(): Promise<void>;
   authorizeRelease(orderId: string): Promise<ReleaseDecision>;
@@ -231,13 +231,29 @@ export function createPayments(deps: PaymentDeps): Payments {
   const invoicesById = new Map<string, Invoice>();
   const invoicesByOrder = new Map<string, Invoice>();
   const receipts = new Map<string, Observation>();
+  let hydratePromise: Promise<void> | null = null;
 
   function cacheInvoice(invoice: Invoice): void {
     invoicesById.set(invoice.id, invoice);
     invoicesByOrder.set(invoice.orderId, invoice);
   }
 
+  async function hydrateFromStore(): Promise<void> {
+    if (!hydratePromise) {
+      hydratePromise = (async () => {
+        for (const invoice of await store.listInvoices()) {
+          cacheInvoice(invoice);
+        }
+        for (const observation of await store.listObservations()) {
+          applyReceipt(receipts, observation);
+        }
+      })();
+    }
+    await hydratePromise;
+  }
+
   async function loadInvoiceForOrder(orderId: string): Promise<Invoice | null> {
+    await hydrateFromStore();
     const cached = invoicesByOrder.get(orderId);
     if (cached) return cached;
     const invoice = await store.getInvoice(orderId);
@@ -277,9 +293,16 @@ export function createPayments(deps: PaymentDeps): Payments {
   }
 
   async function reconcileObservationLocked(observation: Observation): Promise<boolean> {
-    const invoice = observation.invoiceId ? invoicesById.get(observation.invoiceId) ?? null : null;
+    await hydrateFromStore();
+    let invoice = observation.invoiceId ? invoicesById.get(observation.invoiceId) ?? null : null;
     if (observation.invoiceId && !invoice) {
-      return false;
+      for (const cached of invoicesByOrder.values()) {
+        if (cached.id === observation.invoiceId) {
+          invoice = cached;
+          cacheInvoice(cached);
+          break;
+        }
+      }
     }
 
     const at = now();
@@ -296,7 +319,7 @@ export function createPayments(deps: PaymentDeps): Payments {
     deps.hooks?.crashBeforeCommit?.();
     await store.commitReconciliation({
       checkpoint: { revision: observation.revision },
-      observations: [observation],
+      observations: invoice || observation.invoiceId === null ? [observation] : [],
       settlements,
     });
     applyReceipt(receipts, observation);
@@ -317,8 +340,8 @@ export function createPayments(deps: PaymentDeps): Payments {
 
   async function authorizeReleaseLocked(orderId: string): Promise<ReleaseDecision> {
     const invoice = await loadInvoiceForOrder(orderId);
-    const delivery = await store.getDelivery(orderId);
-    const pkg = await store.getPreparedPackage(orderId);
+    let delivery = await store.getDelivery(orderId);
+    let pkg = await store.getPreparedPackage(orderId);
     if (isAuthorized(delivery)) {
       return { disclose: true, reason: 'replay', delivery, package: pkg };
     }
@@ -331,6 +354,11 @@ export function createPayments(deps: PaymentDeps): Payments {
     const settlement = reduceInvoice(invoice, receiptsForInvoice(receipts, invoice.id), health, policy, at);
     if (!settlement.releaseEligible) {
       return { disclose: false, reason: 'not_eligible', delivery, package: null };
+    }
+    if (delivery === 'locked') {
+      await persistPreparedPackage(store, invoice, health.revision, preparePackage);
+      delivery = await store.getDelivery(orderId);
+      pkg = await store.getPreparedPackage(orderId);
     }
     if (delivery !== 'prepared') {
       return { disclose: false, reason: 'not_eligible', delivery, package: null };
@@ -355,7 +383,8 @@ export function createPayments(deps: PaymentDeps): Payments {
 
   return {
     cacheInvoice,
-    knownOrderIds() {
+    async knownOrderIds() {
+      await hydrateFromStore();
       return [...invoicesByOrder.keys()];
     },
     reconcileObservation(observation) {
@@ -365,14 +394,14 @@ export function createPayments(deps: PaymentDeps): Payments {
     },
     reconcileFromScanner() {
       return lock(async () => {
+        await hydrateFromStore();
         const checkpoint = await store.getCheckpoint();
         const items: Observation[] = [];
         for await (const item of scanner.observations(checkpoint)) {
           items.push(item);
         }
         for (const item of items) {
-          const advanced = await reconcileObservationLocked(item);
-          if (!advanced) break;
+          await reconcileObservationLocked(item);
         }
       });
     },

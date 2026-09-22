@@ -80,6 +80,12 @@ export function openCatalogue(options: {
   getPublishedCiphertext(productVersion: string): Promise<Uint8Array>;
   getManifest(productVersion: string): ProductManifest | null;
   listPublished(): ProductManifest[];
+  listProductKeys(): Array<{
+    keyRef: string;
+    productVersion: string;
+    rawKey: Uint8Array;
+    digestHex: string;
+  }>;
   currentAvailability(): Promise<ServiceAvailability>;
   beginPublication(input: {
     version: string;
@@ -152,6 +158,25 @@ export function openCatalogue(options: {
          FROM products WHERE published = 1 ORDER BY created_at ASC`,
       ).all() as ProductRow[];
       return rows.map(rowToManifest);
+    },
+    listProductKeys() {
+      const rows = db.prepare(
+        `SELECT pk.key_ref AS key_ref, pk.product_version AS product_version,
+                pk.wrapped_key AS wrapped_key, p.ciphertext_digest AS digest_hex
+         FROM product_keys pk
+         JOIN products p ON p.version = pk.product_version`,
+      ).all() as Array<{
+        key_ref: string;
+        product_version: string;
+        wrapped_key: Uint8Array;
+        digest_hex: string | null;
+      }>;
+      return rows.map((row) => ({
+        keyRef: row.key_ref,
+        productVersion: row.product_version,
+        rawKey: row.wrapped_key,
+        digestHex: row.digest_hex ?? '',
+      }));
     },
     async currentAvailability() {
       const published = db.prepare(`SELECT 1 AS ok FROM products WHERE published = 1 LIMIT 1`).get() as

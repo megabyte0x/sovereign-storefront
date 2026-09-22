@@ -53,7 +53,7 @@ const HARNESS_HTML = `<!DOCTYPE html>
             keys.set(credentialId, { privateKeyHex, publicKeyHex });
             return { credentialId, buyerKeyId: publicKeyHex, exportable: true };
           },
-          async provePossession(id) {
+          async provePossession(id, _challenge) {
             const rec = keys.get(id);
             if (!rec) throw new Error('unknown credential');
             return new TextEncoder().encode(rec.privateKeyHex);
@@ -64,6 +64,9 @@ const HARNESS_HTML = `<!DOCTYPE html>
               if (rec.privateKeyHex === hex) return rec.publicKeyHex === buyerKeyId;
             }
             return false;
+          },
+          async decryptWrapped() {
+            throw new Error('not used');
           },
           async exportBackupMaterial(id) {
             const rec = keys.get(id);
@@ -315,8 +318,12 @@ test('IndexedDB purchase survives closing and reopening a persistent browser con
             verified: false,
           };
         }
-        const proof = await credentials.provePossession(loaded.credentialId);
-        const verified = await credentials.verifyPossession(loaded.invoice.buyerKeyId, proof);
+        const proof = await credentials.provePossession(loaded.credentialId, {
+          orderId: loaded.invoice.orderId,
+        });
+        const verified = await credentials.verifyPossession(loaded.invoice.buyerKeyId, proof, {
+          orderId: loaded.invoice.orderId,
+        });
         return {
           requestId: loaded.requestId,
           productVersion: loaded.productVersion,

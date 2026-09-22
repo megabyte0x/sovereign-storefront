@@ -1,5 +1,5 @@
-import { createHash, randomBytes, webcrypto } from 'node:crypto';
-import { getPublicKey } from '@waku/message-encryption';
+import { sha256 } from '@noble/hashes/sha256';
+import { type webcrypto } from 'node:crypto';
 import { ecies } from '@waku/message-encryption/crypto';
 import { bytesToHex, hexToBytes } from '@waku/utils/bytes';
 import type { CredentialAdapter, CryptoAdapter, ManifestVerifier } from '../contracts/types.ts';
@@ -33,7 +33,13 @@ export class PayloadTooLarge extends Error {
 }
 
 export function sha256Hex(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
+  return bytesToHex(sha256(bytes));
+}
+
+function randomBytes(size: number): Uint8Array {
+  const bytes = new Uint8Array(size);
+  globalThis.crypto.getRandomValues(bytes);
+  return bytes;
 }
 
 export function hasSsf1Magic(bytes: Uint8Array): boolean {
@@ -202,6 +208,7 @@ export function createManifestVerifier(): ManifestVerifier {
 export function createCryptoAdapter(options?: { credentials?: CredentialAdapter }): CryptoAdapter & {
   decryptProduct(keyRef: string, ciphertext: Uint8Array): Promise<Uint8Array>;
   exportProductKey(keyRef: string): Promise<Uint8Array>;
+  importProductKey(keyRef: string, raw: Uint8Array, digestHex: string): Promise<void>;
 } {
   const keys = new Map<string, KeyRecord>();
   const credentials = options?.credentials;
@@ -214,7 +221,7 @@ export function createCryptoAdapter(options?: { credentials?: CredentialAdapter 
       const key = await generateAesKey();
       const ciphertext = await encryptSsf1(key, plaintext);
       const raw = await exportAesKey(key);
-      const keyRef = randomBytes(16).toString('hex');
+      const keyRef = bytesToHex(randomBytes(16));
       keys.set(keyRef, { key, raw, digestHex: sha256Hex(ciphertext) });
       return { ciphertext, keyRef };
     },
@@ -238,19 +245,11 @@ export function createCryptoAdapter(options?: { credentials?: CredentialAdapter 
         throw new DecryptionFailed('credentials required');
       }
       const split = splitDeliveryEnvelope(envelope);
-      let privateKey: Uint8Array;
       try {
-        privateKey = await credentials.provePossession(credentialId);
-      } catch {
-        throw new DecryptionFailed('unknown credential');
-      }
-      if (bytesToHex(getPublicKey(privateKey)) !== split.header.buyerKeyId) {
-        throw new DecryptionFailed('credential does not match delivery');
-      }
-      try {
-        const productKey = await ecies.decrypt(privateKey, split.wrappedKey);
+        const productKey = await credentials.decryptWrapped(credentialId, split.wrappedKey);
         return { productKey };
-      } catch {
+      } catch (err) {
+        if (err instanceof DecryptionFailed) throw err;
         throw new DecryptionFailed();
       }
     },
@@ -267,6 +266,10 @@ export function createCryptoAdapter(options?: { credentials?: CredentialAdapter 
         throw new Error('unknown product key');
       }
       return new Uint8Array(record.raw);
+    },
+    async importProductKey(keyRef, raw, digestHex) {
+      const key = await importAesKey(raw);
+      keys.set(keyRef, { key, raw: new Uint8Array(raw), digestHex });
     },
   };
 }
