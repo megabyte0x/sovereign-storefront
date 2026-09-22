@@ -2,7 +2,7 @@
 
 ## Status
 
-Research and product hypothesis (sections 1–10 below). A bounded MVP now exists on `feat/mvp-build` against the approved design. **Approval of the plan is not evidence the product works.** The live integrated demo did **not** overall pass. Skipped Waku, replica, and QR checks do not count as passing.
+Research and product hypothesis (sections 1–10 below). A bounded MVP now exists on `feat/mvp-build` against the approved design. **Approval of the plan is not evidence the product works.** The live integrated demo did **not** overall pass. Adapters are not PASS when live constructs memory. Replica absence fails fast. Skipped Waku and QR checks do not count as passing.
 
 Setup and executed evidence (do not treat the research sections as proof):
 

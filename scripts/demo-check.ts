@@ -38,6 +38,8 @@ export type LogosProbe = {
   independentPeers?: boolean;
 };
 
+export type LiveAdapterKind = 'memory' | 'real';
+
 export type PreflightInput = {
   nodeVersion: string;
   env: NodeJS.Dict<string>;
@@ -45,6 +47,11 @@ export type PreflightInput = {
   logos?: LogosProbe | null;
   chromiumPath?: string | null;
   tlsTerminatedByApp?: boolean;
+  liveAdapters?: {
+    messaging: LiveAdapterKind;
+    storage: LiveAdapterKind;
+    scanner: LiveAdapterKind;
+  };
 };
 
 export type PreflightResult = {
@@ -101,6 +108,27 @@ export type PaymentPath = {
   outputIndexKnown: boolean;
 };
 
+export type AdapterPath = {
+  configReal: boolean;
+  liveMessaging: LiveAdapterKind;
+  liveStorage: LiveAdapterKind;
+  liveScanner: LiveAdapterKind;
+};
+
+export function classifyAdapters(path: AdapterPath): CheckResult {
+  if (!path.configReal) {
+    return check('adapters', 'FAIL', 'real-demo requires real messaging/storage/scanner adapters');
+  }
+  if (path.liveMessaging === 'memory' || path.liveStorage === 'memory' || path.liveScanner === 'memory') {
+    return check(
+      'adapters',
+      'SKIP',
+      'config selected real adapters; live constructs MemoryScanner, createMemoryMessaging(), and createMemoryStorageAdapter()',
+    );
+  }
+  return check('adapters', 'PASS', 'real adapters selected and used; no fixture fallback');
+}
+
 export function classifyPayment(path: PaymentPath): CheckResult {
   if (path.scannerKind === 'memory' || path.injectedObservation || !path.outputIndexKnown) {
     return check(
@@ -132,6 +160,7 @@ export type ReplicaRetrievePath = {
   twoNodesDetected: boolean;
   originStopped: boolean;
   retrieved: boolean;
+  originStopUnsafeReason?: string;
   reason?: string;
 };
 
@@ -143,22 +172,36 @@ export function classifyReplicaRetrieve(path: ReplicaRetrievePath): CheckResult 
       'ciphertext retrieved from independent replica after origin stop',
     );
   }
+  if (path.originStopUnsafeReason) {
+    return check('replica-retrieve', 'SKIP', path.originStopUnsafeReason);
+  }
   if (path.twoNodesDetected) {
     return check(
       'replica-retrieve',
-      'SKIP',
+      'FAIL',
       'two Logos nodes detected; origin was not stopped and replica retrieve was not attempted. Gate B independent retrieval remains 73 ciphertext bytes',
     );
   }
   return check(
     'replica-retrieve',
-    'SKIP',
-    path.reason ?? 'live two-node Logos is not proven in this run',
+    'FAIL',
+    path.reason ?? 'independent storage replica is absent',
   );
 }
 
 export function classifyReplica(path: ReplicaRetrievePath): CheckResult {
-  return { ...classifyReplicaRetrieve(path), id: 'replica' };
+  if (path.twoNodesDetected) {
+    return check(
+      'replica',
+      'SKIP',
+      'two Logos nodes detected; origin-stop retrieve is a live step, not a preflight pass',
+    );
+  }
+  return check(
+    'replica',
+    'FAIL',
+    path.reason ?? 'independent storage replica is absent',
+  );
 }
 
 export type ChromiumPath = {
@@ -236,11 +279,16 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
   try {
     const cfg = loadConfig(input.env);
     const adapters = cfg.adapters;
-    if (cfg.mode !== 'real-demo' || adapters.messaging !== 'real' || adapters.storage !== 'real' || adapters.scanner !== 'real') {
-      checks.push(check('adapters', 'FAIL', 'real-demo requires real messaging/storage/scanner adapters'));
-    } else {
-      checks.push(check('adapters', 'PASS', 'real adapters selected; no fixture fallback'));
-    }
+    const live = input.liveAdapters ?? { messaging: 'memory' as const, storage: 'memory' as const, scanner: 'memory' as const };
+    checks.push(classifyAdapters({
+      configReal: cfg.mode === 'real-demo'
+        && adapters.messaging === 'real'
+        && adapters.storage === 'real'
+        && adapters.scanner === 'real',
+      liveMessaging: live.messaging,
+      liveStorage: live.storage,
+      liveScanner: live.scanner,
+    }));
   } catch (error) {
     const message = error instanceof ConfigError ? error.message : error instanceof Error ? error.message : 'config failed';
     checks.push(check('adapters', 'FAIL', message));
@@ -283,7 +331,7 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
   };
 }
 
-const HARD_PREFLIGHT = new Set(['node', 'network', 'confirmations', 'adapters', 'scanner']);
+const HARD_PREFLIGHT = new Set(['node', 'network', 'confirmations', 'adapters', 'scanner', 'replica']);
 
 function hardPreflightFailed(checks: CheckResult[]): boolean {
   return checks.some((item) => HARD_PREFLIGHT.has(item.id) && item.status === 'FAIL');
@@ -637,10 +685,14 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
     }
     steps.push(check('cleared-recovery', 'SKIP', 'browser clear-state/no false recovery is tests/browser/recovery.spec.ts; this process has no IndexedDB'));
 
+    const twoNodesDetected = preflight.logos?.ok === true && preflight.logos.independentPeers === true;
     steps.push(classifyReplicaRetrieve({
-      twoNodesDetected: preflight.logos?.ok === true && preflight.logos.independentPeers === true,
+      twoNodesDetected,
       originStopped: false,
       retrieved: false,
+      originStopUnsafeReason: twoNodesDetected
+        ? 'origin-stop is unsafe because another process needs the node (shared feat-mvp-t2 Logos runtime, not a demo-owned pair)'
+        : undefined,
       reason: preflight.logos?.reason,
     }));
     return {
@@ -694,6 +746,7 @@ async function main(): Promise<void> {
       : { ok: false, reason: logosDetected.reason, independentPeers: false },
     chromiumPath,
     tlsTerminatedByApp: false,
+    liveAdapters: { messaging: 'memory', storage: 'memory', scanner: 'memory' },
   };
 
   const result = sanitize(await runDemoCheck({

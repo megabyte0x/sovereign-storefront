@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import {
+  classifyAdapters,
   classifyCheckout,
   classifyPayment,
   classifyRecover,
@@ -56,11 +57,11 @@ test('preflight fails fast when ths is not running and does not claim pass', () 
   expect(isOverallPass(result.checks)).toBe(false);
 });
 
-test('a skipped replica check does not count as passing', () => {
+test('replica absence fails fast and does not count as passing', () => {
   const result = evaluatePreflight(baseInput({
     logos: { ok: false, reason: 'live two-node Logos is not running in this worktree' },
   }));
-  expect(result.checks.find((item) => item.id === 'replica')?.status).not.toBe('PASS');
+  expect(result.checks.find((item) => item.id === 'replica')?.status).toBe('FAIL');
   expect(isOverallPass(result.checks)).toBe(false);
   expect(result.ok).toBe(false);
 });
@@ -89,6 +90,25 @@ test('fixture adapters fail before any live settlement claim', () => {
   }));
   expect(result.ok).toBe(false);
   expect(result.checks.find((item) => item.id === 'adapters')?.status).toBe('FAIL');
+});
+
+test('preflight adapters is not PASS when live constructs memory adapters', () => {
+  const classified = classifyAdapters({
+    configReal: true,
+    liveMessaging: 'memory',
+    liveStorage: 'memory',
+    liveScanner: 'memory',
+  });
+  expect(classified.status).not.toBe('PASS');
+  expect(classified.detail).toMatch(/MemoryScanner/);
+  expect(classified.detail).toMatch(/createMemoryMessaging/);
+  expect(classified.detail).toMatch(/createMemoryStorageAdapter/);
+
+  const result = evaluatePreflight(baseInput({
+    liveAdapters: { messaging: 'memory', storage: 'memory', scanner: 'memory' },
+  }));
+  expect(result.checks.find((item) => item.id === 'adapters')?.status).not.toBe('PASS');
+  expect(result.ok).toBe(false);
 });
 
 test('mainnet selection fails preflight', () => {
@@ -136,6 +156,23 @@ test('demo-check does not run live steps or claim pass when preflight fails', as
   expect(isOverallPass([...result.preflight, ...result.steps])).toBe(false);
 });
 
+test('demo-check fails fast and does not run live when replica is absent', async () => {
+  let liveCalled = false;
+  const result = await runDemoCheck({
+    preflight: baseInput({
+      logos: { ok: false, reason: 'live two-node Logos is not running in this worktree' },
+    }),
+    runLive: async () => {
+      liveCalled = true;
+      return { steps: [{ id: 'replica-retrieve', status: 'SKIP' as const, detail: 'fake retrieve' }] };
+    },
+  });
+  expect(liveCalled).toBe(false);
+  expect(result.ok).toBe(false);
+  expect(result.liveAttempted).toBe(false);
+  expect(result.preflight.find((item) => item.id === 'replica')?.status).toBe('FAIL');
+});
+
 test('memory-scanner injection cannot be labelled payment PASS', () => {
   const result = classifyPayment({
     scannerKind: 'memory',
@@ -163,15 +200,27 @@ test('unrun replica retrieve cannot be labelled PASS', () => {
     reason: 'live two-node Logos is not proven in this run',
   });
   expect(absent.id).toBe('replica-retrieve');
-  expect(absent.status).not.toBe('PASS');
+  expect(absent.status).toBe('FAIL');
 
   const twoNodesUnrun = classifyReplicaRetrieve({
     twoNodesDetected: true,
     originStopped: false,
     retrieved: false,
   });
-  expect(twoNodesUnrun.status).not.toBe('PASS');
+  expect(twoNodesUnrun.status).toBe('FAIL');
   expect(twoNodesUnrun.detail.toLowerCase()).not.toMatch(/\bpass\b/);
+  expect(twoNodesUnrun.detail.toLowerCase()).not.toMatch(/\bskip\b/);
+});
+
+test('origin-stop retrieve skips only with an explicit unsafe reason', () => {
+  const unsafe = classifyReplicaRetrieve({
+    twoNodesDetected: true,
+    originStopped: false,
+    retrieved: false,
+    originStopUnsafeReason: 'origin-stop is unsafe because another process needs the node',
+  });
+  expect(unsafe.status).toBe('SKIP');
+  expect(unsafe.detail).toMatch(/another process needs the node/);
 });
 
 test('http recover after memory-scanner injection cannot be labelled PASS', () => {
