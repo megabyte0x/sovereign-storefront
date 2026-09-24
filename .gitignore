@@ -2,6 +2,11 @@
 .superpowers/
 node_modules/
 dist/
+.runtime/
+services/scanner/target/
+services/test-wallet/runtime/
+services/test-wallet/target/
+tools/payment-test-wallet/target/
 .env
 .env.*
 *.key

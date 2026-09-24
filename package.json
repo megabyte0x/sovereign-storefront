@@ -9,20 +9,30 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "vite build && tsc -p tsconfig.build.json && cp src/seller/schema.sql dist/service/seller/schema.sql",
+    "build:clean": "node scripts/clean-build.mjs",
     "build:browser": "vite build",
     "build:service": "tsc -p tsconfig.build.json && cp src/seller/schema.sql dist/service/seller/schema.sql",
     "test:browser": "playwright test",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "backup-check": "node --experimental-strip-types scripts/backup-check.ts",
-    "demo-check": "node --experimental-strip-types scripts/demo-check.ts"
+    "demo-check": "node --experimental-strip-types scripts/demo-check.ts",
+    "infra:doctor": "node --experimental-strip-types scripts/live-infra/doctor.ts",
+    "infra:up": "node --experimental-strip-types scripts/live-infra/up.ts",
+    "infra:down": "node --experimental-strip-types scripts/live-infra/down.ts"
   },
   "dependencies": {
+    "@noble/secp256k1": "1.7.2",
     "@waku/message-encryption": "0.0.38",
-    "@waku/utils": "0.0.27"
+    "@waku/sdk": "0.0.36",
+    "@waku/utils": "0.0.27",
+    "qrcode": "1.5.4"
   },
   "devDependencies": {
     "@playwright/test": "1.55.0",
     "@types/node": "24.5.2",
+    "@types/qrcode": "1.5.6",
+    "ajv": "8.17.1",
+    "jsqr": "1.4.0",
     "typescript": "5.9.2",
     "vite": "7.1.5",
     "vitest": "3.2.4"
