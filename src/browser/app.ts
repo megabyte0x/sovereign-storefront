@@ -1,5 +1,6 @@
 import { createCredentialAdapter } from '../adapters/credentials.ts';
 import { createCryptoAdapter } from '../adapters/crypto.ts';
+import { qrSvgMarkup } from './payment-request.ts';
 import {
   allowNewCheckout,
   type BrowserPurchase,
@@ -158,6 +159,7 @@ function parseDeliveryPackage(body: unknown): DeliveryPackage {
     productVersion?: unknown;
     buyerKeyId?: unknown;
     encryptedEnvelope?: unknown;
+    packageId?: unknown;
   };
   if (
     typeof row.orderId !== 'string'
@@ -173,6 +175,7 @@ function parseDeliveryPackage(body: unknown): DeliveryPackage {
     productVersion: row.productVersion,
     buyerKeyId: row.buyerKeyId,
     encryptedEnvelope: base64ToBytes(row.encryptedEnvelope),
+    packageId: typeof row.packageId === 'string' && /^[0-9a-f]{64}$/i.test(row.packageId) ? row.packageId.toLowerCase() : undefined,
   };
 }
 
@@ -220,14 +223,14 @@ export function createBrowserTransport(
     },
     async recover(orderId, credentialId) {
       const proof = await credentials.provePossession(credentialId, { orderId });
-      const response = await post('/api/recover', {
-        orderId,
-        proof: bytesToBase64(proof),
-      });
-      if (!response.ok) {
-        throw new Error(`recover failed: ${response.status}`);
-      }
+      const response = await post('/api/recover', { orderId, proof: bytesToBase64(proof) });
+      if (!response.ok) throw new Error(`recover failed: ${response.status}`);
       return parseDeliveryPackage(await response.json());
+    },
+    async acknowledge(orderId, credentialId, packageId) {
+      const proof = await credentials.provePossession(credentialId, { orderId });
+      const response = await post('/api/acknowledge', { orderId, packageId, proof: bytesToBase64(proof) });
+      if (!response.ok) throw new Error(`acknowledge failed: ${response.status}`);
     },
   };
 }
@@ -239,15 +242,7 @@ function navPurchasesMarkup(): string {
 function qrMarkup(uri: string): string {
   const escaped = escapeHtml(uri);
   return `<div data-zip321-qr="true" data-zip321-uri="${escaped}" role="img" aria-label="Payment request QR">
-    <svg viewBox="0 0 21 21" width="168" height="168" aria-hidden="true">
-      <rect width="21" height="21" fill="#fff"/>
-      <rect x="0" y="0" width="7" height="7" fill="#111"/>
-      <rect x="14" y="0" width="7" height="7" fill="#111"/>
-      <rect x="0" y="14" width="7" height="7" fill="#111"/>
-      <rect x="2" y="2" width="3" height="3" fill="#fff"/>
-      <rect x="16" y="2" width="3" height="3" fill="#fff"/>
-      <rect x="2" y="16" width="3" height="3" fill="#fff"/>
-    </svg>
+    ${qrSvgMarkup(uri)}
   </div>`;
 }
 

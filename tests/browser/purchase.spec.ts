@@ -443,7 +443,9 @@ test('Buy click persists checkout through DOM handlers and lists the purchase', 
   await expect(page.locator('#buy')).toBeEnabled();
   await page.locator('#buy').click();
   await expect(page.locator('#view-checkout')).toBeVisible();
-  await expect(page.locator('#zip321-uri')).toContainText(`zcash:${CONFIG_DESTINATION}`);
+  // Task 7's real invoice issuer mints a fresh unique-receiver address per
+  // order (Section 3.2); it does not reuse the config-level SSF_DESTINATION.
+  await expect(page.locator('#zip321-uri')).toContainText(/^zcash:uregtest1/);
   await expect(page.locator('#copy-uri')).toBeVisible();
   await page.locator('#copy-uri').click();
   await expect(page.locator('#copy-uri')).toHaveAttribute('data-copied', 'true');
@@ -471,14 +473,18 @@ test('recover returns the delivery package envelope to an authenticated buyer', 
   });
   expect(orderRes.ok()).toBe(true);
   const createdInvoice = await orderRes.json() as Invoice;
+  if (createdInvoice.attribution?.kind !== 'receiver') {
+    throw new Error('expected a receiver-attributed invoice');
+  }
+  scanner.setReceiptReceiver('out-recover-envelope', createdInvoice.attribution.receiver);
   scanner.replaceSnapshot([{
     outputId: 'out-recover-envelope',
-    invoiceId: createdInvoice.id,
+    invoiceId: null,
     amountZat: createdInvoice.amountZat,
     confirmations: 10,
     canonical: true,
     receivedAt: Date.now(),
-    revision: { id: 'rev-10', height: 10 },
+    revision: { id: 'rev-1', height: 1 },
   }], { id: 'rev-10', height: 10 }, true, Date.now());
 
   const recoverRes = await page.request.post(`${seller.publicUrl}/api/recover`, {

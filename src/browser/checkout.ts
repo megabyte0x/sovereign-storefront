@@ -25,7 +25,14 @@ function assertInvoiceBinding(record: BrowserPurchase, invoice: Invoice): void {
     throw new Error('invoice network is not test');
   }
   assertCanonicalAmount(invoice.amountZat);
-  if (!invoice.id || !invoice.orderId || !invoice.destination || !invoice.attributionRef) {
+  if (!invoice.id || !invoice.orderId || !invoice.destination) {
+    throw new Error('invoice terms are incomplete');
+  }
+  // Unique-receiver invoices are bound by their destination address alone;
+  // `attributionRef` is a read-only compatibility field for legacy
+  // memo-attributed invoices only, not a universal requirement.
+  const hasReceiverBinding = invoice.attribution?.kind === 'receiver' && !!invoice.attribution.receiver;
+  if (!hasReceiverBinding && !invoice.attributionRef) {
     throw new Error('invoice terms are incomplete');
   }
   if (!Number.isFinite(invoice.expiresAt)) {

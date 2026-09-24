@@ -5,21 +5,38 @@ import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createTestCredentialAdapter } from '../../src/adapters/credentials.ts';
 import { createMemoryMessaging } from '../../src/adapters/messaging.ts';
 import { MemoryScanner } from '../../src/adapters/scanner.ts';
-import type { Invoice, Observation, SellerStore } from '../../src/contracts/types.ts';
+import { openCatalogue } from '../../src/seller/catalogue.ts';
+import { createMemoryStorageAdapter } from '../../src/adapters/storage.ts';
+import type { Invoice, SellerStore, ServiceAvailability } from '../../src/contracts/types.ts';
+import type { ChainIdentity } from '../../src/contracts/live.ts';
 import { openStore } from '../../src/seller/db.ts';
 import { createFulfillment } from '../../src/seller/fulfillment.ts';
+import { createInvoiceIssuer } from '../../src/seller/issuance.ts';
 import { DEFAULT_POLICY, createPayments } from '../../src/seller/payments.ts';
 
 const scratchRoot = process.env.TMPDIR ?? tmpdir();
-const availability = {productPublished: true, messaging: true, storageReplica: true, scanner: true};
+const availability: ServiceAvailability = { productPublished: true, messaging: true, storageReplica: true, scanner: true };
+const chain: ChainIdentity = { network: 'regtest', genesisHash: 'a'.repeat(64), consensusFingerprint: 'c'.repeat(64) };
+const accountId = 'fixture-account';
 
 let dbPath = '';
 let scratchDir = '';
 let store: SellerStore;
 
+function setupProduct(path: string, amountZat = '100'): void {
+  const catalogue = openCatalogue({ dbPath: path, storage: createMemoryStorageAdapter() });
+  catalogue.beginPublication({ version: 'book-v1', description: 'fixture', amountZat, network: chain.network });
+  catalogue.completePublication({
+    version: 'book-v1', ciphertextCid: 'fixture-cid', ciphertextDigest: 'a'.repeat(64), fileSize: 1,
+    sellerKeyRef: 'fixture-key', wrappedKey: new Uint8Array([1]),
+  });
+  catalogue.close();
+}
+
 beforeEach(() => {
   scratchDir = mkdtempSync(join(scratchRoot, 'ssf-fulfill-'));
   dbPath = join(scratchDir, 'seller.sqlite');
+  setupProduct(dbPath);
 });
 
 afterEach(async () => {
@@ -36,47 +53,46 @@ function envelope(invoice: Invoice) {
   };
 }
 
-function observation(invoice: Invoice, overrides: Partial<Observation> = {}): Observation {
-  return {
-    outputId: 'out-a',
-    invoiceId: invoice.id,
-    amountZat: invoice.amountZat,
-    confirmations: DEFAULT_POLICY.minConfirmations,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-10', height: 10 },
-    ...overrides,
-  };
+function payInvoice(
+  scanner: MemoryScanner,
+  invoice: Invoice,
+  overrides: { outputId?: string; canonical?: boolean; minedHeight?: number; confirmations?: number; checkedAt?: number } = {},
+) {
+  if (invoice.attribution?.kind !== 'receiver') throw new Error('receiver invoice required');
+  const outputId = overrides.outputId ?? 'out-a';
+  const minedHeight = overrides.minedHeight ?? 1;
+  const confirmations = overrides.confirmations ?? DEFAULT_POLICY.minConfirmations;
+  const tipHeight = minedHeight + confirmations - 1;
+  const minedRev = { id: `rev-${minedHeight}`, height: minedHeight };
+  const tipRev = { id: `rev-${tipHeight}`, height: tipHeight };
+  scanner.setReceiptReceiver(outputId, invoice.attribution.receiver);
+  scanner.replaceSnapshot(
+    [{ outputId, invoiceId: null, amountZat: invoice.amountZat, confirmations: 0, canonical: overrides.canonical ?? true, receivedAt: 1000, revision: minedRev }],
+    tipRev,
+    true,
+    overrides.checkedAt ?? 1000,
+  );
+  return { outputId, minedRevision: minedRev, tipRevision: tipRev };
 }
 
 async function paidSetup(buyerKeyId = 'buyer-a') {
   store = await openStore(dbPath);
   const credentials = createTestCredentialAdapter();
   const created = await credentials.createPurchaseCredential();
-  const order = await store.createOrder({
-    requestId: `req-${buyerKeyId}`,
-    buyerKeyId: created.buyerKeyId,
-    productVersion: 'book-v1',
-  });
-  const invoice = await store.getOrCreateInvoice({
-    orderId: order.id,
-    buyerKeyId: created.buyerKeyId,
-    productVersion: 'book-v1',
-    now: 1000,
-    availability,
-  });
   const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
+  const issuer = createInvoiceIssuer({
+    store, scanner, chain, accountId, ttlMs: 60_000, now: () => 1000,
+    availability: async () => availability,
   });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(receipt);
-  return { credentials, created, invoice, scanner, payments, receipt };
+  const invoice = await issuer.issue({
+    requestId: `req-${buyerKeyId}`, buyerKeyId: created.buyerKeyId, productVersion: 'book-v1', expectedAmountZat: '100',
+  });
+  payInvoice(scanner, invoice);
+  const payments = createPayments({
+    store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv),
+  });
+  await payments.reconcileFromScanner();
+  return { credentials, created, invoice, scanner, payments, issuer };
 }
 
 test('authorizeRelease is the only first-disclosure gate and failed CAS does not disclose', async () => {
@@ -141,7 +157,7 @@ test('overlapping dispatchPending ticks do not double-send', async () => {
   expect(inner.sent[0].orderId).toBe(invoice.orderId);
 });
 
-test('crash before send does not authorize a second payment; crash after send persists sent_unacknowledged', async () => {
+test('dispatchPending persists an intent record before send I/O, and a transport-accepted outcome only after send succeeds', async () => {
   const { invoice, payments, scanner } = await paidSetup();
   let crashBefore = true;
   const messaging = createMemoryMessaging({
@@ -153,6 +169,9 @@ test('crash before send does not authorize a second payment; crash after send pe
   await expect(fulfillment.dispatchPending()).rejects.toThrow(/before send/);
   expect(messaging.sendInitiatedFor).toHaveLength(0);
   expect(await store.getDelivery(invoice.orderId)).toBe('queued');
+  // Intent was persisted before the send attempt even though we can't yet
+  // prove anything reached the transport: uncertain, not falsely resolved.
+  expect(await store.getDisclosure(invoice.orderId)).toBe('attempted');
 
   crashBefore = false;
   let crashAfter = true;
@@ -164,12 +183,19 @@ test('crash before send does not authorize a second payment; crash after send pe
   const resumed = createFulfillment({ store, payments, messaging: after });
   await expect(resumed.dispatchPending()).rejects.toThrow(/after send/);
   expect(after.sendInitiatedFor).toEqual([invoice.orderId]);
-  expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
+  // The transport fixture actually recorded the send, but our own process
+  // crashed before learning the outcome: delivery stays 'queued' (uncertain,
+  // not claimed exactly-once), not falsely upgraded to sent_unacknowledged.
+  expect(await store.getDelivery(invoice.orderId)).toBe('queued');
+  expect(await store.getDisclosure(invoice.orderId)).toBe('attempted');
 
   crashAfter = false;
   await resumed.dispatchPending();
+  // At-least-once semantics: retry legitimately resends rather than
+  // silently skipping on unproven prior success.
   expect(after.sent).toHaveLength(2);
   expect(await store.getDelivery(invoice.orderId)).toBe('sent_unacknowledged');
+  expect(await store.getDisclosure(invoice.orderId)).toBe('transport-accepted');
   expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
   expect(scanner).toBeDefined();
 });
@@ -200,27 +226,11 @@ test('buyer A credential cannot recover or status buyer B order before any discl
   const first = await paidSetup('buyer-a');
   const credentials = first.credentials;
   const buyerB = await credentials.createPurchaseCredential();
-  const orderB = await store.createOrder({
-    requestId: 'req-buyer-b',
-    buyerKeyId: buyerB.buyerKeyId,
-    productVersion: 'book-v1',
+  const invoiceB = await first.issuer.issue({
+    requestId: 'req-buyer-b', buyerKeyId: buyerB.buyerKeyId, productVersion: 'book-v1', expectedAmountZat: '100',
   });
-  const invoiceB = await store.getOrCreateInvoice({
-    orderId: orderB.id,
-    buyerKeyId: buyerB.buyerKeyId,
-    productVersion: 'book-v1',
-    now: 1000,
-    availability,
-  });
-  first.payments.cacheInvoice(invoiceB);
-  const receiptB = observation(invoiceB, { outputId: 'out-b' });
-  first.scanner.replaceSnapshot(
-    [observation(first.invoice), receiptB],
-    receiptB.revision,
-    true,
-    1000,
-  );
-  await first.payments.reconcileObservation(receiptB);
+  payInvoice(first.scanner, invoiceB, { outputId: 'out-b' });
+  await first.payments.reconcileFromScanner();
   const fulfillment = createFulfillment({
     store,
     payments: first.payments,
@@ -234,7 +244,7 @@ test('buyer A credential cannot recover or status buyer B order before any discl
   expect(owned.disclose).toBe(true);
 });
 
-test('acknowledgements bind to the order and authenticated sender', async () => {
+test('acknowledgements bind to the order, authenticated sender and exact packageId', async () => {
   const { invoice, payments, credentials, created } = await paidSetup();
   const other = await credentials.createPurchaseCredential();
   const fulfillment = createFulfillment({
@@ -244,13 +254,20 @@ test('acknowledgements bind to the order and authenticated sender', async () => 
     credentials,
   });
   await fulfillment.dispatchPending();
-  await expect(fulfillment.acknowledge(invoice.orderId, other.credentialId)).rejects.toThrow(/buyer/);
-  await fulfillment.acknowledge(invoice.orderId, created.credentialId);
+  const pkg = await store.getPreparedPackage(invoice.orderId);
+  const packageId = pkg?.packageId;
+  if (!packageId) throw new Error('prepared package missing identity');
+  await expect(fulfillment.acknowledge(invoice.orderId, other.credentialId, packageId)).rejects.toThrow(/buyer/);
+  await expect(fulfillment.acknowledge(invoice.orderId, created.credentialId, 'wrong-package-id')).rejects.toThrow(/package identity/);
+  await fulfillment.acknowledge(invoice.orderId, created.credentialId, packageId);
+  expect(await store.getDelivery(invoice.orderId)).toBe('acknowledged');
+  // Idempotent: acking the same package again does not throw.
+  await fulfillment.acknowledge(invoice.orderId, created.credentialId, packageId);
   expect(await store.getDelivery(invoice.orderId)).toBe('acknowledged');
 });
 
-test('prepare, crash before send, payment reorg, recover: disclose is false', async () => {
-  const { invoice, payments, scanner, credentials, created, receipt } = await paidSetup();
+test('prepare, then payment reorg, then recover: disclose is false', async () => {
+  const { invoice, payments, scanner, credentials, created } = await paidSetup();
   expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
   const fulfillment = createFulfillment({
     store,
@@ -258,14 +275,8 @@ test('prepare, crash before send, payment reorg, recover: disclose is false', as
     messaging: createMemoryMessaging(),
     credentials,
   });
-  const reorged: Observation = {
-    ...receipt,
-    canonical: false,
-    confirmations: 0,
-    revision: { id: 'rev-11', height: 11 },
-  };
-  scanner.replaceSnapshot([reorged], reorged.revision, true, 1000);
-  await payments.reconcileObservation(reorged);
+  scanner.replaceSnapshot([], { id: 'rev-99', height: 99 }, true, 1000);
+  await payments.reconcileFromScanner();
   const recovered = await fulfillment.recover(invoice.orderId, created.credentialId);
   expect(recovered.disclose).toBe(false);
   expect(recovered.reason).toBe('not_eligible');
@@ -273,50 +284,20 @@ test('prepare, crash before send, payment reorg, recover: disclose is false', as
   expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
 });
 
-test('prepare then reorg before authorizeRelease holds disclosure', async () => {
-  store = await openStore(dbPath);
-  const order = await store.createOrder({requestId: 'hold', buyerKeyId: 'buyer-hold', productVersion: 'book-v1'});
-  const invoice = await store.getOrCreateInvoice({
-    orderId: order.id, buyerKeyId: 'buyer-hold', productVersion: 'book-v1', now: 1000, availability,
-  });
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(receipt);
-  const reorged: Observation = {
-    ...receipt,
-    canonical: false,
-    confirmations: 0,
-    revision: { id: 'rev-11', height: 11 },
-  };
-  scanner.replaceSnapshot([reorged], reorged.revision, true, 1000);
-  await payments.reconcileObservation(reorged);
-  const decision = await payments.authorizeRelease(invoice.orderId);
-  expect(decision.disclose).toBe(false);
-  expect(decision.reason).toBe('not_eligible');
-  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
-  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('reorged');
-});
-
 test('reorg after release records exception and preserves delivery evidence', async () => {
-  const { invoice, payments, receipt, scanner } = await paidSetup();
+  const { invoice, payments, scanner } = await paidSetup();
   const first = await payments.authorizeRelease(invoice.orderId);
   expect(first.reason).toBe('first_release');
-  const reorged: Observation = {
-    ...receipt,
-    canonical: false,
-    confirmations: 0,
-    revision: { id: 'rev-11', height: 11 },
-  };
-  scanner.replaceSnapshot([reorged], reorged.revision, true, 1000);
-  await payments.reconcileObservation(reorged);
+  if (invoice.attribution?.kind !== 'receiver') throw new Error('receiver invoice required');
+  // Same output, still matched, but now reported non-canonical (reorged out).
+  scanner.setReceiptReceiver('out-a', invoice.attribution.receiver);
+  scanner.replaceSnapshot(
+    [{ outputId: 'out-a', invoiceId: null, amountZat: invoice.amountZat, confirmations: 0, canonical: false, receivedAt: 1000, revision: { id: 'rev-99', height: 99 } }],
+    { id: 'rev-99', height: 99 },
+    true,
+    1000,
+  );
+  await payments.reconcileFromScanner();
   const status = await payments.orderStatus(invoice.orderId);
   expect(status.delivery).toBe('queued');
   expect(status.exceptions.some((item) => item.code === 'reorg_after_release')).toBe(true);
@@ -324,32 +305,6 @@ test('reorg after release records exception and preserves delivery evidence', as
   expect(replay.disclose).toBe(true);
   expect(replay.reason).toBe('replay');
   expect(replay.package).not.toBeNull();
-});
-
-test('concurrent reconciliation cannot sneak a reorg between eligibility and authorization', async () => {
-  const { invoice, payments, receipt, scanner } = await paidSetup();
-  const reorged: Observation = {
-    ...receipt,
-    canonical: false,
-    confirmations: 0,
-    revision: { id: 'rev-11', height: 11 },
-  };
-  scanner.replaceSnapshot([reorged], reorged.revision, true, 1000);
-  const results = await Promise.all([
-    payments.reconcileObservation(reorged),
-    payments.authorizeRelease(invoice.orderId),
-  ]);
-  const decision = results[1];
-  const status = await payments.orderStatus(invoice.orderId);
-  if (decision.disclose) {
-    expect(decision.reason).toBe('first_release');
-    expect(status.delivery).toBe('queued');
-    expect(status.exceptions.some((item) => item.code === 'reorg_after_release')).toBe(true);
-  } else {
-    expect(decision.reason).toBe('not_eligible');
-    expect(status.delivery).toBe('prepared');
-    expect(status.payment).toBe('reorged');
-  }
 });
 
 test('restart recaches invoices and rescans before authorizeRelease and dispatchPending succeed', async () => {

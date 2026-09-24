@@ -1,3 +1,6 @@
+import type { ChainIdentity, Network, ReceiverAllocation, ReceiverRef, ScanSnapshot } from './live.ts';
+import type { StoredDelivery, WakuConfig, WakuSession } from './messages.ts';
+
 export type PaymentState =
   | 'awaiting' | 'detected' | 'confirming' | 'confirmed'
   | 'review_required' | 'reorged';
@@ -15,14 +18,38 @@ export type ScanCheckpoint = { revision: ChainRevision };
 
 export type Invoice = {
   id: string; orderId: string; productVersion: string;
-  buyerKeyId: string; network: 'test'; amountZat: string;
-  destination: string; attributionRef: string;
+  buyerKeyId: string; network: Network; chain?: ChainIdentity; accountId?: string; amountZat: string;
+  destination: string; paymentUri?: string; attribution?: InvoiceAttribution;
+  /** Read-only compatibility field for migrated v1 records only. */
+  attributionRef?: string;
   expiresAt: number;
+};
+export type ReceiverInvoiceAttribution = { kind: 'receiver'; allocationId: string; receiver: ReceiverRef };
+export type InvoiceAttribution = ReceiverInvoiceAttribution | { kind: 'legacy-memo'; reference: string };
+/** Live issuance/transport contract; legacy rows are excluded by construction. */
+export type LiveInvoice = Invoice & {
+  chain: ChainIdentity; accountId: string; paymentUri: string; attribution: ReceiverInvoiceAttribution;
+  attributionRef?: never;
+};
+export type InvoiceDraft = {
+  id: string; orderId: string; productVersion: string; buyerKeyId: string;
+  chain: ChainIdentity; accountId: string; amountZat: string; createdAt: number; expiresAt: number;
+};
+export type ReconciledCheckpoint = {
+  sourceId: string; generation: string; tip: { height: number; hash: string }; checkedAt: number;
+};
+export type Disclosure = 'none' | 'attempted' | 'transport-accepted' | 'buyer-acknowledged';
+export type DeliveryAttempt = {
+  attemptId: string; orderId: string; packageId: string;
+  reason: 'initial' | 'recovery'; checkpoint: ReconciledCheckpoint | null;
 };
 export type Observation = {
   outputId: string; invoiceId: string | null; amountZat: string;
   confirmations: number; canonical: boolean; receivedAt: number;
   revision: ChainRevision;
+  sourceId?: string; generation?: string;
+  /** Immutable scanner receipt identity, populated by snapshot hydration. */
+  chainNetwork?: Network; txid?: string; pool?: string; outputIndex?: number;
 };
 export type ScanHealth = {
   healthy: boolean; checkedAt: number;
@@ -36,6 +63,7 @@ export type ExceptionRecord = {
   createdAt: number; detail: string;
 };
 export type InvoiceSettlement = {
+  invoiceId?: string;
   payment: PaymentState;
   releaseEligible: boolean;
   backingOutputIds: string[];
@@ -49,13 +77,15 @@ export type OrderStatus = {
 };
 export type BrowserPurchase = {
   version: 1; requestId: string; orderId: string | null;
-  productVersion: string;
+  productVersion: string; network?: Network; amountZat?: string;
   sellerOrigin: string; sellerKeyId: string;
   credentialId: string; invoice: Invoice | null;
 };
 export type DeliveryPackage = {
   orderId: string; productVersion: string; buyerKeyId: string;
   encryptedEnvelope: Uint8Array;
+  /** Immutable identity persisted with the prepared package. */
+  packageId?: string;
 };
 export type ReleaseDecision = {
   disclose: boolean;
@@ -79,6 +109,8 @@ export interface PurchaseStore {
   list(): Promise<BrowserPurchase[]>;
   exportBackup(requestId: string): Promise<Uint8Array>;
   importBackup(data: Uint8Array): Promise<BrowserPurchase>;
+  saveDelivery(orderId: string, record: StoredDelivery): Promise<void>;
+  getDelivery(orderId: string): Promise<StoredDelivery | null>;
 }
 export interface Scanner {
   health(): Promise<ScanHealth>;
@@ -93,6 +125,7 @@ export interface OrderTransport {
   create(record: BrowserPurchase): Promise<Invoice>;
   status(orderId: string, credentialId: string): Promise<OrderStatus>;
   recover(orderId: string, credentialId: string): Promise<DeliveryPackage>;
+  acknowledge(orderId: string, credentialId: string, packageId: string): Promise<void>;
 }
 export type PossessionChallenge = { orderId: string };
 
@@ -103,6 +136,8 @@ export interface CredentialAdapter {
   decryptWrapped(credentialId: string, wrappedKey: Uint8Array): Promise<Uint8Array>;
   exportBackupMaterial(credentialId: string): Promise<Uint8Array>;
   importBackupMaterial(data: Uint8Array): Promise<{ credentialId: string; buyerKeyId: string }>;
+  publicKey(credentialId: string): Promise<string>;
+  createWakuSession(credentialId: string, config: WakuConfig): Promise<WakuSession>;
 }
 export interface CryptoAdapter {
   encryptProduct(plaintext: Uint8Array): Promise<{ ciphertext: Uint8Array; keyRef: string }>;
@@ -126,11 +161,29 @@ export interface SellerStore {
   listInvoices(): Promise<Invoice[]>;
   listObservations(): Promise<Observation[]>;
   getCheckpoint(): Promise<ScanCheckpoint | null>;
+  getReconciledCheckpoint(): Promise<ReconciledCheckpoint | null>;
   commitReconciliation(input: {
     checkpoint: ScanCheckpoint;
     observations: Observation[];
     settlements: InvoiceSettlement[];
   }): Promise<void>;
+  reserveInvoice(input: {
+    orderId: string; buyerKeyId: string; productVersion: string;
+    chain: ChainIdentity; accountId: string; now: number; ttlMs: number;
+  }): Promise<InvoiceDraft>;
+  commitInvoice(draftId: string, allocation: ReceiverAllocation): Promise<Invoice>;
+  getInvoiceDraft(orderId: string): Promise<InvoiceDraft | null>;
+  getScanSnapshot(): Promise<ScanSnapshot | null>;
+  commitSnapshot(input: {
+    snapshot: ScanSnapshot; observations: Observation[]; settlements: InvoiceSettlement[];
+  }): Promise<void>;
+  beginDeliveryAttempt(input: Omit<DeliveryAttempt, 'attemptId'>): Promise<DeliveryAttempt>;
+  finishDeliveryAttempt(attemptId: string, outcome: 'transport-accepted' | 'failed'): Promise<void>;
+  getDisclosure(orderId: string): Promise<Disclosure>;
+  acknowledgePackage(orderId: string, packageId: string): Promise<void>;
+  recordMessage(input: {
+    signer: string; messageId: string; operation: string; payloadDigest: string; expiresAt: number;
+  }): Promise<'new' | 'duplicate'>;
   savePreparedPackage(pkg: DeliveryPackage): Promise<void>;
   getPreparedPackage(orderId: string): Promise<DeliveryPackage | null>;
   getDelivery(orderId: string): Promise<DeliveryState>;

@@ -4,6 +4,7 @@ import type {
   Invoice,
   PurchaseStore,
 } from '../contracts/types.ts';
+import type { StoredDelivery } from '../contracts/messages.ts';
 
 export const BEARER_SECRET_WARNING =
   'This file grants access to the purchase and is not an ordinary receipt. Treat it as a bearer secret.';
@@ -75,6 +76,7 @@ type StoredPurchase = {
   credentialId: string;
   invoice: Invoice | null;
   credentialMaterial: number[];
+  delivery?: { packageId: string; wireEnvelope: number[] };
 };
 
 type BackupEnvelope = {
@@ -439,6 +441,22 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         throw new Error('imported purchase was not persisted');
       }
       return read;
+    },
+    async saveDelivery(orderId: string, delivery: StoredDelivery): Promise<void> {
+      if (!delivery.packageId || !(delivery.wireEnvelope instanceof Uint8Array) || delivery.wireEnvelope.byteLength === 0) {
+        throw new Error('malformed delivery');
+      }
+      const tx = db.transaction(PURCHASE_STORE, 'readonly');
+      const rows = (await requestDone(tx.objectStore(PURCHASE_STORE).getAll())) as StoredPurchase[];
+      const row = rows.find((candidate) => candidate.orderId === orderId);
+      if (!row) throw new Error('unknown purchase order');
+      await writeStored({ ...row, delivery: { packageId: delivery.packageId, wireEnvelope: Array.from(delivery.wireEnvelope) } });
+    },
+    async getDelivery(orderId: string): Promise<StoredDelivery | null> {
+      const tx = db.transaction(PURCHASE_STORE, 'readonly');
+      const rows = (await requestDone(tx.objectStore(PURCHASE_STORE).getAll())) as StoredPurchase[];
+      const delivery = rows.find((candidate) => candidate.orderId === orderId)?.delivery;
+      return delivery ? { packageId: delivery.packageId, wireEnvelope: Uint8Array.from(delivery.wireEnvelope) } : null;
     },
   };
   return store;

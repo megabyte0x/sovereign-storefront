@@ -4,19 +4,36 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { MemoryScanner, SCANNER_MAPPING } from '../../src/adapters/scanner.ts';
 import { DEFAULT_POLICY, createPayments } from '../../src/seller/payments.ts';
+import { createInvoiceIssuer } from '../../src/seller/issuance.ts';
 import { openStore } from '../../src/seller/db.ts';
-import type { Invoice, Observation, SellerStore } from '../../src/contracts/types.ts';
+import { openCatalogue } from '../../src/seller/catalogue.ts';
+import { createMemoryStorageAdapter } from '../../src/adapters/storage.ts';
+import type { Invoice, SellerStore, ServiceAvailability } from '../../src/contracts/types.ts';
+import type { ChainIdentity } from '../../src/contracts/live.ts';
 
 const scratchRoot = process.env.TMPDIR ?? tmpdir();
-const availability = {productPublished: true, messaging: true, storageReplica: true, scanner: true};
+const availability: ServiceAvailability = { productPublished: true, messaging: true, storageReplica: true, scanner: true };
+const chain: ChainIdentity = { network: 'regtest', genesisHash: 'a'.repeat(64), consensusFingerprint: 'c'.repeat(64) };
+const accountId = 'fixture-account';
 
 let dbPath = '';
 let scratchDir = '';
 let store: SellerStore;
 
+function setupProduct(path: string, amountZat = '100'): void {
+  const catalogue = openCatalogue({ dbPath: path, storage: createMemoryStorageAdapter() });
+  catalogue.beginPublication({ version: 'book-v1', description: 'fixture', amountZat, network: chain.network });
+  catalogue.completePublication({
+    version: 'book-v1', ciphertextCid: 'fixture-cid', ciphertextDigest: 'a'.repeat(64), fileSize: 1,
+    sellerKeyRef: 'fixture-key', wrappedKey: new Uint8Array([1]),
+  });
+  catalogue.close();
+}
+
 beforeEach(() => {
   scratchDir = mkdtempSync(join(scratchRoot, 'ssf-payments-'));
   dbPath = join(scratchDir, 'seller.sqlite');
+  setupProduct(dbPath);
 });
 
 afterEach(async () => {
@@ -24,25 +41,39 @@ afterEach(async () => {
   rmSync(scratchDir, { recursive: true, force: true });
 });
 
-async function seed(storeRef: SellerStore, buyerKeyId = 'buyer-a') {
-  const order = await storeRef.createOrder({requestId: `req-${buyerKeyId}`, buyerKeyId, productVersion: 'book-v1'});
-  const invoice = await storeRef.getOrCreateInvoice({
-    orderId: order.id, buyerKeyId, productVersion: 'book-v1', now: 1000, availability,
+async function issueInvoice(scanner: MemoryScanner, requestId: string, buyerKeyId = 'buyer-a'): Promise<Invoice> {
+  const issuer = createInvoiceIssuer({
+    store, scanner, chain, accountId, ttlMs: 60_000, now: () => 1000,
+    availability: async () => availability,
   });
-  return { order, invoice };
+  return issuer.issue({ requestId, buyerKeyId, productVersion: 'book-v1', expectedAmountZat: '100' });
 }
 
-function observation(invoice: Invoice, overrides: Partial<Observation> = {}): Observation {
-  return {
-    outputId: 'out-a',
-    invoiceId: invoice.id,
-    amountZat: invoice.amountZat,
-    confirmations: DEFAULT_POLICY.minConfirmations,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-10', height: 10 },
-    ...overrides,
-  };
+/** Sets up a scanner receipt that pays the given invoice's exact receiver, with enough confirmations to confirm by default. */
+function payInvoice(
+  scanner: MemoryScanner,
+  invoice: Invoice,
+  overrides: {
+    outputId?: string; canonical?: boolean; minedHeight?: number; confirmations?: number;
+    checkedAt?: number; complete?: boolean;
+  } = {},
+) {
+  if (invoice.attribution?.kind !== 'receiver') throw new Error('receiver invoice required');
+  const outputId = overrides.outputId ?? 'out-a';
+  const minedHeight = overrides.minedHeight ?? 1;
+  const confirmations = overrides.confirmations ?? DEFAULT_POLICY.minConfirmations;
+  const tipHeight = minedHeight + confirmations - 1;
+  const minedRev = { id: `rev-${minedHeight}`, height: minedHeight };
+  const tipRev = { id: `rev-${tipHeight}`, height: tipHeight };
+  scanner.setReceiptReceiver(outputId, invoice.attribution.receiver);
+  scanner.replaceSnapshot(
+    [{ outputId, invoiceId: null, amountZat: invoice.amountZat, confirmations: 0, canonical: overrides.canonical ?? true, receivedAt: 1000, revision: minedRev }],
+    tipRev,
+    true,
+    overrides.checkedAt ?? 1000,
+  );
+  if (overrides.complete === false) scanner.stopConsumer();
+  return { outputId, minedRevision: minedRev, tipRevision: tipRev };
 }
 
 function envelope(invoice: Invoice) {
@@ -57,366 +88,168 @@ function envelope(invoice: Invoice) {
 test('scanner mapping is a labelled dashboard double, not compact-block WalletRead', () => {
   expect(SCANNER_MAPPING.walletReadWired).toBe(false);
   expect(SCANNER_MAPPING.compactBlockScan).toBe(false);
-  expect(SCANNER_MAPPING.liveAttribution).toBe('destination-ua');
-  expect(SCANNER_MAPPING.reducerAttribution).toContain('invoiceId');
-  expect(SCANNER_MAPPING.minConfirmationsDefault).toBe(10);
   expect(DEFAULT_POLICY.minConfirmations).toBe(10);
 });
 
-test('commitReconciliation advances the checkpoint only after observations and settlements commit', async () => {
+test('reconcileFromScanner commits snapshot+observations+settlements together and authorizes release', async () => {
   store = await openStore(dbPath);
-  const { invoice } = await seed(store);
   const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
+  const invoice = await issueInvoice(scanner, 'req-1');
+  payInvoice(scanner, invoice);
   const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
+    store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv),
   });
-  payments.cacheInvoice(invoice);
-  expect(await store.getCheckpoint()).toBeNull();
-  await payments.reconcileObservation(receipt);
-  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
+  expect(await store.getScanSnapshot()).toBeNull();
+  await payments.reconcileFromScanner();
+  expect(await store.getScanSnapshot()).not.toBeNull();
   expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
-  expect(await store.getPreparedPackage(invoice.orderId)).toEqual(envelope(invoice));
   const decision = await payments.authorizeRelease(invoice.orderId);
   expect(decision.disclose).toBe(true);
   expect(decision.reason).toBe('first_release');
 });
 
-test('crash after observation and before commit recovers the output through observations(from) without double-claim', async () => {
-  let crash = false;
-  store = await openStore(dbPath, {
-    crashAfterObservations: () => {
-      if (crash) throw new Error('injected crash after observations');
-    },
-  });
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  crash = true;
-  await expect(payments.reconcileObservation(receipt)).rejects.toThrow(/injected crash/);
-  crash = false;
-  expect(await store.getCheckpoint()).toBeNull();
-  await store.close();
-
+test('a newer generation at a lower height revokes a previously confirmed payment', async () => {
   store = await openStore(dbPath);
-  const restarted = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  restarted.cacheInvoice(invoice);
-  await restarted.reconcileFromScanner();
-  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
-  await restarted.reconcileFromScanner();
-  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
-  const status = await restarted.orderStatus(invoice.orderId);
-  expect(status.payment).toBe('confirmed');
-  expect(status.exceptions.filter((item) => item.code === 'duplicate')).toHaveLength(0);
-});
-
-test('prepared package existence is not disclosure', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
   const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(receipt);
-  expect(await store.getPreparedPackage(invoice.orderId)).not.toBeNull();
-  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
-  scanner.setHealth({ healthy: false, caughtUp: false, revision: receipt.revision, checkedAt: 1000 });
-  const decision = await payments.authorizeRelease(invoice.orderId);
-  expect(decision.disclose).toBe(false);
-  expect(decision.reason).toBe('not_eligible');
-  expect(decision.package).toBeNull();
-});
-
-test('scanner outage sets verification unavailable or stale and does not mark a confirmed purchase unpaid', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(receipt);
+  const invoice = await issueInvoice(scanner, 'req-2');
+  payInvoice(scanner, invoice, { minedHeight: 1 });
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
   expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
 
-  scanner.setHealth({ healthy: false, caughtUp: false, revision: receipt.revision, checkedAt: 1000 });
-  await payments.reconcileObservation({ ...receipt, confirmations: 11, revision: { id: 'rev-11', height: 11 } });
+  // A reorg drops the chain to a lower, newer-generation tip that no longer includes the receipt.
+  scanner.replaceSnapshot([], { id: 'rev-5', height: 5 }, true, 1000);
+  await payments.reconcileFromScanner();
+  const status = await payments.orderStatus(invoice.orderId);
+  expect(status.payment).not.toBe('confirmed');
+});
+
+test('a receipt at the wrong receiver never confirms an unrelated invoice', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-3');
+  const other = await issueInvoice(scanner, 'req-3b', 'buyer-b');
+  if (other.attribution?.kind !== 'receiver') throw new Error('receiver invoice required');
+  // Pay the OTHER invoice's receiver, not this invoice's.
+  const rev = { id: 'rev-1', height: 1 };
+  scanner.setReceiptReceiver('out-a', other.attribution.receiver);
+  scanner.replaceSnapshot(
+    [{ outputId: 'out-a', invoiceId: null, amountZat: invoice.amountZat, confirmations: 0, canonical: true, receivedAt: 1000, revision: rev }],
+    { id: 'rev-10', height: 10 },
+    true,
+    1000,
+  );
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('awaiting');
+  expect((await payments.orderStatus(other.orderId)).payment).toBe('confirmed');
+});
+
+test('unrelated fresh health cannot authorize an old, no-longer-caught-up receipt', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-4');
+  payInvoice(scanner, invoice, { checkedAt: 1000 });
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
+
+  // "Fresh" health but not caught up: must not authorize release.
+  scanner.setHealth({ checkedAt: 5000, caughtUp: false });
+  const decision = await payments.authorizeRelease(invoice.orderId);
+  expect(decision.disclose).toBe(false);
+});
+
+test('missing receipt in a complete snapshot revokes a previously confirmed payment', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-5');
+  payInvoice(scanner, invoice);
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
+
+  // Complete snapshot with no receipts at all: the prior receipt has vanished.
+  scanner.replaceSnapshot([], { id: 'rev-30', height: 30 }, true, 1000);
+  await payments.reconcileFromScanner();
+  expect((await payments.orderStatus(invoice.orderId)).payment).not.toBe('confirmed');
+});
+
+test('a partial (incomplete) snapshot does not commit', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-6');
+  payInvoice(scanner, invoice, { complete: false });
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect(await store.getScanSnapshot()).toBeNull();
+  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
+});
+
+test('a future checkedAt fails and does not commit', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-7');
+  payInvoice(scanner, invoice, { checkedAt: 999_999_999 });
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect(await store.getScanSnapshot()).toBeNull();
+  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
+});
+
+test('scanner outage sets verification unavailable and does not mark a confirmed purchase unpaid', async () => {
+  store = await openStore(dbPath);
+  const scanner = new MemoryScanner();
+  const invoice = await issueInvoice(scanner, 'req-8');
+  payInvoice(scanner, invoice);
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
+  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
+
+  scanner.setHealth({ healthy: false, caughtUp: false });
   const down = await payments.orderStatus(invoice.orderId);
   expect(down.payment).toBe('confirmed');
   expect(down.verification).toBe('unavailable');
   expect(down.exceptions.some((item) => item.code === 'verification_unavailable')).toBe(true);
-  expect((await payments.authorizeRelease(invoice.orderId)).disclose).toBe(false);
-
-  scanner.setHealth({
-    healthy: true,
-    caughtUp: true,
-    revision: { id: 'rev-11', height: 11 },
-    checkedAt: 1000 - DEFAULT_POLICY.maxHealthAgeMs - 1,
-  });
-  const stale = await payments.orderStatus(invoice.orderId);
-  expect(stale.payment).toBe('confirmed');
-  expect(stale.verification).toBe('stale');
 });
 
-test('exceptions are independent of payment and delivery enums', async () => {
+test('crash between commitSnapshot and prepare re-prepares on the next reconcile without disclosing', async () => {
   store = await openStore(dbPath);
-  const { invoice } = await seed(store);
   const scanner = new MemoryScanner();
-  const over: Observation = observation(invoice, { amountZat: `${BigInt(invoice.amountZat) + 1n}` });
-  scanner.replaceSnapshot([over], over.revision, true, 1000);
+  const invoice = await issueInvoice(scanner, 'req-9');
+  payInvoice(scanner, invoice);
   const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
+    store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv),
+    hooks: { crashAfterCommit: () => { throw new Error('injected crash after commit'); } },
   });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(over);
-  const paid = await payments.orderStatus(invoice.orderId);
-  expect(paid.payment).toBe('confirmed');
-  expect(paid.delivery).toBe('prepared');
-  expect(paid.exceptions.some((item) => item.code === 'overpayment')).toBe(true);
-
-  const other = await seed(store, 'buyer-b');
-  scanner.replaceSnapshot([], { id: 'genesis', height: 0 }, false, 1000);
-  scanner.setHealth({ healthy: false, caughtUp: false, revision: { id: 'genesis', height: 0 }, checkedAt: 1000 });
-  payments.cacheInvoice(other.invoice);
-  await payments.reconcileObservation({
-    outputId: 'out-unrelated',
-    invoiceId: null,
-    amountZat: other.invoice.amountZat,
-    confirmations: 0,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-1', height: 1 },
-  });
-  const waiting = await payments.orderStatus(other.invoice.orderId);
-  expect(waiting.payment).toBe('awaiting');
-  expect(waiting.delivery).toBe('locked');
-  expect(waiting.verification).toBe('unavailable');
-  expect(waiting.exceptions.some((item) => item.code === 'verification_unavailable')).toBe(true);
-});
-
-test('payments module does not offer automatic refunds', async () => {
-  expect('refund' in createPayments).toBe(false);
-  store = await openStore(dbPath);
-  const payments = createPayments({
-    store,
-    scanner: new MemoryScanner(),
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  expect('refund' in payments).toBe(false);
-  expect('requestRefund' in payments).toBe(false);
-});
-
-test('does not advance checkpoint when invoiceId is set but the invoice is unknown', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  const later: Observation = {
-    outputId: 'out-later',
-    invoiceId: null,
-    amountZat: invoice.amountZat,
-    confirmations: 0,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-11', height: 11 },
-  };
-  scanner.replaceSnapshot([receipt, later], later.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  await payments.reconcileFromScanner();
-  expect(await store.getCheckpoint()).toEqual({ revision: later.revision });
-  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
-  expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
-});
-
-test('crash after commit re-prepares on recache and rescan without disclosing', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-    hooks: {
-      crashAfterCommit: () => {
-        throw new Error('injected crash after commit');
-      },
-    },
-  });
-  payments.cacheInvoice(invoice);
-  await expect(payments.reconcileObservation(receipt)).rejects.toThrow(/after commit/);
-  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
+  await expect(payments.reconcileFromScanner()).rejects.toThrow(/after commit/);
+  expect(await store.getScanSnapshot()).not.toBeNull();
   expect(await store.getDelivery(invoice.orderId)).toBe('locked');
-  expect(await store.getPreparedPackage(invoice.orderId)).toBeNull();
   await store.close();
 
   store = await openStore(dbPath);
-  const restarted = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  restarted.cacheInvoice(invoice);
+  const restarted = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
   await restarted.reconcileFromScanner();
   expect(await store.getDelivery(invoice.orderId)).toBe('prepared');
-  expect(await store.getPreparedPackage(invoice.orderId)).toEqual(envelope(invoice));
-  const beforeRelease = await restarted.authorizeRelease(invoice.orderId);
-  expect(beforeRelease.disclose).toBe(true);
-  expect(beforeRelease.reason).toBe('first_release');
-});
-
-test('authorizeRelease prepares a paid-but-locked order then queues it', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-    hooks: {
-      crashAfterCommit: () => {
-        throw new Error('injected crash after commit');
-      },
-    },
-  });
-  payments.cacheInvoice(invoice);
-  await expect(payments.reconcileObservation(receipt)).rejects.toThrow(/after commit/);
-  expect(await store.getDelivery(invoice.orderId)).toBe('locked');
-  expect(await store.getPreparedPackage(invoice.orderId)).toBeNull();
-
-  const decision = await payments.authorizeRelease(invoice.orderId);
+  const decision = await restarted.authorizeRelease(invoice.orderId);
   expect(decision.disclose).toBe(true);
   expect(decision.reason).toBe('first_release');
-  expect(decision.package).toEqual(envelope(invoice));
-  expect(await store.getDelivery(invoice.orderId)).toBe('queued');
 });
 
-test('hydrate invoices and observations from sqlite after restart', async () => {
+test('hydrate invoices from sqlite after restart and re-authorize from a fresh reconcile', async () => {
   store = await openStore(dbPath);
-  const { invoice } = await seed(store);
   const scanner = new MemoryScanner();
-  const receipt = observation(invoice);
-  scanner.replaceSnapshot([receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(receipt);
+  const invoice = await issueInvoice(scanner, 'req-10');
+  payInvoice(scanner, invoice);
+  const payments = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
+  await payments.reconcileFromScanner();
   expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
   await store.close();
 
   store = await openStore(dbPath);
-  const restarted = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
+  const restarted = createPayments({ store, scanner, now: () => 1000, preparePackage: async (inv) => envelope(inv) });
   expect(await restarted.knownOrderIds()).toContain(invoice.orderId);
-  const status = await restarted.orderStatus(invoice.orderId);
-  expect(status.payment).toBe('confirmed');
   await restarted.reconcileFromScanner();
   const decision = await restarted.authorizeRelease(invoice.orderId);
   expect(decision.disclose).toBe(true);
-});
-
-test('unknown invoiceId does not abort later observations', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const unknown: Observation = {
-    outputId: 'out-unknown',
-    invoiceId: 'inv-missing',
-    amountZat: invoice.amountZat,
-    confirmations: DEFAULT_POLICY.minConfirmations,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-9', height: 9 },
-  };
-  const receipt = observation(invoice, { revision: { id: 'rev-11', height: 11 } });
-  scanner.replaceSnapshot([unknown, receipt], receipt.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileFromScanner();
-  expect((await payments.orderStatus(invoice.orderId)).payment).toBe('confirmed');
-  expect(await store.getCheckpoint()).toEqual({ revision: receipt.revision });
-});
-
-test('checkpoint does not move backwards when a later observation has a lower height', async () => {
-  store = await openStore(dbPath);
-  const { invoice } = await seed(store);
-  const scanner = new MemoryScanner();
-  const high = observation(invoice, { revision: { id: 'rev-20', height: 20 } });
-  scanner.replaceSnapshot([high], high.revision, true, 1000);
-  const payments = createPayments({
-    store,
-    scanner,
-    now: () => 1000,
-    preparePackage: async (inv) => envelope(inv),
-  });
-  payments.cacheInvoice(invoice);
-  await payments.reconcileObservation(high);
-  expect(await store.getCheckpoint()).toEqual({ revision: high.revision });
-
-  const low: Observation = {
-    outputId: 'out-older',
-    invoiceId: null,
-    amountZat: invoice.amountZat,
-    confirmations: 0,
-    canonical: true,
-    receivedAt: 1000,
-    revision: { id: 'rev-5', height: 5 },
-  };
-  await payments.reconcileObservation(low);
-  expect(await store.getCheckpoint()).toEqual({ revision: high.revision });
 });

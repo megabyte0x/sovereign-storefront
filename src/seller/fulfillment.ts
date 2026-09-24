@@ -23,7 +23,6 @@ async function persistSentUnacknowledged(store: SellerStore, orderId: string): P
 }
 
 export function createFulfillment(deps: FulfillmentDeps) {
-  const sentThisProcess = new Set<string>();
   let inFlight: Promise<void> | null = null;
 
   async function assertBuyer(orderId: string, credentialId: string): Promise<void> {
@@ -55,8 +54,9 @@ export function createFulfillment(deps: FulfillmentDeps) {
       return deps.payments.orderStatus(orderId);
     },
 
-    async acknowledge(orderId: string, credentialId: string): Promise<void> {
+    async acknowledge(orderId: string, credentialId: string, packageId: string): Promise<void> {
       await assertBuyer(orderId, credentialId);
+      await deps.store.acknowledgePackage(orderId, packageId);
       const ok = await deps.store.compareAndSetDelivery(
         orderId,
         'sent_unacknowledged',
@@ -64,7 +64,12 @@ export function createFulfillment(deps: FulfillmentDeps) {
         { id: 'ack', height: 0 },
       );
       if (!ok) {
-        throw new Error('acknowledgement not accepted');
+        const current = await deps.store.getDelivery(orderId);
+        if (current !== 'acknowledged') {
+          throw new Error('acknowledgement not accepted');
+        }
+        // Idempotent replay of the same authenticated ack for the same
+        // immutable package.
       }
     },
 
@@ -73,22 +78,33 @@ export function createFulfillment(deps: FulfillmentDeps) {
       inFlight = (async () => {
         try {
           for (const orderId of await deps.payments.knownOrderIds()) {
-            if (sentThisProcess.has(orderId)) continue;
             const decision = await deps.payments.authorizeRelease(orderId);
             if (!decision.disclose || !decision.package) continue;
             if (decision.delivery === 'acknowledged') continue;
+            if (decision.delivery === 'sent_unacknowledged') continue;
             const pkg: DeliveryPackage = decision.package;
+            const packageId = pkg.packageId;
+            if (!packageId) throw new Error('prepared package missing identity');
+            // Persist intent before any network I/O: a crash after this
+            // point but before send is a durably visible 'attempted'
+            // disclosure, not silently lost.
+            const attempt = await deps.store.beginDeliveryAttempt({
+              orderId,
+              packageId,
+              reason: 'initial',
+              checkpoint: null,
+            });
             try {
               await deps.messaging.send(pkg);
-              sentThisProcess.add(orderId);
-              await deps.store.recordSendAttempt(orderId);
-              await persistSentUnacknowledged(deps.store, orderId);
             } catch (error) {
-              if (deps.messaging.sendInitiatedFor.includes(orderId)) {
-                await persistSentUnacknowledged(deps.store, orderId);
-              }
+              // Send outcome is unproven either way (our own process may
+              // crash before or after the transport actually accepted it);
+              // leave the attempt unresolved rather than guessing, and do
+              // not upgrade delivery state on an unconfirmed send.
               throw error;
             }
+            await deps.store.finishDeliveryAttempt(attempt.attemptId, 'transport-accepted');
+            await persistSentUnacknowledged(deps.store, orderId);
           }
         } finally {
           inFlight = null;

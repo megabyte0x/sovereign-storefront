@@ -8,6 +8,7 @@ import {
   assertProductNetwork,
   assertRequiredString,
 } from '../contracts/validation.ts';
+import { migrateStore } from './migrations.ts';
 import {
   FILE_FORMAT_VERSION,
   FIRST_RELEASE_MAX_CIPHERTEXT_BYTES,
@@ -110,6 +111,7 @@ export function openCatalogue(options: {
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA journal_mode = WAL');
   db.exec(SCHEMA);
+  migrateStore(db);
 
   const read = (version: string): ProductRow | undefined =>
     db.prepare(

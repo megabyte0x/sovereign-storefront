@@ -13,11 +13,11 @@ import type {
   CredentialAdapter,
   DeliveryPackage,
   OrderStatus,
-  Scanner,
   SellerStore,
   ServiceAvailability,
   StorageAdapter,
 } from '../contracts/types.ts';
+import type { ReceiptSource } from '../contracts/live.ts';
 import { MAX_PAYLOAD_BYTES } from '../contracts/validation.ts';
 import { createCiphertextHandler } from '../gateway/ciphertext.ts';
 import { publishProduct } from './admin.ts';
@@ -25,6 +25,7 @@ import { openCatalogue } from './catalogue.ts';
 import { openStore } from './db.ts';
 import { createFulfillment } from './fulfillment.ts';
 import { loadOrCreateSellerIdentity } from './identity.ts';
+import { createInvoiceIssuer } from './issuance.ts';
 import { createPayments } from './payments.ts';
 
 const CSP = [
@@ -53,7 +54,7 @@ export type SellerOptions = {
   availability?: Partial<ServiceAvailability>;
   publicDir?: string;
   storage?: StorageAdapter;
-  scanner?: Scanner;
+  scanner?: ReceiptSource;
   credentials?: CredentialAdapter;
   messaging?: FulfillmentMessaging;
   logger?: OperationalLogger;
@@ -131,12 +132,14 @@ function serializeDeliveryPackage(pkg: DeliveryPackage): {
   productVersion: string;
   buyerKeyId: string;
   encryptedEnvelope: string;
+  packageId?: string;
 } {
   return {
     orderId: pkg.orderId,
     productVersion: pkg.productVersion,
     buyerKeyId: pkg.buyerKeyId,
     encryptedEnvelope: Buffer.from(pkg.encryptedEnvelope).toString('base64'),
+    packageId: pkg.packageId,
   };
 }
 
@@ -199,9 +202,16 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const messaging = options.messaging ?? createMemoryMessaging();
   const logger = options.logger ?? silentLogger;
 
+  if (scanner instanceof MemoryScanner) {
+    scanner.setChainNetwork(config.productNetwork);
+  }
   if (scanner instanceof MemoryScanner && !options.scanner) {
     scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   }
+
+  const startupSnapshot = await scanner.snapshot();
+  const chain = startupSnapshot.chain;
+  const accountId = startupSnapshot.accountId;
 
   if (options.seedProduct) {
     await publishProduct({
@@ -209,7 +219,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       version: 'book-v1',
       description: 'Harmless fixture',
       amountZat: '100000000',
-      network: config.productNetwork,
+      network: chain.network,
       plaintext: FIXTURE_PLAINTEXT,
       crypto,
       storage,
@@ -226,8 +236,8 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       messaging: async () => availabilityOverride.messaging ?? true,
       scanner: async () => {
         if (availabilityOverride.scanner === false) return false;
-        const health = await scanner.health();
-        return health.healthy && health.caughtUp;
+        const snapshot = await scanner.snapshot();
+        return snapshot.health === 'ready' && snapshot.caughtUp;
       },
       ...(availabilityOverride.storageReplica === undefined
         ? {}
@@ -268,6 +278,15 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     },
   });
   const fulfillment = createFulfillment({ store, payments, messaging, credentials });
+  const issuer = createInvoiceIssuer({
+    store,
+    scanner,
+    chain,
+    accountId,
+    ttlMs: config.invoiceTtlMs,
+    now: Date.now,
+    availability: async () => catalogue.currentAvailability(),
+  });
   const dispatchTimer = setInterval(() => {
     void payments.reconcileFromScanner()
       .then(() => fulfillment.dispatchPending())
@@ -337,6 +356,14 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         sendPublic(req, res, 404, 'not found');
         return;
       }
+      if (config.mode === 'real-demo' && (path === '/api/orders' || path === '/api/status' || path === '/api/recover')) {
+        // Task 7: real-demo checkout/status/recovery must go through the
+        // authenticated Waku application path (Task 9), not this HTTP
+        // fallback. These routes stay reachable only in fixture mode for
+        // the pre-existing deterministic browser tests that exercise them.
+        sendPublic(req, res, 404, 'not found');
+        return;
+      }
       if (path.startsWith('/ciphertext/')) {
         ciphertext(req, res);
         logResponse(req, 0);
@@ -399,18 +426,16 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           sendPublicJson(req, res, 403, { error: 'proof rejected' });
           return;
         }
-        const availability = await catalogue.currentAvailability();
-        const order = await store.createOrder({
+        const manifest = catalogue.getManifest(payload.productVersion);
+        if (!manifest?.amountZat) {
+          sendPublicJson(req, res, 400, { error: 'unpublished product' });
+          return;
+        }
+        const invoice = await issuer.issue({
           requestId: payload.requestId,
           buyerKeyId: payload.buyerKeyId,
           productVersion: payload.productVersion,
-        });
-        const invoice = await store.getOrCreateInvoice({
-          orderId: order.id,
-          buyerKeyId: payload.buyerKeyId,
-          productVersion: payload.productVersion,
-          now: Date.now(),
-          availability,
+          expectedAmountZat: manifest.amountZat,
         });
         payments.cacheInvoice(invoice);
         logger.log({ event: 'invoice.issued' });

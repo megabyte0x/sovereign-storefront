@@ -1,4 +1,5 @@
 import { parseAmountZat } from '../contracts/validation.ts';
+import { sameReceiver } from '../contracts/live-validation.ts';
 import type {
   ChainRevision,
   DeliveryPackage,
@@ -12,10 +13,10 @@ import type {
   Policy,
   ReleaseDecision,
   ScanHealth,
-  Scanner,
   SellerStore,
   Verification,
 } from '../contracts/types.ts';
+import type { ReceiptSource, Receipt, ScanSnapshot } from '../contracts/live.ts';
 
 export const DEFAULT_MIN_CONFIRMATIONS = 10;
 export const DEFAULT_MAX_HEALTH_AGE_MS = 120_000;
@@ -63,6 +64,15 @@ function healthAllowsRelease(
   return true;
 }
 
+/**
+ * Pure settlement reducer. Unchanged in shape from the pre-Task-5 version:
+ * it still takes an already invoiceId-attributed Observation[] plus a health
+ * snapshot and folds them into one settlement. What changed in Task 5 is
+ * WHERE these Observation[] come from (see fetchAndCommitSnapshot below):
+ * they are now derived wholesale, every reconciliation cycle, from one
+ * complete authoritative ReceiptSource snapshot and receiver-identity
+ * matching, never from an incrementally merged per-output height cache.
+ */
 export function reduceInvoice(
   invoice: Invoice,
   receipts: Observation[],
@@ -149,17 +159,11 @@ function createLock() {
   };
 }
 
-function applyReceipt(into: Map<string, Observation>, observation: Observation): void {
-  const previous = into.get(observation.outputId);
-  if (!previous || observation.revision.height >= previous.revision.height) {
-    into.set(observation.outputId, { ...observation, revision: { ...observation.revision } });
-  }
-}
-
-function classifyVerification(health: ScanHealth, policy: Policy, now: number): Verification {
-  if (!health.healthy) return 'unavailable';
-  if (now - health.checkedAt > policy.maxHealthAgeMs) return 'stale';
-  if (!health.caughtUp) return 'stale';
+function classifyVerification(snapshot: ScanSnapshot | null, policy: Policy, now: number): Verification {
+  if (!snapshot) return 'unavailable';
+  if (snapshot.health !== 'ready') return 'unavailable';
+  if (snapshot.checkedAt > now || now - snapshot.checkedAt > policy.maxHealthAgeMs) return 'stale';
+  if (!snapshot.caughtUp) return 'stale';
   return 'available';
 }
 
@@ -170,8 +174,20 @@ function isAuthorized(delivery: DeliveryState): boolean {
     || delivery === 'retry_required';
 }
 
-function receiptsForInvoice(receipts: Map<string, Observation>, invoiceId: string): Observation[] {
-  return [...receipts.values()].filter((item) => item.invoiceId === invoiceId);
+function receiptMatchesInvoice(invoice: Invoice, snapshot: ScanSnapshot, receipt: Receipt): boolean {
+  if (invoice.attribution?.kind !== 'receiver') return false;
+  if (!invoice.chain || !invoice.accountId) return false;
+  if (invoice.accountId !== snapshot.accountId) return false;
+  if (invoice.chain.network !== snapshot.chain.network) return false;
+  if (invoice.chain.genesisHash !== snapshot.chain.genesisHash) return false;
+  if (invoice.chain.consensusFingerprint !== snapshot.chain.consensusFingerprint) return false;
+  return sameReceiver(invoice.attribution.receiver, {
+    accountId: receipt.accountId,
+    scope: receipt.scope === 'external' ? 'external' : invoice.attribution.receiver.scope,
+    pool: 'orchard',
+    diversifierIndex: invoice.attribution.receiver.diversifierIndex,
+    receiverHex: receipt.receiverHex,
+  }) && receipt.scope === 'external' && receipt.pool === 'orchard';
 }
 
 export type PaymentHooks = {
@@ -181,7 +197,7 @@ export type PaymentHooks = {
 
 export type PaymentDeps = {
   store: SellerStore;
-  scanner: Scanner;
+  scanner: ReceiptSource;
   policy?: Policy;
   now?: () => number;
   preparePackage?: (invoice: Invoice) => Promise<DeliveryPackage>;
@@ -191,7 +207,6 @@ export type PaymentDeps = {
 export type Payments = {
   cacheInvoice(invoice: Invoice): void;
   knownOrderIds(): Promise<string[]>;
-  reconcileObservation(observation: Observation): Promise<void>;
   reconcileFromScanner(): Promise<void>;
   authorizeRelease(orderId: string): Promise<ReleaseDecision>;
   orderStatus(orderId: string): Promise<OrderStatus>;
@@ -230,8 +245,6 @@ export function createPayments(deps: PaymentDeps): Payments {
   const lock = createLock();
   const invoicesById = new Map<string, Invoice>();
   const invoicesByOrder = new Map<string, Invoice>();
-  const receipts = new Map<string, Observation>();
-  let hydratePromise: Promise<void> | null = null;
 
   function cacheInvoice(invoice: Invoice): void {
     invoicesById.set(invoice.id, invoice);
@@ -239,17 +252,12 @@ export function createPayments(deps: PaymentDeps): Payments {
   }
 
   async function hydrateFromStore(): Promise<void> {
-    if (!hydratePromise) {
-      hydratePromise = (async () => {
-        for (const invoice of await store.listInvoices()) {
-          cacheInvoice(invoice);
-        }
-        for (const observation of await store.listObservations()) {
-          applyReceipt(receipts, observation);
-        }
-      })();
+    // Always re-fetch: invoices are issued continuously by a separate issuer
+    // process/path, so a payments instance must see newly issued invoices on
+    // every reconciliation cycle, not just the first.
+    for (const invoice of await store.listInvoices()) {
+      cacheInvoice(invoice);
     }
-    await hydratePromise;
   }
 
   async function loadInvoiceForOrder(orderId: string): Promise<Invoice | null> {
@@ -274,11 +282,17 @@ export function createPayments(deps: PaymentDeps): Payments {
 
   async function settleInvoice(
     invoice: Invoice,
-    source: Map<string, Observation>,
+    observations: Observation[],
     health: ScanHealth,
     at: number,
   ): Promise<InvoiceSettlement> {
-    const settlement = reduceInvoice(invoice, receiptsForInvoice(source, invoice.id), health, policy, at);
+    const settlement = reduceInvoice(
+      invoice,
+      observations.filter((item) => item.invoiceId === invoice.id),
+      health,
+      policy,
+      at,
+    );
     const delivery = await store.getDelivery(invoice.orderId);
     if (settlement.payment === 'reorged' && isAuthorized(delivery)) {
       settlement.exceptions.push({
@@ -292,50 +306,88 @@ export function createPayments(deps: PaymentDeps): Payments {
     return settlement;
   }
 
-  async function reconcileObservationLocked(observation: Observation): Promise<boolean> {
+  /**
+   * The single production reconciliation entrypoint. Fetches ONE complete
+   * ReceiptSource snapshot, wholesale-replaces the reducer's view of the
+   * world from it (never merges with a stale incremental cache), matches
+   * receipts to known invoices by receiver identity (not an injected
+   * invoiceId), refuses to commit an incomplete/future-dated snapshot, and
+   * atomically persists observations+settlements+snapshot together via
+   * store.commitSnapshot. Returns false when nothing was committed (stale,
+   * incomplete, or future-dated snapshot) so callers such as
+   * authorizeRelease can refuse first disclosure on that cycle.
+   */
+  async function fetchAndCommitSnapshot(): Promise<boolean> {
+    const raw = await scanner.snapshot();
+    const at = now();
+    if (raw.checkedAt > at) return false;
+    if (!raw.complete) return false;
+
     await hydrateFromStore();
-    let invoice = observation.invoiceId ? invoicesById.get(observation.invoiceId) ?? null : null;
-    if (observation.invoiceId && !invoice) {
-      for (const cached of invoicesByOrder.values()) {
-        if (cached.id === observation.invoiceId) {
-          invoice = cached;
-          cacheInvoice(cached);
-          break;
-        }
-      }
+    const knownInvoices = [...invoicesByOrder.values()];
+
+    const observations: Observation[] = [];
+    for (const receipt of raw.receipts) {
+      if (receipt.pool !== 'orchard' || receipt.scope !== 'external') continue;
+      const matched = knownInvoices.find((invoice) => receiptMatchesInvoice(invoice, raw, receipt));
+      observations.push({
+        outputId: receipt.outputId,
+        invoiceId: matched ? matched.id : null,
+        amountZat: receipt.amountZat,
+        confirmations: receipt.canonical && receipt.mined
+          ? Math.max(0, raw.tip.height - receipt.mined.height + 1)
+          : 0,
+        canonical: receipt.canonical,
+        receivedAt: receipt.firstSeenAt,
+        revision: { id: raw.tip.hash, height: raw.tip.height },
+        sourceId: raw.sourceId,
+        generation: raw.generation,
+        chainNetwork: raw.chain.network,
+        txid: receipt.txid,
+        pool: receipt.pool,
+        outputIndex: receipt.outputIndex,
+      });
     }
 
-    const at = now();
-    const health = await scanner.health();
-    const verification = classifyVerification(health, policy, at);
-    const pending = new Map(receipts);
-    applyReceipt(pending, observation);
+    const health: ScanHealth = {
+      healthy: raw.health === 'ready',
+      checkedAt: raw.checkedAt,
+      revision: { id: raw.tip.hash, height: raw.tip.height },
+      caughtUp: raw.caughtUp,
+    };
 
     const settlements: InvoiceSettlement[] = [];
-    if (invoice) {
-      settlements.push(await settleInvoice(invoice, pending, health, at));
+    for (const invoice of knownInvoices) {
+      if (invoice.attribution?.kind !== 'receiver') continue;
+      settlements.push(await settleInvoice(invoice, observations, health, at));
     }
 
     deps.hooks?.crashBeforeCommit?.();
-    await store.commitReconciliation({
-      checkpoint: { revision: observation.revision },
-      observations: invoice || observation.invoiceId === null ? [observation] : [],
-      settlements,
-    });
-    applyReceipt(receipts, observation);
+    await store.commitSnapshot({ snapshot: raw, observations, settlements });
     deps.hooks?.crashAfterCommit?.();
 
-    for (const cached of invoicesByOrder.values()) {
-      await recordVerification(cached.orderId, verification, at);
+    const verification = classifyVerification(raw, policy, at);
+    for (const invoice of knownInvoices) {
+      await recordVerification(invoice.orderId, verification, at);
     }
 
-    if (invoice) {
-      const settlement = settlements[0];
+    let settlementIndex = 0;
+    for (const invoice of knownInvoices) {
+      if (invoice.attribution?.kind !== 'receiver') continue;
+      const settlement = settlements[settlementIndex];
+      settlementIndex += 1;
       if (settlement?.releaseEligible) {
         await persistPreparedPackage(store, invoice, health.revision, preparePackage);
       }
     }
+
     return true;
+  }
+
+  async function currentSnapshotAndObservations(): Promise<{ snapshot: ScanSnapshot | null; observations: Observation[] }> {
+    const snapshot = await store.getScanSnapshot();
+    const observations = await store.listObservations();
+    return { snapshot, observations };
   }
 
   async function authorizeReleaseLocked(orderId: string): Promise<ReleaseDecision> {
@@ -345,26 +397,44 @@ export function createPayments(deps: PaymentDeps): Payments {
     if (isAuthorized(delivery)) {
       return { disclose: true, reason: 'replay', delivery, package: pkg };
     }
-    if (!invoice) {
+    if (!invoice || invoice.attribution?.kind !== 'receiver') {
       return { disclose: false, reason: 'not_eligible', delivery, package: null };
     }
 
-    const at = now();
-    const health = await scanner.health();
-    const settlement = reduceInvoice(invoice, receiptsForInvoice(receipts, invoice.id), health, policy, at);
-    if (!settlement.releaseEligible) {
+    const committed = await fetchAndCommitSnapshot();
+    if (!committed) {
       return { disclose: false, reason: 'not_eligible', delivery, package: null };
     }
-    if (delivery === 'locked') {
-      await persistPreparedPackage(store, invoice, health.revision, preparePackage);
-      delivery = await store.getDelivery(orderId);
-      pkg = await store.getPreparedPackage(orderId);
-    }
+
+    delivery = await store.getDelivery(orderId);
+    pkg = await store.getPreparedPackage(orderId);
     if (delivery !== 'prepared') {
       return { disclose: false, reason: 'not_eligible', delivery, package: null };
     }
 
-    const ok = await store.compareAndSetDelivery(orderId, 'prepared', 'queued', health.revision);
+    const { snapshot, observations } = await currentSnapshotAndObservations();
+    if (!snapshot) {
+      return { disclose: false, reason: 'not_eligible', delivery, package: null };
+    }
+    const health: ScanHealth = {
+      healthy: snapshot.health === 'ready',
+      checkedAt: snapshot.checkedAt,
+      revision: { id: snapshot.tip.hash, height: snapshot.tip.height },
+      caughtUp: snapshot.caughtUp,
+    };
+    const fresh = reduceInvoice(
+      invoice,
+      observations.filter((item) => item.invoiceId === invoice.id),
+      health,
+      policy,
+      now(),
+    );
+    if (!fresh.releaseEligible) {
+      return { disclose: false, reason: 'not_eligible', delivery, package: null };
+    }
+
+    const revision = { id: snapshot.tip.hash, height: snapshot.tip.height };
+    const ok = await store.compareAndSetDelivery(orderId, 'prepared', 'queued', revision);
     if (!ok) {
       return {
         disclose: false,
@@ -387,22 +457,9 @@ export function createPayments(deps: PaymentDeps): Payments {
       await hydrateFromStore();
       return [...invoicesByOrder.keys()];
     },
-    reconcileObservation(observation) {
-      return lock(async () => {
-        await reconcileObservationLocked(observation);
-      });
-    },
     reconcileFromScanner() {
       return lock(async () => {
-        await hydrateFromStore();
-        const checkpoint = await store.getCheckpoint();
-        const items: Observation[] = [];
-        for await (const item of scanner.observations(checkpoint)) {
-          items.push(item);
-        }
-        for (const item of items) {
-          await reconcileObservationLocked(item);
-        }
+        await fetchAndCommitSnapshot();
       });
     },
     authorizeRelease(orderId) {
@@ -413,15 +470,37 @@ export function createPayments(deps: PaymentDeps): Payments {
         const invoice = await loadInvoiceForOrder(orderId);
         const delivery = await store.getDelivery(orderId);
         const at = now();
-        const health = await scanner.health();
-        const verification = classifyVerification(health, policy, at);
+        const live = await scanner.snapshot().catch(() => null);
+        const verification = classifyVerification(live, policy, at);
         await recordVerification(orderId, verification, at);
-        const settlement = invoice
-          ? reduceInvoice(invoice, receiptsForInvoice(receipts, invoice.id), health, policy, at)
-          : null;
+        if (!invoice || invoice.attribution?.kind !== 'receiver') {
+          const exceptions = await store.listExceptions(orderId);
+          return {
+            payment: 'awaiting',
+            delivery,
+            verification,
+            exceptions: exceptions.map((record) => ({ code: record.code })),
+          };
+        }
+        const { snapshot, observations } = await currentSnapshotAndObservations();
+        const health: ScanHealth = snapshot
+          ? {
+            healthy: snapshot.health === 'ready',
+            checkedAt: snapshot.checkedAt,
+            revision: { id: snapshot.tip.hash, height: snapshot.tip.height },
+            caughtUp: snapshot.caughtUp,
+          }
+          : { healthy: false, checkedAt: 0, revision: { id: 'none', height: 0 }, caughtUp: false };
+        const settlement = reduceInvoice(
+          invoice,
+          observations.filter((item) => item.invoiceId === invoice.id),
+          health,
+          policy,
+          at,
+        );
         const exceptions = await store.listExceptions(orderId);
         return {
-          payment: settlement?.payment ?? 'awaiting',
+          payment: settlement.payment,
           delivery,
           verification,
           exceptions: exceptions.map((record) => ({ code: record.code })),

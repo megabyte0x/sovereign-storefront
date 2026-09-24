@@ -46,12 +46,18 @@ CREATE TABLE IF NOT EXISTS invoices (
   order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
   product_version TEXT NOT NULL,
   buyer_key_id TEXT NOT NULL,
-  network TEXT NOT NULL CHECK (network = 'test'),
+  network TEXT NOT NULL CHECK (network IN ('test', 'regtest')),
   amount_zat TEXT NOT NULL,
   destination TEXT NOT NULL,
   attribution_ref TEXT NOT NULL UNIQUE,
   expires_at INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  attribution_kind TEXT NOT NULL DEFAULT 'legacy-memo',
+  attribution_data TEXT NOT NULL DEFAULT '{}',
+  payment_uri TEXT NOT NULL DEFAULT '',
+  chain_genesis_hash TEXT NOT NULL DEFAULT '',
+  consensus_fingerprint TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -62,7 +68,13 @@ CREATE TABLE IF NOT EXISTS observations (
   canonical INTEGER NOT NULL CHECK (canonical IN (0, 1)),
   received_at INTEGER NOT NULL,
   revision_id TEXT NOT NULL,
-  revision_height INTEGER NOT NULL
+  revision_height INTEGER NOT NULL,
+  source_id TEXT NOT NULL DEFAULT 'legacy',
+  generation TEXT NOT NULL DEFAULT '0',
+  chain_network TEXT NOT NULL DEFAULT '',
+  txid TEXT NOT NULL DEFAULT '',
+  pool TEXT NOT NULL DEFAULT '',
+  output_index INTEGER NOT NULL DEFAULT -1
 );
 
 CREATE TABLE IF NOT EXISTS scan_checkpoints (
@@ -84,7 +96,8 @@ CREATE TABLE IF NOT EXISTS delivery_packages (
   order_id TEXT PRIMARY KEY REFERENCES orders(id),
   product_version TEXT NOT NULL,
   buyer_key_id TEXT NOT NULL,
-  encrypted_envelope BLOB NOT NULL
+  encrypted_envelope BLOB NOT NULL,
+  package_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS delivery_state (

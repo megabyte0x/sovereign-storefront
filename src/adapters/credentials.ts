@@ -3,6 +3,8 @@ import { ecies, sha256, sign } from '@waku/message-encryption/crypto';
 import { recoverPublicKey } from '@noble/secp256k1';
 import { bytesToHex, hexToBytes } from '@waku/utils/bytes';
 import type { CredentialAdapter, PossessionChallenge } from '../contracts/types.ts';
+import type { WakuConfig, WakuSession } from '../contracts/messages.ts';
+import { createWakuSession } from './waku.ts';
 
 const PROOF_MAGIC = new TextEncoder().encode('SSPF');
 const NONCE_BYTES = 16;
@@ -145,6 +147,18 @@ function createStoredAdapter(options: {
       }
       const record = store(privateKey, publicKeyHex);
       return { credentialId: record.credentialId, buyerKeyId: record.publicKeyHex };
+    },
+    async publicKey(credentialId) {
+      const record = byId.get(credentialId);
+      if (!record) throw new Error('unknown credential');
+      return record.publicKeyHex;
+    },
+    async createWakuSession(credentialId: string, config: WakuConfig): Promise<WakuSession> {
+      const record = byId.get(credentialId);
+      if (!record) {
+        throw new Error('unknown credential');
+      }
+      return createWakuSession(config, record.privateKey);
     },
   };
 }

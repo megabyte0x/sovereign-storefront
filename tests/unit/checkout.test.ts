@@ -39,6 +39,8 @@ function memoryStore(seed: BrowserPurchase[] = []): PurchaseStore {
     async importBackup() {
       throw new Error('not used in unit tests');
     },
+    async saveDelivery() { throw new Error('not used in unit tests'); },
+    async getDelivery() { return null; },
   };
 }
 
@@ -61,6 +63,8 @@ function mockCredentials(): CredentialAdapter {
       credentialId: 'cred-new',
       buyerKeyId: 'buyer-1',
     })),
+    publicKey: vi.fn(async () => 'buyer-1'),
+    createWakuSession: vi.fn(async () => { throw new Error('not used in unit tests'); }),
   };
 }
 
@@ -79,6 +83,7 @@ function mockTransport(invoice?: Invoice): OrderTransport {
     }),
     status: vi.fn(),
     recover: vi.fn(),
+    acknowledge: vi.fn(),
   };
 }
 
@@ -95,6 +100,8 @@ test('beginCheckout does not request an invoice when store.save rejects', async 
     importBackup: async () => {
       throw new Error('quota exceeded');
     },
+    saveDelivery: async () => { throw new Error('quota exceeded'); },
+    getDelivery: async () => null,
   };
   const transport = mockTransport();
   const credentials = mockCredentials();
@@ -168,6 +175,8 @@ test('a failed invoice save does not return payment instructions and can be repl
     async importBackup() {
       throw new Error('not used');
     },
+    async saveDelivery() { throw new Error('not used'); },
+    async getDelivery() { return null; },
   };
   const transport = mockTransport();
   const credentials = mockCredentials();

@@ -51,7 +51,7 @@ test('live Logos origin upload uses completion, not fetch(); replica proof is no
   }
 
   scratchDir = mkdtempSync(join(scratchRoot, 'ssf-storage-int-'));
-  const storage = createLogosStorageAdapter(detected.runtime, scratchDir);
+  const storage = createLogosStorageAdapter(detected.runtime, { workDir: scratchDir });
   const credentials = createCredentialAdapter();
   const buyer = await credentials.createPurchaseCredential();
   const crypto = createCryptoAdapter({ credentials });

@@ -148,6 +148,11 @@ async function possessionProof(
   return Buffer.from(await credentials.provePossession(credentialId, { orderId })).toString('base64');
 }
 
+function receiverOf(invoice: Invoice) {
+  if (invoice.attribution?.kind !== 'receiver') throw new Error('receiver fixture required');
+  return invoice.attribution.receiver;
+}
+
 test('wired adapter keeps ORDER_MARK BUYER_MARK PRODUCT_MARK in encrypted JSON only', () => {
   const payload = encodeApplicationPayload({
     ORDER_MARK: 'ORDER_MARK',
@@ -323,14 +328,15 @@ test('cross-origin, unauthorized admin, wrong proof, buyer A vs B, replay and ga
   });
   expect(crossRecover.status).toBe(403);
 
+  scanner.setReceiptReceiver('out-a', receiverOf(invoiceA));
   scanner.replaceSnapshot([{
     outputId: 'out-a',
-    invoiceId: invoiceA.id,
+    invoiceId: null,
     amountZat: invoiceA.amountZat,
     confirmations: 10,
     canonical: true,
     receivedAt: Date.now(),
-    revision: { id: 'rev-10', height: 10 },
+    revision: { id: 'rev-1', height: 1 },
   }], { id: 'rev-10', height: 10 }, true, Date.now());
 
   const firstRecover = await jsonRequest(seller.publicUrl, '/api/recover', {
@@ -435,14 +441,15 @@ test('unavailable storage, scanner outage and seller restart stay honest', async
   });
   expect(paidCreated.status).toBe(200);
   const paidInvoice = JSON.parse(paidCreated.body) as Invoice;
+  scanner.setReceiptReceiver('out-paid-status', receiverOf(paidInvoice));
   scanner.replaceSnapshot([{
     outputId: 'out-paid-status',
-    invoiceId: paidInvoice.id,
+    invoiceId: null,
     amountZat: paidInvoice.amountZat,
     confirmations: 10,
     canonical: true,
     receivedAt: Date.now(),
-    revision: { id: 'rev-10', height: 10 },
+    revision: { id: 'rev-1', height: 1 },
   }], { id: 'rev-10', height: 10 }, true, Date.now());
   const paidBefore = await jsonRequest(live.publicUrl, '/api/status', {
     method: 'POST',
@@ -525,14 +532,15 @@ test('seller backup restores into an isolated instance without spending keys or 
     }),
   });
   const invoice = JSON.parse(created.body) as Invoice;
+  scanner.setReceiptReceiver('out-paid', receiverOf(invoice));
   scanner.replaceSnapshot([{
     outputId: 'out-paid',
-    invoiceId: invoice.id,
+    invoiceId: null,
     amountZat: invoice.amountZat,
     confirmations: 10,
     canonical: true,
     receivedAt: Date.now(),
-    revision: { id: 'rev-10', height: 10 },
+    revision: { id: 'rev-1', height: 1 },
   }], { id: 'rev-10', height: 10 }, true, Date.now());
   const recovered = await jsonRequest(origin.publicUrl, '/api/recover', {
     method: 'POST',
@@ -628,14 +636,15 @@ test('composed seller seals a real delivery envelope, not the dummy [1] byte', a
   });
   expect(created.status).toBe(200);
   const invoice = JSON.parse(created.body) as Invoice;
+  scanner.setReceiptReceiver('out-seal', receiverOf(invoice));
   scanner.replaceSnapshot([{
     outputId: 'out-seal',
-    invoiceId: invoice.id,
+    invoiceId: null,
     amountZat: invoice.amountZat,
     confirmations: 10,
     canonical: true,
     receivedAt: Date.now(),
-    revision: { id: 'rev-10', height: 10 },
+    revision: { id: 'rev-1', height: 1 },
   }], { id: 'rev-10', height: 10 }, true, Date.now());
 
   const recovered = await jsonRequest(seller.publicUrl, '/api/recover', {
@@ -730,4 +739,48 @@ test('raw buyer key in possession proof is rejected; wrong buyer still 403', asy
     }),
   });
   expect(wrong.status).toBe(403);
+});
+
+test('real-demo mode disables direct HTTP checkout/status/recover routes', async () => {
+  scratchDir = mkdtempSync(join(scratchRoot, 'ssf-real-demo-routes-'));
+  const credentials = createCredentialAdapter();
+  const scanner = new MemoryScanner();
+  scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
+  const storage = createMemoryStorageAdapter();
+  const messaging = { sent: [], sendInitiatedFor: [], async send() {} };
+  const seller = await startSeller({
+    config: env(join(scratchDir, 'seller.sqlite'), {
+      SSF_MODE: 'real-demo',
+      SSF_ADAPTER_MESSAGING: 'real',
+      SSF_ADAPTER_STORAGE: 'real',
+      SSF_ADAPTER_SCANNER: 'real',
+    }),
+    seedProduct: false,
+    scanner,
+    credentials,
+    storage,
+    messaging,
+  });
+  servers.push(seller);
+
+  const orders = await jsonRequest(seller.publicUrl, '/api/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId: 'r', productVersion: 'p', buyerKeyId: 'b', proof: '' }),
+  });
+  expect(orders.status).toBe(404);
+
+  const status = await jsonRequest(seller.publicUrl, '/api/status', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: 'o', proof: '' }),
+  });
+  expect(status.status).toBe(404);
+
+  const recover = await jsonRequest(seller.publicUrl, '/api/recover', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ orderId: 'o', proof: '' }),
+  });
+  expect(recover.status).toBe(404);
 });
