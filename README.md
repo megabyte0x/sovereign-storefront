@@ -12,6 +12,36 @@ Setup and executed evidence (do not treat the research sections as proof):
 - [Integration gates A–C](docs/integration-report.md)
 - [Demo results](docs/demo-results.md)
 
+## Live demo (local target L)
+
+The live stack runs on one machine: a Zcash regtest chain with an independent wallet scanner, two local Logos storage nodes, and pinned public Waku peers. Mainnet is never used. Full operator notes: [docs/live-infra.md](docs/live-infra.md).
+
+Prerequisites: Linux on aarch64 (the pinned `logosctl` 0.2.3 build is aarch64-only), Node.js 22+, Docker, a Rust toolchain (`cargo`), [`ths`](https://github.com/zcashlabs/thus-spoke-zakura) 0.2.1 on `PATH`, outbound internet for Waku, and `/usr/bin/chromium` for the browser suite.
+
+```sh
+npm ci
+
+# 1. Bring everything up (idempotent; first cold run builds the scanner)
+npm run infra:up          # prints one status line per stack, then six doctor rows
+
+# 2. Confirm all six rows PASS. Unreachable is FAIL here, never a synthetic PASS
+SSF_STRICT_LIVE=1 npm run infra:doctor
+#   zcash PASS · scanner PASS · logos-a PASS · logos-b PASS · logos-replication PASS · waku PASS
+
+# 3. Run the live integration suite against the running stack
+set -a; . .runtime/live/live.env; set +a
+SSF_STRICT_LIVE_WAKU=1 npm run test:integration
+#   expected: 5 passed, 1 skipped. Waku and Logos tests hit the live stack; payment.test.ts
+#   uses labelled in-memory scanner fixtures, and public-testnet settlement is skipped by design
+
+# 4. Tear down owned resources only, and verify nothing is left behind
+npm run infra:down        # prints: infra=down leftovers=none
+```
+
+What this proves today: a Zcash regtest chain whose independent scanner answers on its socket and advances its generation after a mined block (doctor `zcash`/`scanner` rows), real Logos upload on node A with replica fetch on node B, and a signed Waku light-push/filter round trip on public peers. What it does not prove yet: a live shielded payment settling an order through the scanner, the assembled live storefront (`start:live`, plan Task 10), and the strict built-app browser acceptance (Task 12). `.runtime/live/live.env` is the handoff those tasks consume.
+
+Secrets: `.runtime/` is gitignored. `.runtime/live/zcash/ths-start.log` contains the disposable regtest mnemonic and spending keys, and the scanner's viewing key lives only in 0600 files under `~/.local/state/ssf-live/scanner`. Never paste either.
+
 The research inspected official documentation and competitor offerings. Customer demand, production readiness, and scale remain unvalidated. Independent Logos replica retrieval is proven only at 73 ciphertext bytes. Live payments in this tree are zakura/regtest, not public testnet.
 
 ## Recommendation

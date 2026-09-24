@@ -90,3 +90,9 @@ Evidence: `spikes/results/messaging.json`, `spikes/results/storage.json`, `spike
 ## Combined feature branch
 
 `feat/mvp-build` after merging review-clean Tasks 1–3 (not pushed).
+
+### Remaining private-test relocation
+
+- Moved the pinned `WalletWrite` generic signature check and the `AccountPurpose::ViewOnly` assertion into `wallet.rs`'s crate-private test module without widening wallet helper visibility.
+- Removed `services/scanner/tests/qualification.rs` and `services/scanner/tests/projection.rs` after confirming the crate-private projection suite retains every duplicate behavior and adds the corrected fail-closed coverage.
+- Passed locked scanner library/full tests, check, clippy with warnings denied, scoped Rust formatting, and `git diff --check`.
