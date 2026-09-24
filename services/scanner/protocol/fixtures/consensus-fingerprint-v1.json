@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "domain": "sovereign-storefront.consensus-fingerprint.v1",
+  "order": ["overwinter", "sapling", "blossom", "heartwood", "canopy", "nu5", "nu6", "nu6-1", "nu6-2", "nu6-3"],
+  "note": "Expected digests were computed independently with printf | sha256sum over the exact preimage. Deterministic vectors only; the heights are not a live-chain claim.",
+  "valid": [
+    {
+      "name": "task1-observed-regtest-shape",
+      "network": "regtest",
+      "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1, "nu6-1": null, "nu6-2": null, "nu6-3": null },
+      "preimage": "sovereign-storefront.consensus-fingerprint.v1\nnetwork=regtest\noverwinter=1\nsapling=1\nblossom=1\nheartwood=1\ncanopy=1\nnu5=1\nnu6=1\nnu6-1=none\nnu6-2=none\nnu6-3=none\n",
+      "consensusFingerprint": "09b69fcfa62093e7e8bc9b6e5b5ffad4d7cdc49efd313e7b1e9c2409abf4a909"
+    },
+    {
+      "name": "absent-optional-upgrades-equal-explicit-null",
+      "network": "regtest",
+      "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1 },
+      "preimage": "sovereign-storefront.consensus-fingerprint.v1\nnetwork=regtest\noverwinter=1\nsapling=1\nblossom=1\nheartwood=1\ncanopy=1\nnu5=1\nnu6=1\nnu6-1=none\nnu6-2=none\nnu6-3=none\n",
+      "consensusFingerprint": "09b69fcfa62093e7e8bc9b6e5b5ffad4d7cdc49efd313e7b1e9c2409abf4a909"
+    },
+    {
+      "name": "all-upgrades-at-one-regtest",
+      "network": "regtest",
+      "activations": { "nu6-3": 1, "nu6-2": 1, "nu6-1": 1, "nu6": 1, "nu5": 1, "canopy": 1, "heartwood": 1, "blossom": 1, "sapling": 1, "overwinter": 1 },
+      "preimage": "sovereign-storefront.consensus-fingerprint.v1\nnetwork=regtest\noverwinter=1\nsapling=1\nblossom=1\nheartwood=1\ncanopy=1\nnu5=1\nnu6=1\nnu6-1=1\nnu6-2=1\nnu6-3=1\n",
+      "consensusFingerprint": "4998808bbf73d6b51f595277778a9bc047b735f35c9de5a262bd9165969f4cad"
+    },
+    {
+      "name": "staggered-heights-test-network",
+      "network": "test",
+      "activations": { "overwinter": 10, "sapling": 20, "blossom": 30, "heartwood": 40, "canopy": 50, "nu5": 60, "nu6": 70, "nu6-1": 80, "nu6-2": null, "nu6-3": null },
+      "preimage": "sovereign-storefront.consensus-fingerprint.v1\nnetwork=test\noverwinter=10\nsapling=20\nblossom=30\nheartwood=40\ncanopy=50\nnu5=60\nnu6=70\nnu6-1=80\nnu6-2=none\nnu6-3=none\n",
+      "consensusFingerprint": "f7a35c35b469c2d56c014efb3e93174cdbece9d80e44fba392f8addbd994e99a"
+    }
+  ],
+  "invalid": [
+    { "name": "mainnet-forbidden", "network": "main", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1 } },
+    { "name": "unknown-upgrade-name", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1, "nu7": 1 } },
+    { "name": "display-name-spelling", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1, "nu6_1": null } },
+    { "name": "missing-required-upgrade", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1 } },
+    { "name": "required-upgrade-unactivated", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": null } },
+    { "name": "decreasing-heights", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 5, "nu6": 4 } },
+    { "name": "activation-after-unactivated-upgrade", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1, "nu6-1": null, "nu6-2": 2 } },
+    { "name": "height-exceeds-u32", "network": "regtest", "activations": { "overwinter": 1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 4294967296 } },
+    { "name": "negative-height", "network": "regtest", "activations": { "overwinter": -1, "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1 } },
+    { "name": "fractional-height", "network": "regtest", "activations": { "overwinter": 1.5, "sapling": 2, "blossom": 2, "heartwood": 2, "canopy": 2, "nu5": 2, "nu6": 2 } },
+    { "name": "string-height", "network": "regtest", "activations": { "overwinter": "1", "sapling": 1, "blossom": 1, "heartwood": 1, "canopy": 1, "nu5": 1, "nu6": 1 } }
+  ]
+}

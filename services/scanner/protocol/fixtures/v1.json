@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "fixturePurpose": "non-production protocol compatibility vector; contains no wallet material",
+  "identity": {
+    "network": "regtest",
+    "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "accountId": "seller-account-0"
+  },
+  "product": {
+    "version": "product-v1",
+    "amountZat": "100000000",
+    "network": "regtest",
+    "ciphertextCid": "fixture-cid",
+    "ciphertextDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "snapshot": {
+    "version": 1,
+    "sourceId": "fixture-scanner",
+    "generation": "1",
+    "chain": {
+      "network": "regtest",
+      "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "accountId": "seller-account-0",
+    "tip": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+    "scanned": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+    "checkedAt": 1000000,
+    "caughtUp": true,
+    "complete": true,
+    "health": "ready",
+    "receipts": [{
+      "outputId": "output-1",
+      "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "pool": "orchard",
+      "outputIndex": 0,
+      "accountId": "seller-account-0",
+      "scope": "external",
+      "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202",
+      "amountZat": "100000000",
+      "firstSeenAt": 999000,
+      "mined": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+      "canonical": true
+    }]
+  },
+  "allocation": {
+    "allocationId": "allocation-1",
+    "chain": {
+      "network": "regtest",
+      "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "accountId": "seller-account-0",
+    "amountZat": "100000000",
+    "expiresAt": 2000000,
+    "destination": "uregtest1fixture-only-receiver",
+    "receiver": {
+      "accountId": "seller-account-0",
+      "scope": "external",
+      "pool": "orchard",
+      "diversifierIndex": "0101010101010101010101",
+      "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202"
+    },
+    "paymentUri": "zcash:uregtest1fixture-only-receiver?amount=1"
+  },
+  "observation": {
+    "outputId": "output-1",
+    "sourceId": "fixture-scanner",
+    "generation": "1",
+    "chainNetwork": "regtest",
+    "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "pool": "orchard",
+    "outputIndex": 0
+  },
+  "preparedPackage": {
+    "orderId": "order-1",
+    "productVersion": "product-v1",
+    "buyerKeyId": "buyer-key-1",
+    "packageId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "encryptedEnvelopeBytes": 3
+  },
+  "negative": {
+    "snapshots": [
+      { "name": "snapshot-bad-generation", "candidate": { "version": 1, "sourceId": "fixture-scanner", "generation": "01", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "tip": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "scanned": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "checkedAt": 1000000, "caughtUp": true, "complete": true, "health": "ready", "receipts": [] } },
+      { "name": "snapshot-extra-property", "candidate": { "version": 1, "sourceId": "fixture-scanner", "generation": "1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "tip": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "scanned": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "checkedAt": 1000000, "caughtUp": true, "complete": true, "health": "ready", "receipts": [], "unexpected": true } },
+      { "name": "snapshot-non-boolean-canonical", "candidate": { "version": 1, "sourceId": "fixture-scanner", "generation": "1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "tip": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "scanned": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "checkedAt": 1000000, "caughtUp": true, "complete": true, "health": "ready", "receipts": [{ "outputId": "output-1", "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "pool": "orchard", "outputIndex": 0, "accountId": "seller-account-0", "scope": "external", "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202", "amountZat": "100000000", "firstSeenAt": 999000, "mined": null, "canonical": "true" }] } },
+      { "name": "snapshot-duplicate-output-id", "candidate": { "version": 1, "sourceId": "fixture-scanner", "generation": "1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "tip": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "scanned": { "height": 20, "hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "checkedAt": 1000000, "caughtUp": true, "complete": true, "health": "ready", "receipts": [{ "outputId": "output-1", "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "pool": "orchard", "outputIndex": 0, "accountId": "seller-account-0", "scope": "external", "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202", "amountZat": "100000000", "firstSeenAt": 999000, "mined": null, "canonical": true }, { "outputId": "output-1", "txid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "pool": "orchard", "outputIndex": 1, "accountId": "seller-account-0", "scope": "external", "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202", "amountZat": "100000000", "firstSeenAt": 999000, "mined": null, "canonical": true }] } }
+    ],
+    "allocations": [
+      { "name": "allocation-over-money-bound", "candidate": { "allocationId": "allocation-1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "amountZat": "2100000000000001", "expiresAt": 2000000, "destination": "uregtest1fixture-only-receiver", "receiver": { "accountId": "seller-account-0", "scope": "external", "pool": "orchard", "diversifierIndex": "0101010101010101010101", "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202" }, "paymentUri": "zcash:uregtest1fixture-only-receiver?amount=1" } },
+      { "name": "allocation-noncanonical-receiver-hex", "candidate": { "allocationId": "allocation-1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "amountZat": "100000000", "expiresAt": 2000000, "destination": "uregtest1fixture-only-receiver", "receiver": { "accountId": "seller-account-0", "scope": "external", "pool": "orchard", "diversifierIndex": "0101010101010101010101", "receiverHex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, "paymentUri": "zcash:uregtest1fixture-only-receiver?amount=1" } },
+      { "name": "allocation-account-binding", "candidate": { "allocationId": "allocation-1", "chain": { "network": "regtest", "genesisHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consensusFingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "accountId": "seller-account-0", "amountZat": "100000000", "expiresAt": 2000000, "destination": "uregtest1fixture-only-receiver", "receiver": { "accountId": "other-account", "scope": "external", "pool": "orchard", "diversifierIndex": "0101010101010101010101", "receiverHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202" }, "paymentUri": "zcash:uregtest1fixture-only-receiver?amount=1" } }
+    ],
+    "vectors": [
+      { "name": "vector-product-network-binding", "candidate": { "product": { "version": "product-v1", "amountZat": "100000000", "network": "test", "ciphertextCid": "fixture-cid", "ciphertextDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } },
+      { "name": "vector-observation-identity-binding", "candidate": { "observation": { "outputId": "output-1", "sourceId": "fixture-scanner", "generation": "1", "chainNetwork": "regtest", "txid": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "pool": "orchard", "outputIndex": 0 } } },
+      { "name": "vector-package-body-bound", "candidate": { "preparedPackage": { "orderId": "order-1", "productVersion": "product-v1", "buyerKeyId": "buyer-key-1", "packageId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "encryptedEnvelopeBytes": 65537 } } }
+    ]
+  }
+}

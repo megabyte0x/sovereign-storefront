@@ -1,0 +1,44 @@
+[package]
+name = "sovereign-storefront-scanner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+async-trait = "=0.1.92"
+getrandom = "=0.4.3"
+hex = "=0.4.3"
+nix = { version = "=0.31.3", default-features = false, features = ["dir", "fs", "user"] }
+prost = "=0.14.4"
+rand_core = "=0.10.1"
+rusqlite = "=0.37.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+tonic = "=0.14.6"
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc5", features = ["orchard", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc5", features = ["orchard"] }
+# Feature unification only: the matching same-source PCZT release gates the
+# SQLite Orchard migration's `Pczt::into_effects` behind `io-finalizer`.
+# Scanner code never imports PCZT or any spending API.
+zakura_pczt = { package = "zakura-pczt", version = "=0.1.0-rc3", features = ["io-finalizer"] }
+zcash_keys = { package = "zakura-keys", version = "=1.2.0", features = ["orchard"] }
+zcash_primitives = { package = "zakura-primitives", version = "=1.2.0", default-features = false, features = ["std"] }
+zcash_protocol = { version = "=0.10.6", default-features = false, features = ["local-consensus", "std"] }
+zcash_address = "=0.13.0"
+zip32 = { version = "=0.2.1", default-features = false }
+zip321 = "=0.9.0"
+
+[dev-dependencies]
+# Test-only ZIP-316 fixtures exercise the production decoder with a valid
+# Orchard-less UFVK. This does not enable the fixture constructor in normal
+# scanner builds.
+zcash_keys = { package = "zakura-keys", version = "=1.2.0", default-features = false, features = ["orchard", "sapling", "test-dependencies"] }
+# Test-only RC5 fixtures construct a decryptable full transaction for the
+# production view-only WalletDb enhancement/reopen regression. These features
+# are never enabled by normal scanner builds.
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc5", features = ["test-dependencies"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc5", features = ["test-dependencies"] }
+zcash_primitives = { package = "zakura-primitives", version = "=1.2.0", default-features = false, features = ["std", "test-dependencies"] }
+
