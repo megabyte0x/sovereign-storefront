@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
-import { extname, join, normalize, sep } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createCredentialAdapter } from '../adapters/credentials.ts';
 import { createCryptoAdapter } from '../adapters/crypto.ts';
@@ -8,6 +8,7 @@ import { createMemoryMessaging, type FulfillmentMessaging } from '../adapters/me
 import { MemoryScanner } from '../adapters/scanner.ts';
 import { createMemoryStorageAdapter } from '../adapters/storage.ts';
 import { ConfigError, type RuntimeConfig } from '../config.ts';
+import { createAdminPublishHandler } from './admin-publish.ts';
 import { silentLogger, type OperationalLogger } from '../ops/log.ts';
 import type {
   CredentialAdapter,
@@ -21,30 +22,97 @@ import type { ReceiptSource } from '../contracts/live.ts';
 import { MAX_PAYLOAD_BYTES } from '../contracts/validation.ts';
 import { createCiphertextHandler } from '../gateway/ciphertext.ts';
 import { publishProduct } from './admin.ts';
-import { openCatalogue } from './catalogue.ts';
+import { openCatalogue, type AvailabilityProbes } from './catalogue.ts';
+import { isScannerUnavailable } from './messages.ts';
 import { openStore } from './db.ts';
 import { createFulfillment } from './fulfillment.ts';
 import { loadOrCreateSellerIdentity } from './identity.ts';
 import { createInvoiceIssuer } from './issuance.ts';
-import { createPayments } from './payments.ts';
+import { createPayments, type Payments } from './payments.ts';
 
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self'",
-  "img-src 'self' data:",
-  "connect-src 'self'",
-  "object-src 'none'",
-  "base-uri 'self'",
-  "form-action 'self'",
-  "frame-ancestors 'none'",
-].join('; ');
+const PEER_ADDR_RE = /^\/(dns4|dns6|dns|ip4|ip6)\/([^/]+)\/tcp\/([0-9]{1,5})\/(wss|tls\/ws|ws)(?:\/|$)/;
+const CSP_HOST_RE = /^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+$/;
+
+function isLoopbackHost(proto: string, host: string): boolean {
+  if (proto === 'ip4') return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (proto === 'ip6') return host === '::1';
+  return host === 'localhost';
+}
+
+/** Map one Waku peer multiaddr to a single CSP connect-src origin. */
+function peerOrigin(peer: string): string {
+  const match = PEER_ADDR_RE.exec(peer);
+  if (!match) throw new ConfigError('invalid Waku peer multiaddr for CSP');
+  const [, proto = '', host = '', portRaw = '', transport = ''] = match;
+  const port = Number(portRaw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !CSP_HOST_RE.test(host)) {
+    throw new ConfigError('invalid Waku peer multiaddr for CSP');
+  }
+  const hostPart = proto === 'ip6' ? `[${host}]` : host;
+  if (transport === 'ws') {
+    if (!isLoopbackHost(proto, host)) throw new ConfigError('plain ws:// Waku peer is allowed only on loopback');
+    return `ws://${hostPart}:${port}`;
+  }
+  return `wss://${hostPart}:${port}`;
+}
+
+/**
+ * Content-Security-Policy for the public server. Fixture mode keeps
+ * connect-src 'self'; real-demo adds exactly one origin per configured Waku
+ * peer (never a wildcard or bare scheme). Throws ConfigError on a peer that
+ * would need plain ws:// to a non-loopback host.
+ */
+export function buildCsp(config: RuntimeConfig): string {
+  const connect = ["'self'"];
+  if (config.mode === 'real-demo') {
+    for (const peer of config.live?.waku.bootstrapPeers ?? []) {
+      const origin = peerOrigin(peer);
+      if (!connect.includes(origin)) connect.push(origin);
+    }
+  }
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    `connect-src ${connect.join(' ')}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+}
+
+/** Real-demo serves only an explicit built browser directory; fixture keeps its dev fallback. */
+function resolvePublicDir(config: RuntimeConfig, explicit: string | undefined): string {
+  if (config.mode === 'real-demo') {
+    if (explicit === undefined) throw new ConfigError('real-demo mode requires an explicit publicDir (built dist/browser)');
+    if (!existsSync(join(explicit, 'index.html'))) throw new ConfigError('real-demo publicDir must contain index.html');
+    return explicit;
+  }
+  if (explicit !== undefined) return explicit;
+  // Fixture mode only: developer fallback to the working directory.
+  return existsSync(join(process.cwd(), 'dist/browser/index.html'))
+    ? join(process.cwd(), 'dist/browser')
+    : process.cwd();
+}
 
 const FIXTURE_PLAINTEXT = new TextEncoder().encode('sovereign-storefront harmless fixture v1\n');
+
+/** Seller business components, shared by the HTTP and Waku transports. */
+export type SellerCore = {
+  sellerKeyId: string;
+  store: SellerStore;
+  payments: Payments;
+  issuer: ReturnType<typeof createInvoiceIssuer>;
+  fulfillment: ReturnType<typeof createFulfillment>;
+  catalogue: ReturnType<typeof openCatalogue>;
+};
 
 export type SellerServer = {
   publicUrl: string;
   adminUrl: string;
+  core: SellerCore;
   close: () => Promise<void>;
 };
 
@@ -58,6 +126,16 @@ export type SellerOptions = {
   credentials?: CredentialAdapter;
   messaging?: FulfillmentMessaging;
   logger?: OperationalLogger;
+  /** Validated persisted seller identity; overrides config.sellerKeyId everywhere. */
+  sellerKeyId?: string;
+  /** Replace availability probes (live runtime supplies real readiness probes). */
+  probes?: Partial<AvailabilityProbes>;
+  /** Cached per-product replica readiness; request paths then never touch storage. */
+  replicaReady?: (productVersion: string) => boolean;
+  /** Default true. The live runtime owns its own bounded loops instead. */
+  startLoops?: boolean;
+  /** Runs after components are built and before any listener accepts traffic. */
+  beforeListen?: (core: SellerCore) => Promise<void>;
 };
 
 function listen(server: Server, host: string, port: number): Promise<{ url: string; port: number }> {
@@ -80,8 +158,13 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
-function applySecurityHeaders(res: ServerResponse): void {
-  res.setHeader('content-security-policy', CSP);
+const DEFAULT_CSP = buildCsp({ mode: 'fixture' } as RuntimeConfig);
+
+/** A per-instance CSP set earlier on the response is kept; otherwise the self-only default applies. */
+function applySecurityHeaders(res: ServerResponse, csp?: string): void {
+  if (csp !== undefined || !res.hasHeader('content-security-policy')) {
+    res.setHeader('content-security-policy', csp ?? DEFAULT_CSP);
+  }
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('cache-control', 'no-store');
   res.setHeader('referrer-policy', 'no-referrer');
@@ -143,7 +226,7 @@ function serializeDeliveryPackage(pkg: DeliveryPackage): {
   };
 }
 
-function applyStoreSettings(dbPath: string, destination: string, invoiceTtlMs: number): void {
+function applyStoreSettings(dbPath: string, destination: string | null, invoiceTtlMs: number): void {
   const db = new DatabaseSync(dbPath);
   try {
     db.exec('PRAGMA busy_timeout = 5000');
@@ -151,7 +234,7 @@ function applyStoreSettings(dbPath: string, destination: string, invoiceTtlMs: n
       `INSERT INTO store_settings (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     );
-    upsert.run('destination', destination);
+    if (destination !== null) upsert.run('destination', destination);
     upsert.run('invoice_ttl_ms', String(invoiceTtlMs));
   } finally {
     db.close();
@@ -171,14 +254,18 @@ function contentTypeFor(filePath: string): string {
 function safeJoin(root: string, requestPath: string): string | null {
   const relative = requestPath.replace(/^\/+/, '');
   if (relative.includes('\0') || relative.includes('..')) return null;
-  const resolved = normalize(join(root, relative));
-  const rootPath = normalize(root) + sep;
-  if (resolved !== normalize(root) && !resolved.startsWith(rootPath)) return null;
+  // resolve() drops a trailing separator, so a root given as `.../browser/`
+  // (as dist/service/main.js passes it) still contains its own files.
+  const base = resolve(root);
+  const resolved = resolve(base, relative);
+  if (resolved !== base && !resolved.startsWith(base + sep)) return null;
   return resolved;
 }
 
 export async function startSeller(options: SellerOptions): Promise<SellerServer> {
-  const { config } = options;
+  const config: RuntimeConfig = options.sellerKeyId === undefined
+    ? options.config
+    : { ...options.config, sellerKeyId: options.sellerKeyId };
   if (config.mode === 'real-demo') {
     if (
       config.adapters.messaging !== 'real'
@@ -190,7 +277,16 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     if (!options.storage || !options.scanner || !options.messaging) {
       throw new ConfigError('real-demo mode requires real adapters; refusing fixture fallback');
     }
+    if (!config.live) {
+      throw new ConfigError('real-demo mode requires a live config block');
+    }
   }
+  // Fail before any store/listener work: invalid peers or a missing built UI.
+  const publicCsp = buildCsp(config);
+  const publicDir = resolvePublicDir(config, options.publicDir);
+  // Real-demo config omits sellerKeyId; the runtime supplies the persisted identity.
+  const sellerKeyId = config.sellerKeyId;
+  if (!sellerKeyId) throw new ConfigError('seller key id unavailable');
 
   const storage = options.storage ?? createMemoryStorageAdapter();
   const scanner = options.scanner ?? new MemoryScanner();
@@ -201,6 +297,14 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   }
   const messaging = options.messaging ?? createMemoryMessaging();
   const logger = options.logger ?? silentLogger;
+  const adminPublish = createAdminPublishHandler({
+    dbPath: config.dbPath,
+    network: config.productNetwork,
+    crypto,
+    storage,
+    logger,
+    maxBodyBytes: 4096,
+  });
 
   if (scanner instanceof MemoryScanner) {
     scanner.setChainNetwork(config.productNetwork);
@@ -209,9 +313,15 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   }
 
-  const startupSnapshot = await scanner.snapshot();
-  const chain = startupSnapshot.chain;
-  const accountId = startupSnapshot.accountId;
+  // Live identity comes from validated config (the wallet scanner pins every
+  // response against it); never from whatever the scanner first reports.
+  let chain = config.live?.chain;
+  let accountId = config.live?.scannerAccountId;
+  if (!chain || !accountId) {
+    const startupSnapshot = await scanner.snapshot();
+    chain = startupSnapshot.chain;
+    accountId = startupSnapshot.accountId;
+  }
 
   if (options.seedProduct) {
     await publishProduct({
@@ -228,11 +338,12 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   }
 
   const availabilityOverride = options.availability ?? {};
-  loadOrCreateSellerIdentity(config.dbPath);
+  if (options.sellerKeyId === undefined) loadOrCreateSellerIdentity(config.dbPath);
   const catalogue = openCatalogue({
     dbPath: config.dbPath,
     storage,
-    probes: {
+    ...(options.replicaReady ? { replicaReady: options.replicaReady } : {}),
+    probes: options.probes ?? {
       messaging: async () => availabilityOverride.messaging ?? true,
       scanner: async () => {
         if (availabilityOverride.scanner === false) return false;
@@ -246,7 +357,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   });
 
   const store: SellerStore = await openStore(config.dbPath);
-  applyStoreSettings(config.dbPath, config.destination, config.invoiceTtlMs);
+  applyStoreSettings(config.dbPath, config.mode === 'real-demo' ? null : config.destination, config.invoiceTtlMs);
   for (const key of catalogue.listProductKeys()) {
     const raw = key.rawKey instanceof Uint8Array ? key.rawKey : new Uint8Array(key.rawKey);
     await crypto.importProductKey(key.keyRef, raw, key.digestHex);
@@ -285,19 +396,22 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     accountId,
     ttlMs: config.invoiceTtlMs,
     now: Date.now,
-    availability: async () => catalogue.currentAvailability(),
+    availability: config.mode === 'real-demo'
+      ? async (productVersion) => catalogue.productAvailability(productVersion)
+      : async () => catalogue.currentAvailability(),
   });
-  const dispatchTimer = setInterval(() => {
-    void payments.reconcileFromScanner()
-      .then(() => fulfillment.dispatchPending())
-      .catch(() => undefined);
-  }, 2_000);
-  dispatchTimer.unref();
-
-  const publicDir = options.publicDir
-    ?? (existsSync(join(process.cwd(), 'dist/browser/index.html'))
-      ? join(process.cwd(), 'dist/browser')
-      : process.cwd());
+  const core: SellerCore = { sellerKeyId, store, payments, issuer, fulfillment, catalogue };
+  let dispatchTimer: ReturnType<typeof setInterval> | undefined;
+  if (options.startLoops !== false) {
+    dispatchTimer = setInterval(() => {
+      void payments.reconcileFromScanner()
+        .then(() => fulfillment.dispatchPending())
+        .catch((error: unknown) => {
+          logger.log({ event: 'error', code: error instanceof Error ? error.name : 'Error' });
+        });
+    }, 2_000);
+    dispatchTimer.unref();
+  }
 
   const ciphertext = createCiphertextHandler({
     maxCiphertextBytes: config.maxCiphertextBytes,
@@ -344,7 +458,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   };
 
   async function handlePublic(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    applySecurityHeaders(res);
+    applySecurityHeaders(res, publicCsp);
     logRequest(req);
     const path = requestPath(req);
     try {
@@ -356,7 +470,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         sendPublic(req, res, 404, 'not found');
         return;
       }
-      if (config.mode === 'real-demo' && (path === '/api/orders' || path === '/api/status' || path === '/api/recover')) {
+      if (config.mode === 'real-demo' && (path === '/api/orders' || path === '/api/status' || path === '/api/recover' || path === '/api/acknowledge')) {
         // Task 7: real-demo checkout/status/recovery must go through the
         // authenticated Waku application path (Task 9), not this HTTP
         // fallback. These routes stay reachable only in fixture mode for
@@ -403,8 +517,25 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         });
         return;
       }
+      if (req.method === 'GET' && path === '/api/waku-config') {
+        // Real-demo only: the browser's Waku bootstrap. Exactly the frozen
+        // PublicWakuConfig fields; bootstrapPeers is the same list buildCsp()
+        // derives connect-src from. Fixture mode falls through to 404.
+        if (config.mode !== 'real-demo' || !config.live) {
+          sendPublic(req, res, 404, 'not found');
+          return;
+        }
+        sendPublicJson(req, res, 200, {
+          sellerKeyId: config.sellerKeyId,
+          network: config.productNetwork,
+          contentTopic: config.live.waku.contentTopic,
+          bootstrapPeers: [...config.live.waku.bootstrapPeers],
+        });
+        return;
+      }
       if (req.method === 'GET' && path === '/api/availability') {
-        sendPublicJson(req, res, 200, await catalogue.currentAvailability());
+        const productVersion = new URL(req.url ?? '/', 'http://localhost').searchParams.get('productVersion');
+        sendPublicJson(req, res, 200, await catalogue.currentAvailability(productVersion ?? undefined));
         return;
       }
       if (req.method === 'POST' && path === '/api/orders') {
@@ -462,13 +593,24 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
           return;
         }
         payments.cacheInvoice(invoice);
-        await payments.reconcileFromScanner();
         if (path === '/api/status') {
+          // Parity with the Waku dispatcher: a scanner outage still yields a
+          // status (orderStatus maps it to verification 'unavailable').
+          await payments.reconcileFromScanner().catch(() => undefined);
           const status: OrderStatus = await payments.orderStatus(payload.orderId);
           sendPublicJson(req, res, 200, status);
           return;
         }
-        const decision = await payments.authorizeRelease(payload.orderId);
+        let decision: Awaited<ReturnType<typeof payments.authorizeRelease>>;
+        try {
+          await payments.reconcileFromScanner();
+          decision = await payments.authorizeRelease(payload.orderId);
+        } catch (error) {
+          if (!isScannerUnavailable(error)) throw error;
+          logger.log({ event: 'error', code: 503 });
+          sendPublicJson(req, res, 503, { error: 'verification unavailable' });
+          return;
+        }
         if (!decision.disclose || !decision.package) {
           sendPublicJson(req, res, 403, { error: 'not eligible' });
           return;
@@ -505,6 +647,10 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       send(res, 401, 'unauthorized');
       return;
     }
+    if (await adminPublish(req, res)) {
+      logResponse(req, res.statusCode);
+      return;
+    }
     const path = requestPath(req);
     if (req.method === 'GET' && path === '/admin/health') {
       logResponse(req, 200);
@@ -515,18 +661,35 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     send(res, 404, 'not found');
   }
 
-  const publicBind = await listen(publicServer, config.publicHost, config.publicPort);
-  const adminBind = await listen(adminServer, config.adminHost, config.adminPort);
+  const closeCore = async (): Promise<void> => {
+    if (dispatchTimer) clearInterval(dispatchTimer);
+    catalogue.close();
+    await store.close();
+  };
+  let publicBind: { url: string; port: number };
+  let adminBind: { url: string; port: number };
+  try {
+    await options.beforeListen?.(core);
+    publicBind = await listen(publicServer, config.publicHost, config.publicPort);
+    try {
+      adminBind = await listen(adminServer, config.adminHost, config.adminPort);
+    } catch (error) {
+      await closeServer(publicServer);
+      throw error;
+    }
+  } catch (error) {
+    await closeCore();
+    throw error;
+  }
 
   return {
     publicUrl: publicBind.url,
     adminUrl: adminBind.url,
+    core,
     async close() {
-      clearInterval(dispatchTimer);
-      catalogue.close();
-      await store.close();
       await closeServer(publicServer);
       await closeServer(adminServer);
+      await closeCore();
     },
   };
 }

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { StorageAdapter } from '../contracts/types.ts';
@@ -166,7 +166,7 @@ export type LogosRunner = {
 // fired <1 s after spawn is missed. The live bring-up smoke waits 1 s.
 const WATCH_ATTACH_MS = 1_000;
 
-function defaultRunner(logosctlPath: string): LogosRunner {
+export function defaultLogosRunner(logosctlPath: string): LogosRunner {
   return {
     async call(configDir, method, args = []) {
       if (method === 'fetch') {
@@ -264,6 +264,12 @@ export type LogosRuntime = {
   logosctlPath: string;
   originConfigDir: string;
   replicaConfigDir: string;
+  /**
+   * Origin's fixed loopback listen port. When set, replication connects by
+   * the explicit `/ip4/127.0.0.1/tcp/<port>/p2p/<peer>` multiaddr: an empty
+   * address hint never discovers a loopback-only origin via the DHT.
+   */
+  originListenPort?: number;
 };
 
 export type LogosDetection =
@@ -306,7 +312,15 @@ export type LogosAdapterOptions = {
   maxBytes?: number;
   uploadTimeoutMs?: number;
   downloadTimeoutMs?: number;
+  /** Attempts for a transient "Failed to start download." (default 4). */
+  downloadAttempts?: number;
+  /** Delay between those attempts (default 2000 ms). */
+  downloadRetryDelayMs?: number;
 };
+
+const DEFAULT_DOWNLOAD_ATTEMPTS = 4;
+const DEFAULT_DOWNLOAD_RETRY_DELAY_MS = 2_000;
+const TRANSIENT_DOWNLOAD_RE = /Failed to start download/;
 
 /**
  * Serializes all one-shot operations on a single config dir. Real logosctl
@@ -331,13 +345,15 @@ export function createLogosStorageAdapter(
   deps: LogosAdapterDeps = {},
   options: LogosAdapterOptions = {},
 ): StorageAdapter {
-  const runner = deps.runner ?? defaultRunner(runtime.logosctlPath);
+  const runner = deps.runner ?? defaultLogosRunner(runtime.logosctlPath);
   const readFile = deps.readFile ?? ((path: string) => new Uint8Array(readFileSync(path)));
   const writeFile = deps.writeFile ?? ((path: string, data: Uint8Array) => writeFileSync(path, data, { mode: 0o600 }));
   const workDir = deps.workDir ?? mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'ssf-logos-'));
   const maxBytes = options.maxBytes ?? FIRST_RELEASE_MAX_CIPHERTEXT_BYTES;
   const uploadTimeoutMs = options.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS;
   const downloadTimeoutMs = options.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
+  const downloadAttempts = Math.max(1, options.downloadAttempts ?? DEFAULT_DOWNLOAD_ATTEMPTS);
+  const downloadRetryDelayMs = options.downloadRetryDelayMs ?? DEFAULT_DOWNLOAD_RETRY_DELAY_MS;
   const withLock = createQueue();
 
   function tryRead(path: string): Uint8Array {
@@ -426,45 +442,64 @@ export function createLogosStorageAdapter(
   async function downloadAndWait(cid: string): Promise<Uint8Array> {
     return withLock(runtime.replicaConfigDir, async () => {
       const destPath = join(workDir, `download-${randomUUID()}.ssf1`);
-      await runner.call(runtime.replicaConfigDir, 'downloadManifest', [cid]);
+      try {
+        return await downloadInto(cid, destPath);
+      } finally {
+        // Every readiness probe downloads; never leave the file behind.
+        rmSync(destPath, { force: true });
+      }
+    });
+  }
+
+  async function downloadInto(cid: string, destPath: string): Promise<Uint8Array> {
+    await runner.call(runtime.replicaConfigDir, 'downloadManifest', [cid]);
+    let event: Record<string, unknown> | null = null;
+    let sessionId: unknown;
+    // Observed live (and retried in logos-up.ts): a downloadToUrl right
+    // after connect can fail with "Failed to start download." and succeed
+    // moments later. Retry only that error, each time with a fresh watch.
+    for (let attempt = 1; ; attempt += 1) {
       const sub = runner.subscribe(runtime.replicaConfigDir, DOWNLOAD_DONE_EVENT, downloadTimeoutMs);
-      let event: Record<string, unknown> | null;
-      let sessionId: unknown;
       try {
         await sub.ready;
         sessionId = await runner.call(runtime.replicaConfigDir, 'downloadToUrl', [cid, destPath, 'false', String(CHUNK_SIZE)]);
         event = await sub.event;
+        break;
+      } catch (error) {
+        const transient = error instanceof Error && TRANSIENT_DOWNLOAD_RE.test(error.message);
+        if (!transient || attempt >= downloadAttempts) throw error;
       } finally {
         sub.cancel();
       }
-      if (!event) {
-        throw new Error(`timed out waiting for ${DOWNLOAD_DONE_EVENT}: no event received within ${downloadTimeoutMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, downloadRetryDelayMs));
+    }
+    if (!event) {
+      throw new Error(`timed out waiting for ${DOWNLOAD_DONE_EVENT}: no event received within ${downloadTimeoutMs}ms`);
+    }
+    if (event.success !== true) {
+      throw new Error(`download failed: ${JSON.stringify(event)}`);
+    }
+    // Live storage_module 2.1.2 emits {sessionId, success} (no cid) and
+    // correlation is by the sessionId downloadToUrl returned. A cid, when
+    // present, must also match. An event with neither is uncorrelated.
+    if (event.cid !== undefined && event.cid !== cid) {
+      throw new Error(`download completion event reports cid ${String(event.cid)}, expected ${cid}`);
+    }
+    if (event.sessionId !== undefined) {
+      if (sessionId == null || String(event.sessionId) !== String(sessionId)) {
+        throw new Error(`download completion event belongs to a different session (${String(event.sessionId)} != ${String(sessionId)})`);
       }
-      if (event.success !== true) {
-        throw new Error(`download failed: ${JSON.stringify(event)}`);
-      }
-      // Live storage_module 2.1.2 emits {sessionId, success} (no cid) and
-      // correlation is by the sessionId downloadToUrl returned. A cid, when
-      // present, must also match. An event with neither is uncorrelated.
-      if (event.cid !== undefined && event.cid !== cid) {
-        throw new Error(`download completion event reports cid ${String(event.cid)}, expected ${cid}`);
-      }
-      if (event.sessionId !== undefined) {
-        if (sessionId == null || String(event.sessionId) !== String(sessionId)) {
-          throw new Error(`download completion event belongs to a different session (${String(event.sessionId)} != ${String(sessionId)})`);
-        }
-      } else if (event.cid === undefined) {
-        throw new Error('download completion event carries neither cid nor sessionId; cannot correlate');
-      }
-      const bytes = await readCompleteDownload(destPath, cid);
-      if (bytes.byteLength === 0) {
-        throw new Error(`download did not materialize ${destPath}`);
-      }
-      if (bytes.byteLength > maxBytes) {
-        throw new PayloadTooLarge(bytes.byteLength, maxBytes);
-      }
-      return bytes;
-    });
+    } else if (event.cid === undefined) {
+      throw new Error('download completion event carries neither cid nor sessionId; cannot correlate');
+    }
+    const bytes = await readCompleteDownload(destPath, cid);
+    if (bytes.byteLength === 0) {
+      throw new Error(`download did not materialize ${destPath}`);
+    }
+    if (bytes.byteLength > maxBytes) {
+      throw new PayloadTooLarge(bytes.byteLength, maxBytes);
+    }
+    return bytes;
   }
 
   /**
@@ -477,7 +512,11 @@ export function createLogosStorageAdapter(
     return withLock(runtime.replicaConfigDir, async () => {
       const peerId = await runner.call(runtime.originConfigDir, 'peerId');
       if (typeof peerId === 'string' && peerId.length > 0) {
-        await runner.call(runtime.replicaConfigDir, 'connect', [peerId, 'json:[]']);
+        const port = runtime.originListenPort;
+        const hint = port !== undefined && Number.isInteger(port) && port > 0 && port <= 65535
+          ? `json:[${JSON.stringify(`/ip4/127.0.0.1/tcp/${port}/p2p/${peerId}`)}]`
+          : 'json:[]';
+        await runner.call(runtime.replicaConfigDir, 'connect', [peerId, hint]);
       }
     });
   }

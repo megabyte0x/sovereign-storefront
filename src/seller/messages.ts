@@ -1,12 +1,22 @@
 import type { SellerApplication, BuyerRequest, SellerResponse, WakuSession } from '../contracts/messages.ts';
 import type { DeliveryPackage, Invoice, SellerStore } from '../contracts/types.ts';
 import type { Network } from '../contracts/live.ts';
+import { silentLogger, type OperationalLogger } from '../ops/log.ts';
 import type { Payments } from './payments.ts';
 import type { createInvoiceIssuer } from './issuance.ts';
 
 type InvoiceIssuer = ReturnType<typeof createInvoiceIssuer>;
 
 const MESSAGE_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * True when the scanner (not the request) is at fault: the live wallet
+ * scanner is down/non-200. Matched by name so this layer does not depend on
+ * the adapter module.
+ */
+export function isScannerUnavailable(error: unknown): boolean {
+  return error instanceof Error && error.name === 'WalletScannerUnavailableError';
+}
 
 export type SellerApplicationDeps = {
   store: SellerStore;
@@ -127,14 +137,22 @@ export function createSellerApplication(deps: SellerApplicationDeps): SellerAppl
         case 'status': {
           const invoice = await assertOwner(body.orderId, signerKeyId);
           if (!invoice) return errorResponse(body, signerKeyId, 'forbidden');
-          await deps.payments.reconcileFromScanner();
+          // A scanner outage must not suppress the reply: orderStatus maps a
+          // failed live snapshot to verification 'unavailable' itself.
+          await deps.payments.reconcileFromScanner().catch(() => undefined);
           const status = await deps.payments.orderStatus(body.orderId);
           return respond(body, signerKeyId, { type: 'status', orderId: body.orderId, status });
         }
         case 'recover': {
           const invoice = await assertOwner(body.orderId, signerKeyId);
           if (!invoice) return errorResponse(body, signerKeyId, 'forbidden');
-          const decision = await deps.payments.authorizeRelease(body.orderId);
+          let decision: Awaited<ReturnType<Payments['authorizeRelease']>>;
+          try {
+            decision = await deps.payments.authorizeRelease(body.orderId);
+          } catch (error) {
+            if (isScannerUnavailable(error)) return errorResponse(body, signerKeyId, 'unavailable');
+            throw error;
+          }
           if (!decision.disclose || !decision.package) {
             return errorResponse(body, signerKeyId, 'not_eligible');
           }
@@ -168,6 +186,14 @@ export function createSellerApplication(deps: SellerApplicationDeps): SellerAppl
   };
 }
 
+export type AttachOptions = {
+  logger?: OperationalLogger;
+  now?: () => number;
+  /** Seller identity/network for the catch-all reply; defaults to the request's own header. */
+  sellerKeyId?: string;
+  network?: Network;
+};
+
 /**
  * Subscribes a `SellerApplication` to a `WakuSession`: decoded requests are
  * dispatched through `application.handle`, and the response is sent back to
@@ -176,11 +202,44 @@ export function createSellerApplication(deps: SellerApplicationDeps): SellerAppl
  * the same request), matching the recover/status idempotency already built
  * into `handle` itself. Non-request bodies (a `SellerResponse` looping back
  * to the seller's own decoder) are ignored.
+ *
+ * The Waku SDK invokes this callback as `void callback(message)`, so any
+ * rejection here would be unhandled and crash the seller. A catch-all logs a
+ * sanitized code (never the message) and replies `unavailable` instead.
  */
-export function attachSellerApplication(session: WakuSession, application: SellerApplication): Promise<() => Promise<void>> {
+export function attachSellerApplication(
+  session: WakuSession,
+  application: SellerApplication,
+  options: AttachOptions = {},
+): Promise<() => Promise<void>> {
+  const logger = options.logger ?? silentLogger;
+  const now = options.now ?? Date.now;
   return session.subscribe(async (message) => {
-    if ('inReplyTo' in message.body || 'buyerKeyId' in message.body) return;
-    const response = await application.handle({ signerKeyId: message.signerKeyId, body: message.body });
-    await session.send(message.signerKeyId, response).catch(() => undefined);
+    try {
+      if ('inReplyTo' in message.body || 'buyerKeyId' in message.body) return;
+      const request = message.body;
+      let response: SellerResponse;
+      try {
+        response = await application.handle({ signerKeyId: message.signerKeyId, body: request });
+      } catch (error) {
+        logger.log({ event: 'error', component: 'waku.handler', code: error instanceof Error ? error.name : 'Error', ok: false });
+        const at = now();
+        response = {
+          version: 1,
+          messageId: `resp-${request.messageId}`,
+          inReplyTo: request.messageId,
+          sellerKeyId: options.sellerKeyId ?? request.sellerKeyId,
+          buyerKeyId: message.signerKeyId,
+          network: options.network ?? request.network,
+          issuedAt: at,
+          expiresAt: at + MESSAGE_TTL_MS,
+          type: 'error',
+          code: 'unavailable',
+        } as SellerResponse;
+      }
+      await session.send(message.signerKeyId, response).catch(() => undefined);
+    } catch (error) {
+      logger.log({ event: 'error', component: 'waku.handler', code: error instanceof Error ? error.name : 'Error', ok: false });
+    }
   });
 }

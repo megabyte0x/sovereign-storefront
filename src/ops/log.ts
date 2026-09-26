@@ -6,21 +6,74 @@ export const ALLOWED_EVENTS = [
   'payment.observed',
   'fulfillment.dispatch',
   'admin.auth',
+  'admin.publish',
+  'runtime.component',
+  'runtime.loop',
+  'runtime.readiness',
+  'waku.handler_error',
   'error',
 ] as const;
 
+/**
+ * Allow-list: event class, status, timing and safe aggregate counters only.
+ * `loop` (runtime loop name) and `method` (HTTP verb) are enum-valued call-site
+ * extensions. Free text, paths, URLs and error messages are never logged.
+ */
 export const ALLOWED_LOG_FIELDS = new Set([
   'event',
   'ts',
-  'method',
-  'path',
+  'component',
   'status',
   'ok',
   'code',
+  'count',
+  'durationMs',
+  'generation',
+  'timing',
+  'loop',
+  'method',
 ]);
 
 const FORBIDDEN_KEY_PATTERN =
   /invoice|memo|attr|uri|destination|credential|private|secret|key|proof|spending|payment|buyer|orderid|amount|wrapped/i;
+
+/** Enum-like identifier: no spaces, slashes or free-text messages. */
+export const LOG_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+const FORBIDDEN_VALUE_PATTERN = /secret|passw|mnemonic|ufvk|spending|private|token/i;
+const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+
+function safeIdentifier(value: unknown): string | undefined {
+  return typeof value === 'string' && LOG_CODE_PATTERN.test(value) && !FORBIDDEN_VALUE_PATTERN.test(value)
+    ? value
+    : undefined;
+}
+
+function safeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Per-field value typing; undefined means the field is dropped. */
+function sanitizeValue(key: string, value: unknown): string | number | boolean | undefined {
+  switch (key) {
+    case 'ok':
+      return typeof value === 'boolean' ? value : undefined;
+    case 'code':
+    case 'count':
+    case 'status':
+      return safeNumber(value) ?? safeIdentifier(value);
+    case 'durationMs':
+    case 'generation':
+    case 'timing':
+      return safeNumber(value);
+    case 'component':
+    case 'loop':
+      return safeIdentifier(value);
+    case 'method':
+      return typeof value === 'string' && HTTP_METHODS.has(value) ? value : undefined;
+    default:
+      return undefined;
+  }
+}
 
 export type LogSink = (line: string) => void;
 
@@ -43,10 +96,8 @@ function sanitize(record: Record<string, unknown>): Record<string, unknown> {
     if (key === 'event' || key === 'ts') continue;
     if (!ALLOWED_LOG_FIELDS.has(key)) continue;
     if (FORBIDDEN_KEY_PATTERN.test(key)) continue;
-    if (value !== null && typeof value === 'object') continue;
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      out[key] = value;
-    }
+    const safe = sanitizeValue(key, value);
+    if (safe !== undefined) out[key] = safe;
   }
   return out;
 }

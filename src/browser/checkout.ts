@@ -5,6 +5,7 @@ import type {
   OrderTransport,
   PurchaseStore,
 } from '../contracts/types.ts';
+import type { Network } from '../contracts/live.ts';
 
 export type CheckoutDraft = Pick<
   BrowserPurchase,
@@ -17,12 +18,17 @@ function assertCanonicalAmount(value: string): void {
   }
 }
 
-function assertInvoiceBinding(record: BrowserPurchase, invoice: Invoice): void {
+export type CheckoutOptions = {
+  /** Network the invoice must be on: the seller's advertised network in real-demo, `test` otherwise. */
+  network?: Network;
+};
+
+function assertInvoiceBinding(record: BrowserPurchase, invoice: Invoice, network: Network): void {
   if (invoice.productVersion !== record.productVersion) {
     throw new Error('invoice product version does not match');
   }
-  if (invoice.network !== 'test') {
-    throw new Error('invoice network is not test');
+  if (invoice.network !== network) {
+    throw new Error('invoice network does not match');
   }
   assertCanonicalAmount(invoice.amountZat);
   if (!invoice.id || !invoice.orderId || !invoice.destination) {
@@ -72,7 +78,9 @@ export async function beginCheckout(
   transport: OrderTransport,
   credentials: CredentialAdapter,
   draft: CheckoutDraft,
+  options: CheckoutOptions = {},
 ): Promise<Invoice> {
+  const network: Network = options.network ?? 'test';
   const existing = await store.get(draft.requestId);
   const credentialId = existing?.credentialId
     ? existing.credentialId
@@ -87,7 +95,7 @@ export async function beginCheckout(
   await requireUsableCredential(credentials, savedDraft.credentialId);
 
   if (savedDraft.invoice) {
-    assertInvoiceBinding(savedDraft, savedDraft.invoice);
+    assertInvoiceBinding(savedDraft, savedDraft.invoice, network);
     const proof = await credentials.provePossession(savedDraft.credentialId, {
       orderId: savedDraft.invoice.orderId,
     });
@@ -100,7 +108,7 @@ export async function beginCheckout(
   }
 
   const invoice = await transport.create(savedDraft);
-  assertInvoiceBinding(savedDraft, invoice);
+  assertInvoiceBinding(savedDraft, invoice, network);
   const proof = await credentials.provePossession(savedDraft.credentialId, {
     orderId: invoice.orderId,
   });

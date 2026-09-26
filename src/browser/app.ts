@@ -14,7 +14,9 @@ import {
 } from '../contracts/types.ts';
 import { beginCheckout, paymentInstructions, renderPaymentInstructions } from './checkout.ts';
 import { decryptDownload } from './download.ts';
-import { BEARER_SECRET_WARNING, openPurchaseStore, renderBackupGuidance } from './purchases.ts';
+import { BEARER_SECRET_WARNING, openPurchaseStore, renderBackupGuidance, type PurchaseStoreOptions } from './purchases.ts';
+import { createWakuOrderTransport, type WakuSellerConfig } from './waku-transport.ts';
+import type { WakuConfig, WakuSession } from '../contracts/messages.ts';
 
 export type ProductViewModel = {
   version: string;
@@ -182,9 +184,10 @@ function parseDeliveryPackage(body: unknown): DeliveryPackage {
 export function createBrowserTransport(
   credentials: CredentialAdapter,
   origin = '',
+  fetchImpl: typeof fetch = (input, init) => fetch(input, init),
 ): OrderTransport {
   async function post(path: string, body: unknown): Promise<Response> {
-    return fetch(`${origin}${path}`, {
+    return fetchImpl(`${origin}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -333,7 +336,7 @@ export function renderStatusView(root: RenderRoot, orderStatus: OrderStatus): vo
   `;
 }
 
-export function renderPurchasesView(root: RenderRoot, input: { purchases: BrowserPurchase[] }): void {
+export function renderPurchasesView(root: RenderRoot, input: { purchases: BrowserPurchase[]; notice?: string }): void {
   const rows = input.purchases.map((item) => (
     `<li><button type="button" data-request-id="${escapeHtml(item.requestId)}">${escapeHtml(item.requestId)}</button></li>`
   )).join('');
@@ -342,6 +345,8 @@ export function renderPurchasesView(root: RenderRoot, input: { purchases: Browse
       <h1>My purchases</h1>
       <p id="backup-warning"></p>
       <button type="button" id="export-backup">Export backup</button>
+      <label for="import-backup">Import backup <input type="file" id="import-backup" accept=".backup"></label>
+      ${input.notice ? `<p role="status" id="import-status">${escapeHtml(input.notice)}</p>` : ''}
       <ul>${rows}</ul>
     </section>
   `;
@@ -430,8 +435,88 @@ type AppRoot = RenderRoot & {
   addEventListener(type: string, listener: (event: { target: unknown }) => unknown): void;
 };
 
-async function startBrowserApp(root: RenderRoot): Promise<void> {
+/** Frozen R3 contract: GET /api/waku-config (real-demo only; 404 in fixture mode). */
+export type PublicWakuConfig = {
+  sellerKeyId: string;
+  network: 'regtest' | 'test';
+  contentTopic: string;
+  bootstrapPeers: string[];
+};
+
+/**
+ * `fixture`: the seller answered 404 → HTTP transport (fixture seller only).
+ * `waku`: real-demo → every order call runs over a Waku session scoped to the
+ * purchase credential it acts for. `unavailable`: waku-config could not be
+ * read or was malformed → no order transport at all (never HTTP).
+ */
+export type TransportMode = 'fixture' | 'waku' | 'unavailable';
+
+export type BrowserAppDeps = {
+  fetch?: typeof fetch;
+  credentials?: CredentialAdapter;
+  openStore?: (options: PurchaseStoreOptions) => Promise<PurchaseStore>;
+  /** Defaults to `credentials.createWakuSession`. */
+  createSession?: (credentialId: string, config: WakuConfig) => Promise<WakuSession>;
+  /**
+   * Verified decrypt of a recovered package. Defaults to `decryptDownload`.
+   * An acknowledgement is sent only after this resolves.
+   */
+  decrypt?: typeof decryptDownload;
+  origin?: string;
+  peerTimeoutMs?: number;
+};
+
+export type BrowserApp = { transportMode: TransportMode };
+
+const DEFAULT_PEER_TIMEOUT_MS = 10_000;
+
+const VERIFICATION_UNAVAILABLE: OrderStatus = {
+  payment: 'awaiting',
+  delivery: 'locked',
+  verification: 'unavailable',
+  exceptions: [{ code: 'verification_unavailable' }],
+};
+
+function parsePublicWakuConfig(body: unknown): PublicWakuConfig | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const row = body as Record<string, unknown>;
+  if (typeof row.sellerKeyId !== 'string' || !/^[0-9a-f]{66}$|^[0-9a-f]{130}$/i.test(row.sellerKeyId)) return null;
+  if (row.network !== 'regtest' && row.network !== 'test') return null;
+  if (typeof row.contentTopic !== 'string' || row.contentTopic.length === 0) return null;
+  if (!Array.isArray(row.bootstrapPeers) || !row.bootstrapPeers.every((p) => typeof p === 'string' && p.length > 0)) return null;
+  return {
+    sellerKeyId: row.sellerKeyId.toLowerCase(),
+    network: row.network,
+    contentTopic: row.contentTopic,
+    bootstrapPeers: [...row.bootstrapPeers as string[]],
+  };
+}
+
+/**
+ * One-shot boot probe. A 404 is only a fixture-mode *candidate*: fixture mode
+ * also requires the fixture seller's product marker (`network === 'test'`).
+ * A 404 on any other origin is `unavailable`, never a fail-open HTTP attempt.
+ */
+async function probeWakuConfig(fetchImpl: typeof fetch): Promise<PublicWakuConfig | 'fixture-candidate' | null> {
+  try {
+    const res = await fetchImpl('/api/waku-config');
+    if (!res.ok) {
+      // Drain the body so the request completes (an unread body keeps it open).
+      await res.text().catch(() => undefined);
+      return res.status === 404 ? 'fixture-candidate' : null;
+    }
+    return parsePublicWakuConfig(await res.json());
+  } catch {
+    return null;
+  }
+}
+
+/** Runs `fn` with an order transport for exactly one purchase credential. */
+type ScopedTransport = <T>(credentialId: string, fn: (transport: OrderTransport) => Promise<T>) => Promise<T>;
+
+export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {}): Promise<BrowserApp> {
   exposeHooks();
+  const fetchImpl: typeof fetch = deps.fetch ?? ((input, init) => fetch(input, init));
   let product: ProductViewModel = {
     version: 'book-v1',
     description: 'Product',
@@ -447,10 +532,11 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
     storageReplica: false,
     scanner: false,
   };
+  const wakuProbe = probeWakuConfig(fetchImpl);
   try {
     const [productRes, availabilityRes] = await Promise.all([
-      fetch('/api/product'),
-      fetch('/api/availability'),
+      fetchImpl('/api/product'),
+      fetchImpl('/api/availability'),
     ]);
     if (productRes.ok) {
       product = await productRes.json() as ProductViewModel;
@@ -462,14 +548,82 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
     // Product metadata is informational until the seller answers.
   }
 
-  const credentials = createCredentialAdapter();
-  const transport = createBrowserTransport(credentials);
-  const origin = pageOrigin();
-  const storePromise: Promise<PurchaseStore> = openPurchaseStore({
+  const credentials = deps.credentials ?? createCredentialAdapter();
+  const decrypt = deps.decrypt ?? decryptDownload;
+  const origin = deps.origin ?? pageOrigin();
+
+  // Transport selection happens exactly once, here. Real-demo never uses HTTP
+  // order routes, and a Waku failure never falls back to them. The store opens
+  // after the probe so a verified waku-config can supply the content topic a
+  // v2 backup's delivery is re-verified against.
+  const probe = await wakuProbe;
+  let transportMode: TransportMode;
+  let withTransport: ScopedTransport;
+  let checkoutNetwork: 'regtest' | 'test' = 'test';
+  // Fixture mode needs the 404 *and* the fixture seller's product marker.
+  // A misrouting proxy 404 on a real-demo origin (network !== 'test') yields
+  // unavailable rather than a fail-open HTTP attempt.
+  const wakuConfigProbe = probe !== null && probe !== 'fixture-candidate'
+    && (!product.sellerKeyId || product.sellerKeyId.toLowerCase() === probe.sellerKeyId)
+    ? probe
+    : null;
+  const storePromise: Promise<PurchaseStore> = (deps.openStore ?? openPurchaseStore)({
     sellerOrigin: origin,
     sellerKeyId: product.sellerKeyId,
     credentials,
+    ...(wakuConfigProbe ? { contentTopic: wakuConfigProbe.contentTopic } : {}),
   });
+  if (probe === 'fixture-candidate' && product.network === 'test') {
+    transportMode = 'fixture';
+    const http = createBrowserTransport(credentials, '', fetchImpl);
+    withTransport = async (_credentialId, fn) => fn(http);
+  } else if (wakuConfigProbe) {
+    transportMode = 'waku';
+    checkoutNetwork = wakuConfigProbe.network;
+    const wakuConfig: WakuConfig = {
+      contentTopic: wakuConfigProbe.contentTopic,
+      bootstrapPeers: wakuConfigProbe.bootstrapPeers,
+      peerTimeoutMs: deps.peerTimeoutMs ?? DEFAULT_PEER_TIMEOUT_MS,
+    };
+    const createSession = deps.createSession
+      ?? ((credentialId: string, config: WakuConfig) => credentials.createWakuSession(credentialId, config));
+    const sellerConfig: WakuSellerConfig = {
+      sellerKeyId: wakuConfigProbe.sellerKeyId,
+      network: wakuConfigProbe.network,
+      amountZat: product.amountZat,
+      productVersion: product.version,
+    };
+    withTransport = async (credentialId, fn) => {
+      // A fresh session per purchase credential: its signing/decryption key
+      // is that credential's key, so each purchase speaks as its own buyer.
+      const session = await createSession(credentialId, wakuConfig);
+      try {
+        const store = await storePromise;
+        const transport = createWakuOrderTransport(credentials, session, sellerConfig, store);
+        // Subscribe before any request so a seller-pushed delivery arriving
+        // while this session is open is verified and persisted.
+        await transport.listen();
+        return await fn(transport);
+      } finally {
+        await session.close().catch(() => undefined);
+      }
+    };
+  } else {
+    transportMode = 'unavailable';
+    availability = { ...availability, messaging: false };
+    withTransport = async () => {
+      throw new Error('order messaging unavailable');
+    };
+  }
+
+  // Checkout learns the credential only inside beginCheckout, so route each
+  // call to a transport scoped to the record's own credential.
+  const checkoutTransport: OrderTransport = {
+    create: (record) => withTransport(record.credentialId, (t) => t.create(record)),
+    status: (orderId, credentialId) => withTransport(credentialId, (t) => t.status(orderId, credentialId)),
+    recover: (orderId, credentialId) => withTransport(credentialId, (t) => t.recover(orderId, credentialId)),
+    acknowledge: (orderId, credentialId, packageId) => withTransport(credentialId, (t) => t.acknowledge(orderId, credentialId, packageId)),
+  };
 
   const showProduct = (): void => {
     renderProductView(root, {
@@ -489,7 +643,12 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
 
   const showPurchases = async (): Promise<void> => {
     const store = await storePromise;
-    renderPurchasesView(root, { purchases: await store.list() });
+    const purchases = await store.list();
+    const skipped = (purchases as { skipped?: number }).skipped ?? 0;
+    renderPurchasesView(root, {
+      purchases,
+      ...(skipped > 0 ? { notice: 'Some purchases could not be read' } : {}),
+    });
   };
 
   const onBuy = async (): Promise<void> => {
@@ -502,7 +661,7 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
       sellerOrigin: origin,
       sellerKeyId: product.sellerKeyId,
     };
-    await beginCheckout(store, transport, credentials, draft);
+    await beginCheckout(store, checkoutTransport, credentials, draft, { network: checkoutNetwork });
     const saved = await store.get(draft.requestId);
     if (!saved) {
       throw new Error('purchase draft was not persisted');
@@ -533,24 +692,55 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
     setDataAttribute(target, 'export-backup', 'data-exported', 'true');
   };
 
+  // Import a purchase backup chosen through the file control; the store
+  // verifies and migrates it. Errors show a fixed message (no backup detail).
+  const onImport = async (target: unknown): Promise<void> => {
+    const input = target as { files?: ArrayLike<{ arrayBuffer(): Promise<ArrayBuffer> }>; value?: string };
+    const file = input.files?.[0];
+    if (!file) return;
+    const store = await storePromise;
+    let notice = 'Backup imported';
+    try {
+      await store.importBackup(new Uint8Array(await file.arrayBuffer()));
+    } catch {
+      notice = 'Backup could not be imported';
+    }
+    if (typeof input.value === 'string') input.value = '';
+    renderPurchasesView(root, { purchases: await store.list(), notice });
+  };
+
   const onOpenPurchase = async (requestId: string): Promise<void> => {
     const store = await storePromise;
     const purchase = await store.get(requestId);
     if (!purchase?.orderId) return;
-    const orderStatus = await transport.status(purchase.orderId, purchase.credentialId);
-    renderStatusView(root, orderStatus);
+    const orderId = purchase.orderId;
+    const credentialId = purchase.credentialId;
     try {
-      const pkg = await transport.recover(purchase.orderId, purchase.credentialId);
-      const cipherRes = await fetch(`/ciphertext/${encodeURIComponent(pkg.productVersion)}`);
-      if (!cipherRes.ok) return;
-      const ciphertext = new Uint8Array(await cipherRes.arrayBuffer());
-      const blob = await decryptDownload(pkg, ciphertext, {
-        crypto: createCryptoAdapter({ credentials }),
-        credentialId: purchase.credentialId,
+      // One transport (one Waku session in real-demo) scoped to *this*
+      // purchase's credential, for both the status and the recover call.
+      await withTransport(credentialId, async (transport) => {
+        const orderStatus = await transport.status(orderId, credentialId);
+        renderStatusView(root, orderStatus);
+        try {
+          const pkg = await transport.recover(orderId, credentialId);
+          const cipherRes = await fetchImpl(`/ciphertext/${encodeURIComponent(pkg.productVersion)}`);
+          if (!cipherRes.ok) return;
+          const ciphertext = new Uint8Array(await cipherRes.arrayBuffer());
+          const blob = await decrypt(pkg, ciphertext, {
+            crypto: createCryptoAdapter({ credentials }),
+            credentialId,
+          });
+          downloadBytes(`${pkg.productVersion}.bin`, new Uint8Array(await blob.arrayBuffer()));
+          // Acknowledge only after a verified decrypt, over the same scoped transport.
+          if (pkg.packageId) await transport.acknowledge(orderId, credentialId, pkg.packageId);
+        } catch {
+          // Status is informational; recovery may be ineligible until payment confirms.
+        }
       });
-      downloadBytes(`${pkg.productVersion}.bin`, new Uint8Array(await blob.arrayBuffer()));
     } catch {
-      // Status is informational; recovery may be ineligible until payment confirms.
+      // No verified answer (Waku failed to start, no peers, timeout): show the
+      // existing "verification unavailable" state. Never retry over HTTP.
+      renderStatusView(root, VERIFICATION_UNAVAILABLE);
     }
   };
 
@@ -578,8 +768,13 @@ async function startBrowserApp(root: RenderRoot): Promise<void> {
     }
   });
 
+  (root as AppRoot).addEventListener('change', (event) => {
+    if (closestAttribute(event.target, 'id') === 'import-backup') void onImport(event.target);
+  });
+
   showProduct();
   void storePromise;
+  return { transportMode };
 }
 
 exposeHooks();

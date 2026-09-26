@@ -77,6 +77,12 @@ export function openCatalogue(options: {
   dbPath: string;
   storage: StorageAdapter;
   probes?: Partial<AvailabilityProbes>;
+  /**
+   * Cached per-product replica readiness (live runtime). When supplied, no
+   * availability read ever touches storage: the bounded readiness loop is the
+   * only thing that downloads, and a missing/stale entry means unavailable.
+   */
+  replicaReady?: (productVersion: string) => boolean;
 }): {
   getPublishedCiphertext(productVersion: string): Promise<Uint8Array>;
   getManifest(productVersion: string): ProductManifest | null;
@@ -87,7 +93,10 @@ export function openCatalogue(options: {
     rawKey: Uint8Array;
     digestHex: string;
   }>;
-  currentAvailability(): Promise<ServiceAvailability>;
+  /** First-published-product availability, or one product's when `productVersion` is given. */
+  currentAvailability(productVersion?: string): Promise<ServiceAvailability>;
+  /** Availability for one product: that product's own replica (cached when `replicaReady` is set). */
+  productAvailability(productVersion: string): Promise<ServiceAvailability>;
   beginPublication(input: {
     version: string;
     description: string;
@@ -124,9 +133,17 @@ export function openCatalogue(options: {
     messaging: options.probes?.messaging ?? (async () => false),
     scanner: options.probes?.scanner ?? (async () => false),
     storageReplica: options.probes?.storageReplica ?? (async () => {
+      if (options.replicaReady) {
+        // Cached readiness only (no download): any published product whose
+        // replica entry is fresh and ok.
+        const rows = db.prepare(
+          `SELECT version FROM products WHERE published = 1 AND ciphertext_cid IS NOT NULL ORDER BY created_at ASC`,
+        ).all() as Array<{ version: string }>;
+        return rows.some((row) => options.replicaReady!(row.version));
+      }
       const row = db.prepare(
-        `SELECT ciphertext_cid FROM products WHERE published = 1 AND ciphertext_cid IS NOT NULL LIMIT 1`,
-      ).get() as { ciphertext_cid: string } | undefined;
+        `SELECT version, ciphertext_cid FROM products WHERE published = 1 AND ciphertext_cid IS NOT NULL ORDER BY created_at ASC LIMIT 1`,
+      ).get() as { version: string; ciphertext_cid: string } | undefined;
       if (!row?.ciphertext_cid) return false;
       return options.storage.verifyReplica(row.ciphertext_cid, 'replica');
     }),
@@ -180,7 +197,8 @@ export function openCatalogue(options: {
         digestHex: row.digest_hex ?? '',
       }));
     },
-    async currentAvailability() {
+    async currentAvailability(productVersion) {
+      if (productVersion !== undefined) return this.productAvailability(productVersion);
       const published = db.prepare(`SELECT 1 AS ok FROM products WHERE published = 1 LIMIT 1`).get() as
         | { ok: number }
         | undefined;
@@ -188,6 +206,24 @@ export function openCatalogue(options: {
         productPublished: Boolean(published),
         messaging: await probes.messaging(),
         storageReplica: await probes.storageReplica(),
+        scanner: await probes.scanner(),
+      };
+    },
+    async productAvailability(productVersion) {
+      const row = PRODUCT_VERSION_RE.test(productVersion) ? read(productVersion) : undefined;
+      const published = row?.published === 1 && Boolean(row.ciphertext_cid);
+      let storageReplica = false;
+      if (published) {
+        storageReplica = options.replicaReady
+          ? options.replicaReady(productVersion)
+          : options.probes?.storageReplica
+            ? await options.probes.storageReplica()
+            : await options.storage.verifyReplica(row!.ciphertext_cid!, 'replica').catch(() => false);
+      }
+      return {
+        productPublished: published,
+        messaging: await probes.messaging(),
+        storageReplica,
         scanner: await probes.scanner(),
       };
     },

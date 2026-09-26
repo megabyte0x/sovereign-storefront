@@ -1,6 +1,6 @@
 import { generatePrivateKey, getPublicKey } from '@waku/message-encryption';
 import { createDecoder, createEncoder } from '@waku/message-encryption/ecies';
-import { createLightNode, DefaultNetworkConfig, Protocols, WakuEvent } from '@waku/sdk';
+import { createLightNode, DefaultNetworkConfig, Protocols, waku, WakuEvent } from '@waku/sdk';
 import { createRoutingInfo } from '@waku/utils';
 import { bytesToHex, hexToBytes } from '@waku/utils/bytes';
 import type { BuyerRequest, DecodedWakuMessage, SellerResponse, WakuConfig, WakuSession } from '../contracts/messages.ts';
@@ -22,18 +22,42 @@ export type WakuNode = {
     removeEventListener(type: string, listener: (event: { detail: unknown }) => void): void;
   };
   stop(): Promise<void>;
+  /**
+   * `IWaku.isConnected()` from `@waku/interfaces` (true while at least one
+   * peer is connected). Optional so narrow test fakes may omit it; the
+   * session then relies on `waku:connection` events alone.
+   */
+  isConnected?(): boolean;
 };
 
 type EciesDecodedMessage = {
   payload: Uint8Array;
+  /** The received protobuf message (still ECIES-encrypted and signed); set by @waku/core DecodedMessage. */
+  proto?: unknown;
   verifySignature(publicKey: Uint8Array): boolean;
   signaturePublicKey?: Uint8Array;
   signature?: Uint8Array;
 };
 
+function wireBytes(decoded: EciesDecodedMessage): Uint8Array | null {
+  if (!decoded.proto || typeof decoded.proto !== 'object') return null;
+  try {
+    return waku.message.version_0.proto.WakuMessage.encode(decoded.proto as never);
+  } catch {
+    return null;
+  }
+}
+
 export type WakuSessionOptions = {
   createNode?: (config: WakuConfig) => Promise<WakuNode>;
   retryIntervalMs?: number;
+  /**
+   * Per-instance report of a failed delivery handler. It receives no
+   * arguments: never the payload, signer or error text. Callers log it as the
+   * allow-listed `waku.handler_error` event class. Undecodable or unsigned
+   * deliveries are dropped without calling it.
+   */
+  onHandlerError?: () => void;
 };
 
 const MAX_PENDING_REQUESTS = 128;
@@ -70,7 +94,43 @@ async function defaultCreateNode(config: WakuConfig): Promise<WakuNode> {
     networkConfig: DefaultNetworkConfig,
   });
   await node.waitForPeers([Protocols.LightPush, Protocols.Filter], config.peerTimeoutMs);
-  return node as unknown as WakuNode;
+  return withLibp2pConnectivity(node as unknown as WakuNode);
+}
+
+type ConnectionListener = (event: { detail: unknown }) => void;
+
+/**
+ * Under Node 22 `globalThis.navigator` exists without `onLine`, so
+ * @waku/core's NetworkMonitor reports `isConnected() === false` and dispatches
+ * every `waku:connection` event with `detail: false`, even while libp2p holds
+ * live peer connections. Derive connectivity from libp2p's own connection
+ * list instead. Nodes without `libp2p` (narrow test fakes) are returned as-is.
+ */
+export function withLibp2pConnectivity(node: WakuNode): WakuNode {
+  const libp2p = (node as { libp2p?: { getConnections?: () => unknown[] } }).libp2p;
+  if (!libp2p || typeof libp2p.getConnections !== 'function') return node;
+  const connected = (): boolean => libp2p.getConnections!().length > 0;
+  const wrapped = new Map<ConnectionListener, ConnectionListener>();
+  return {
+    waitForPeers: (protocols, timeoutMs) => node.waitForPeers(protocols, timeoutMs),
+    lightPush: node.lightPush,
+    filter: node.filter,
+    events: {
+      addEventListener(type, listener) {
+        if (type !== WakuEvent.Connection) return node.events.addEventListener(type, listener);
+        const relay: ConnectionListener = () => listener({ detail: connected() });
+        wrapped.set(listener, relay);
+        node.events.addEventListener(type, relay);
+      },
+      removeEventListener(type, listener) {
+        const relay = type === WakuEvent.Connection ? wrapped.get(listener) : undefined;
+        if (relay) wrapped.delete(listener);
+        node.events.removeEventListener(type, relay ?? listener);
+      },
+    },
+    stop: () => node.stop(),
+    isConnected: connected,
+  };
 }
 
 /** Extra test-only accessor exposed alongside the public WakuSession contract. */
@@ -94,6 +154,10 @@ export function createWakuSession(
   let handler: ((message: DecodedWakuMessage) => Promise<void>) | null = null;
   let ownDecoder: ReturnType<typeof createDecoder> | null = null;
   let connectionListener: ((event: { detail: unknown }) => void) | null = null;
+  // Current connectivity, so ready() never latches: the last
+  // `waku:connection` event, and whether our filter subscription is live.
+  let connectedByEvent = true;
+  let subscribed = false;
 
   let pendingCount = 0;
   let activeDecodes = 0;
@@ -113,16 +177,22 @@ export function createWakuSession(
     return count <= RATE_LIMIT_PER_SIGNER_PER_MINUTE;
   }
 
-  function verifiedSignerKeyId(decoded: EciesDecodedMessage): string | null {
-    if (!decoded.signaturePublicKey || !decoded.signature) return null;
-    if (!decoded.verifySignature(decoded.signaturePublicKey)) return null;
+  function verifiedSignerKeyId(decoded: EciesDecodedMessage | null | undefined): string | null {
+    // The live @waku/sdk filter hands the subscriber fromProtoObj's result even
+    // when it is undefined (traffic on our topic we cannot decrypt).
+    if (!decoded || !decoded.signaturePublicKey || !decoded.signature) return null;
+    try {
+      if (!decoded.verifySignature(decoded.signaturePublicKey)) return null;
+    } catch {
+      return null;
+    }
     return bytesToHex(decoded.signaturePublicKey);
   }
 
-  async function handleDecoded(decoded: EciesDecodedMessage): Promise<void> {
+  async function handleDecoded(decoded: EciesDecodedMessage | undefined): Promise<void> {
     if (!handler) return;
     const signerKeyId = verifiedSignerKeyId(decoded);
-    if (!signerKeyId) return;
+    if (!signerKeyId || !decoded) return;
     if (!withinRateLimit(signerKeyId)) return;
     if (pendingCount >= MAX_PENDING_REQUESTS || activeDecodes >= MAX_CONCURRENT_DECODES) return;
 
@@ -135,28 +205,51 @@ export function createWakuSession(
       } catch {
         return;
       }
-      await handler({ signerKeyId, body, wireEnvelope: decoded.payload });
+      // Keep the signed ECIES wire bytes (not the decrypted payload) so a stored
+      // delivery can be re-verified later with decodeStored().
+      const wireEnvelope = wireBytes(decoded);
+      if (!wireEnvelope) return;
+      await handler({ signerKeyId, body, wireEnvelope });
     } finally {
       pendingCount -= 1;
       activeDecodes -= 1;
     }
   }
 
+  function reportHandlerError(): void {
+    try {
+      options.onHandlerError?.();
+    } catch {
+      // A failing reporter must not turn into an unhandled rejection either.
+    }
+  }
+
   async function subscribeOwnDecoder(activeNode: WakuNode): Promise<void> {
     ownDecoder = createDecoder(config.contentTopic, routingInfo, ownPrivateKey);
-    const ok = await activeNode.filter.subscribe(ownDecoder, (message) => handleDecoded(message as EciesDecodedMessage));
+    const ok = await activeNode.filter.subscribe(ownDecoder, (message) =>
+      // Never let one bad delivery become an unhandled rejection in the seller;
+      // report the failure class only (no payload, no message text).
+      handleDecoded(message as EciesDecodedMessage | undefined).catch(reportHandlerError));
     if (!ok) {
+      subscribed = false;
       throw new Error('waku filter subscribe failed');
     }
+    subscribed = true;
   }
 
   async function ensureStarted(): Promise<WakuNode> {
     if (node && started) return node;
     node = await withTimeout(createNode(config), config.peerTimeoutMs, 'waku node startup timed out');
     await subscribeOwnDecoder(node);
+    connectedByEvent = true;
     connectionListener = (event) => {
       if (event.detail === true) {
-        void subscribeOwnDecoder(node!);
+        connectedByEvent = true;
+        const current = node;
+        if (current) subscribeOwnDecoder(current).catch(() => { subscribed = false; });
+      } else if (event.detail === false) {
+        connectedByEvent = false;
+        subscribed = false;
       }
     };
     node.events.addEventListener(WakuEvent.Connection, connectionListener);
@@ -166,8 +259,9 @@ export function createWakuSession(
 
   return {
     async ready() {
-      await ensureStarted();
-      return true;
+      const activeNode = await ensureStarted();
+      if (!connectedByEvent || !subscribed) return false;
+      return typeof activeNode.isConnected === 'function' ? activeNode.isConnected() : true;
     },
     async send(recipientKeyId, body) {
       const activeNode = await ensureStarted();
@@ -232,6 +326,7 @@ export function createWakuSession(
       }
       node = null;
       started = false;
+      subscribed = false;
     },
   };
 }

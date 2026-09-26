@@ -4,7 +4,11 @@ import type {
   Invoice,
   PurchaseStore,
 } from '../contracts/types.ts';
-import type { StoredDelivery } from '../contracts/messages.ts';
+import { MAX_MESSAGE_BYTES, type StoredDelivery } from '../contracts/messages.ts';
+import type { ChainIdentity, Network, ReceiverRef } from '../contracts/live.ts';
+import { validateChainIdentity, validateReceiver } from '../contracts/live-validation.ts';
+import { hexToBytes } from '@waku/utils/bytes';
+import { importVerifySession, verifyImportedDelivery } from './waku-transport.ts';
 
 export const BEARER_SECRET_WARNING =
   'This file grants access to the purchase and is not an ordinary receipt. Treat it as a bearer secret.';
@@ -13,8 +17,22 @@ export const STORAGE_FAILURE_GUIDANCE =
   'Storage failed. Export a backup, re-import it to confirm recovery, then retry. Payment is blocked until the purchase is stored.';
 
 export const BACKUP_KIND = 'sovereign-storefront-purchase-backup';
-export const BACKUP_VERSION = 1 as const;
-export const IDB_SCHEMA_VERSION = 1 as const;
+/**
+ * Backup envelope version. v2 adds the retained signed delivery (package id +
+ * original wire envelope); v1 backups (no delivery) are still importable.
+ */
+export const BACKUP_VERSION = 2 as const;
+const LEGACY_BACKUP_VERSION = 1;
+/**
+ * Per-record schema version stored on every IndexedDB purchase row. v2 makes
+ * the retained delivery an explicit field (`null` when absent). v1 rows are
+ * migrated in place on first read without touching the credential material;
+ * any other (future/unknown) version is refused and never overwritten.
+ */
+export const IDB_SCHEMA_VERSION = 2 as const;
+const LEGACY_SCHEMA_VERSION = 1;
+/** IndexedDB database version (object-store layout), independent of row schema. */
+const IDB_DATABASE_VERSION = 1;
 export const DEFAULT_DB_NAME = 'sovereign-storefront-purchases';
 const PURCHASE_STORE = 'purchases';
 
@@ -63,7 +81,15 @@ export type PurchaseStoreOptions = {
   indexedDB?: IDBFactoryLike;
   persist?: PersistFn | null;
   dbName?: string;
+  /**
+   * Content topic the retained delivery was sealed on. A v2 backup's delivery
+   * is re-verified with decodeStored on this topic before it is stored; with
+   * no topic, a delivery-bearing backup is rejected rather than trusted.
+   */
+  contentTopic?: string;
 };
+
+type StoredDeliveryRow = { packageId: string; wireEnvelope: number[] };
 
 type StoredPurchase = {
   schemaVersion: typeof IDB_SCHEMA_VERSION;
@@ -76,7 +102,13 @@ type StoredPurchase = {
   credentialId: string;
   invoice: Invoice | null;
   credentialMaterial: number[];
-  delivery?: { packageId: string; wireEnvelope: number[] };
+  delivery: StoredDeliveryRow | null;
+};
+
+/** A row as read from IndexedDB: any schema version may be on disk. */
+type RawStoredPurchase = Omit<StoredPurchase, 'schemaVersion' | 'delivery'> & {
+  schemaVersion: unknown;
+  delivery?: StoredDeliveryRow | null;
 };
 
 type BackupEnvelope = {
@@ -85,6 +117,7 @@ type BackupEnvelope = {
   warning: string;
   sellerOrigin: string;
   sellerKeyId: string;
+  contentTopic?: string;
   purchase: {
     version: 1;
     requestId: string;
@@ -96,6 +129,7 @@ type BackupEnvelope = {
     privateKeyHex: string;
     publicKeyHex: string;
   };
+  delivery: StoredDeliveryRow | null;
 };
 
 export type WarningTarget = {
@@ -110,6 +144,47 @@ function requiredString(value: unknown, field: string): string {
   return value;
 }
 
+/**
+ * A live (real-demo) invoice: receiver-attributed, bound to a chain identity,
+ * never carrying the legacy `attributionRef`. Chain and receiver checks reuse
+ * the contract validators; any failure is reported as a malformed invoice.
+ */
+function sanitizeLiveInvoice(row: Record<string, unknown>): Invoice {
+  const invalid = (field: string): never => { throw new Error(`malformed backup: invoice.${field}`); };
+  const network = row.network;
+  if (network !== 'test' && network !== 'regtest') invalid('network');
+  if (row.attributionRef !== undefined) invalid('attributionRef');
+  let chain: ChainIdentity;
+  try { chain = validateChainIdentity(row.chain); } catch { return invalid('chain'); }
+  if (chain.network !== network) invalid('chain');
+  const accountId = requiredString(row.accountId, 'invoice.accountId');
+  const attribution = row.attribution as Record<string, unknown>;
+  if (attribution.kind !== 'receiver') invalid('attribution');
+  const allocationId = requiredString(attribution.allocationId, 'invoice.attribution.allocationId');
+  let receiver: ReceiverRef;
+  try { receiver = validateReceiver(attribution.receiver, accountId); } catch { return invalid('attribution.receiver'); }
+  const amountZat = requiredString(row.amountZat, 'invoice.amountZat');
+  if (!/^[1-9][0-9]*$/.test(amountZat)) invalid('amountZat');
+  const paymentUri = requiredString(row.paymentUri, 'invoice.paymentUri');
+  if (!paymentUri.startsWith('zcash:')) invalid('paymentUri');
+  const expiresAt = row.expiresAt;
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) invalid('expiresAt');
+  return {
+    id: requiredString(row.id, 'invoice.id'),
+    orderId: requiredString(row.orderId, 'invoice.orderId'),
+    productVersion: requiredString(row.productVersion, 'invoice.productVersion'),
+    buyerKeyId: requiredString(row.buyerKeyId, 'invoice.buyerKeyId'),
+    network: network as Network,
+    chain,
+    accountId,
+    amountZat,
+    destination: requiredString(row.destination, 'invoice.destination'),
+    paymentUri,
+    attribution: { kind: 'receiver', allocationId, receiver },
+    expiresAt: expiresAt as number,
+  };
+}
+
 function sanitizeInvoice(value: unknown): Invoice | null {
   if (value === null || value === undefined) {
     return null;
@@ -118,6 +193,9 @@ function sanitizeInvoice(value: unknown): Invoice | null {
     throw new Error('malformed backup: invoice');
   }
   const row = value as Record<string, unknown>;
+  if (typeof row.attribution === 'object' && row.attribution !== null) {
+    return sanitizeLiveInvoice(row);
+  }
   const network = requiredString(row.network, 'invoice.network');
   if (network !== 'test') {
     throw new Error('malformed backup: invoice.network');
@@ -141,6 +219,43 @@ function sanitizeInvoice(value: unknown): Invoice | null {
     attributionRef: requiredString(row.attributionRef, 'invoice.attributionRef'),
     expiresAt,
   };
+}
+
+function sanitizeDelivery(value: unknown): StoredDeliveryRow | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('malformed backup: delivery');
+  }
+  const row = value as Record<string, unknown>;
+  const packageId = row.packageId;
+  const wire = row.wireEnvelope;
+  if (typeof packageId !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(packageId)) {
+    throw new Error('malformed backup: delivery');
+  }
+  if (!Array.isArray(wire) || wire.length === 0 || wire.length > MAX_MESSAGE_BYTES
+    || !wire.every((b) => typeof b === 'number' && Number.isInteger(b) && b >= 0 && b <= 255)) {
+    throw new Error('malformed backup: delivery');
+  }
+  return { packageId, wireEnvelope: [...wire] as number[] };
+}
+
+/**
+ * Brings a raw row to the current schema. Returns `migrated: true` when the
+ * row was a legacy v1 row that must be written back. Throws (without any
+ * write) for an unknown schema version.
+ */
+function upgradeRow(raw: RawStoredPurchase): { row: StoredPurchase; migrated: boolean } {
+  if (raw.schemaVersion === IDB_SCHEMA_VERSION) {
+    return { row: { ...raw, schemaVersion: IDB_SCHEMA_VERSION, delivery: raw.delivery ?? null }, migrated: false };
+  }
+  if (raw.schemaVersion === LEGACY_SCHEMA_VERSION) {
+    // v1 → v2: only the schema tag changes and `delivery` becomes explicit.
+    // Credential material and every other field are carried over verbatim.
+    return { row: { ...raw, schemaVersion: IDB_SCHEMA_VERSION, delivery: raw.delivery ?? null }, migrated: true };
+  }
+  throw new Error('unsupported purchase schema');
 }
 
 function toPurchase(row: StoredPurchase): BrowserPurchase {
@@ -174,7 +289,7 @@ function transactionDone(tx: IDBTransactionLike): Promise<void> {
 
 function openDatabase(factory: IDBFactoryLike, name: string): Promise<IDBDatabaseLike> {
   return new Promise((resolve, reject) => {
-    const request = factory.open(name, IDB_SCHEMA_VERSION);
+    const request = factory.open(name, IDB_DATABASE_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(PURCHASE_STORE)) {
@@ -269,11 +384,36 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
   const db = await openDatabase(getIndexedDB(options.indexedDB), options.dbName ?? DEFAULT_DB_NAME);
   const restored = new Map<string, string>();
 
-  async function readStored(requestId: string): Promise<StoredPurchase | null> {
+  async function readRaw(requestId: string): Promise<RawStoredPurchase | null> {
     const tx = db.transaction(PURCHASE_STORE, 'readonly');
     const request = tx.objectStore(PURCHASE_STORE).get(requestId);
     const row = await requestDone(request);
-    return (row as StoredPurchase | undefined) ?? null;
+    return (row as RawStoredPurchase | undefined) ?? null;
+  }
+
+  async function readAllRaw(): Promise<RawStoredPurchase[]> {
+    const tx = db.transaction(PURCHASE_STORE, 'readonly');
+    const rows = (await requestDone(tx.objectStore(PURCHASE_STORE).getAll())) as RawStoredPurchase[] | undefined;
+    return rows ?? [];
+  }
+
+  /** Reads and upgrades one row; a legacy row is migrated and written back. */
+  async function upgradeAndPersist(raw: RawStoredPurchase): Promise<StoredPurchase> {
+    const { row, migrated } = upgradeRow(raw);
+    if (migrated) {
+      await writeStored(row);
+    }
+    return row;
+  }
+
+  async function readStored(requestId: string): Promise<StoredPurchase | null> {
+    const raw = await readRaw(requestId);
+    return raw ? upgradeAndPersist(raw) : null;
+  }
+
+  async function findByOrder(orderId: string): Promise<StoredPurchase | null> {
+    const raw = (await readAllRaw()).find((candidate) => candidate.orderId === orderId);
+    return raw ? upgradeAndPersist(raw) : null;
   }
 
   async function writeStored(row: StoredPurchase): Promise<void> {
@@ -293,9 +433,6 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
   }
 
   async function hydrate(row: StoredPurchase): Promise<BrowserPurchase> {
-    if (row.schemaVersion !== IDB_SCHEMA_VERSION) {
-      throw new Error('unsupported purchase schema');
-    }
     assertSameSeller(row.sellerOrigin, row.sellerKeyId);
     let credentialId = restored.get(row.requestId) ?? row.credentialId;
     if (!restored.has(row.requestId) && row.credentialMaterial?.length) {
@@ -311,6 +448,8 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
   const store: PurchaseStore = {
     async save(record: BrowserPurchase): Promise<void> {
       assertSameSeller(record.sellerOrigin, record.sellerKeyId);
+      // readStored refuses (throws, no write) an unknown-version row, so a
+      // future record is never clobbered by an older client.
       const existing = await readStored(record.requestId);
       if (existing) {
         assertSameSeller(existing.sellerOrigin, existing.sellerKeyId);
@@ -327,6 +466,8 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         credentialId: record.credentialId,
         invoice: record.invoice,
         credentialMaterial: Array.from(material),
+        // Re-saving the same purchase must not drop its retained delivery.
+        delivery: existing?.delivery ?? null,
       });
       restored.set(record.requestId, record.credentialId);
       const read = await readStored(record.requestId);
@@ -342,12 +483,22 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
       return hydrate(row);
     },
     async list(): Promise<BrowserPurchase[]> {
-      const tx = db.transaction(PURCHASE_STORE, 'readonly');
-      const request = tx.objectStore(PURCHASE_STORE).getAll();
-      const rows = (await requestDone(request)) as StoredPurchase[];
+      const rows = await readAllRaw();
       const out: BrowserPurchase[] = [];
-      for (const row of rows ?? []) {
-        out.push(await hydrate(row));
+      let skipped = 0;
+      for (const raw of rows) {
+        // One unknown-version row must not fail the whole list. It is counted
+        // and left untouched — never upgraded, never overwritten.
+        if (raw.schemaVersion !== IDB_SCHEMA_VERSION && raw.schemaVersion !== LEGACY_SCHEMA_VERSION) {
+          skipped += 1;
+          continue;
+        }
+        out.push(await hydrate(await upgradeAndPersist(raw)));
+      }
+      // A skipped count rides on the array so callers can surface a notice
+      // without a second round trip. Zero stays off the array.
+      if (skipped > 0) {
+        Object.defineProperty(out, 'skipped', { value: skipped, enumerable: false });
       }
       return out;
     },
@@ -358,12 +509,14 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
       }
       const material = await options.credentials.exportBackupMaterial(purchase.credentialId);
       const credential = parseGateACredential(material);
+      const stored = await readStored(requestId);
       const envelope: BackupEnvelope = {
         version: BACKUP_VERSION,
         kind: BACKUP_KIND,
         warning: BEARER_SECRET_WARNING,
         sellerOrigin: options.sellerOrigin,
         sellerKeyId: options.sellerKeyId,
+        ...(options.contentTopic ? { contentTopic: options.contentTopic } : {}),
         purchase: {
           version: 1,
           requestId: purchase.requestId,
@@ -372,6 +525,7 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
           invoice: purchase.invoice,
         },
         credential,
+        delivery: stored?.delivery ?? null,
       };
       return new TextEncoder().encode(JSON.stringify(envelope));
     },
@@ -386,7 +540,7 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         throw new Error('malformed backup');
       }
       const envelope = parsed as Record<string, unknown>;
-      if (envelope.version !== BACKUP_VERSION) {
+      if (envelope.version !== BACKUP_VERSION && envelope.version !== LEGACY_BACKUP_VERSION) {
         throw new Error('unsupported backup version');
       }
       if (envelope.kind !== BACKUP_KIND) {
@@ -422,6 +576,38 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         privateKeyHex,
         publicKeyHex,
       }));
+      // v1 backups carry no delivery. A v2 delivery is re-verified with
+      // decodeStored — seller signature, buyer binding, derived package id —
+      // before any credential is imported or any row is written. Shape alone
+      // is not enough, and a failure rejects the whole import.
+      const delivery = envelope.version === BACKUP_VERSION ? sanitizeDelivery(envelope.delivery) : null;
+      if (delivery && options.contentTopic) {
+        const topic = options.contentTopic;
+        if (typeof envelope.contentTopic === 'string' && envelope.contentTopic !== topic) {
+          throw new Error('backup could not be imported');
+        }
+        const orderId = typeof purchaseRow.orderId === 'string' ? purchaseRow.orderId : null;
+        const productVersion = typeof purchaseRow.productVersion === 'string' ? purchaseRow.productVersion : '';
+        const invoiceNet = (typeof purchaseRow.invoice === 'object' && purchaseRow.invoice !== null)
+          ? (purchaseRow.invoice as { network?: unknown }).network
+          : undefined;
+        if (orderId === null || productVersion.length === 0) throw new Error('backup could not be imported');
+        const session = importVerifySession(topic, hexToBytes(privateKeyHex));
+        try {
+          await verifyImportedDelivery(session, {
+            packageId: delivery.packageId,
+            wireEnvelope: Uint8Array.from(delivery.wireEnvelope),
+          }, {
+            sellerKeyId,
+            buyerKeyId: publicKeyHex,
+            orderId,
+            productVersion,
+            network: invoiceNet === 'regtest' ? 'regtest' : 'test',
+          });
+        } finally {
+          await session.close().catch(() => undefined);
+        }
+      }
       const imported = await options.credentials.importBackupMaterial(material);
       const record: BrowserPurchase = {
         version: 1,
@@ -435,7 +621,16 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
         credentialId: imported.credentialId,
         invoice: sanitizeInvoice(purchaseRow.invoice),
       };
+      if (delivery && record.orderId === null) {
+        throw new Error('malformed backup: delivery');
+      }
       await store.save(record);
+      if (delivery && record.orderId !== null) {
+        await store.saveDelivery(record.orderId, {
+          packageId: delivery.packageId,
+          wireEnvelope: Uint8Array.from(delivery.wireEnvelope),
+        });
+      }
       const read = await store.get(record.requestId);
       if (!read) {
         throw new Error('imported purchase was not persisted');
@@ -446,16 +641,20 @@ export async function openPurchaseStore(options: PurchaseStoreOptions): Promise<
       if (!delivery.packageId || !(delivery.wireEnvelope instanceof Uint8Array) || delivery.wireEnvelope.byteLength === 0) {
         throw new Error('malformed delivery');
       }
-      const tx = db.transaction(PURCHASE_STORE, 'readonly');
-      const rows = (await requestDone(tx.objectStore(PURCHASE_STORE).getAll())) as StoredPurchase[];
-      const row = rows.find((candidate) => candidate.orderId === orderId);
+      const row = await findByOrder(orderId);
       if (!row) throw new Error('unknown purchase order');
+      // Never overwrite a retained delivery with a different package. The same
+      // packageId is a no-op (the push path's rule, now enforced here too).
+      if (row.delivery) {
+        if (row.delivery.packageId !== delivery.packageId) {
+          throw new Error('delivery package id does not match the retained package');
+        }
+        return;
+      }
       await writeStored({ ...row, delivery: { packageId: delivery.packageId, wireEnvelope: Array.from(delivery.wireEnvelope) } });
     },
     async getDelivery(orderId: string): Promise<StoredDelivery | null> {
-      const tx = db.transaction(PURCHASE_STORE, 'readonly');
-      const rows = (await requestDone(tx.objectStore(PURCHASE_STORE).getAll())) as StoredPurchase[];
-      const delivery = rows.find((candidate) => candidate.orderId === orderId)?.delivery;
+      const delivery = (await findByOrder(orderId))?.delivery;
       return delivery ? { packageId: delivery.packageId, wireEnvelope: Uint8Array.from(delivery.wireEnvelope) } : null;
     },
   };
