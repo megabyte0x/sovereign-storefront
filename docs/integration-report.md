@@ -96,3 +96,7 @@ Evidence: `spikes/results/messaging.json`, `spikes/results/storage.json`, `spike
 - Moved the pinned `WalletWrite` generic signature check and the `AccountPurpose::ViewOnly` assertion into `wallet.rs`'s crate-private test module without widening wallet helper visibility.
 - Removed `services/scanner/tests/qualification.rs` and `services/scanner/tests/projection.rs` after confirming the crate-private projection suite retains every duplicate behavior and adds the corrected fail-closed coverage.
 - Passed locked scanner library/full tests, check, clippy with warnings denied, scoped Rust formatting, and `git diff --check`.
+
+## Live L run (2026-09-26)
+
+Manual regtest run 2 finalized with 33 PASS, 0 FAIL, 1 NOT_RUN (T01, D4); see `docs/demo-results.md` "Live L run". Integration defect found and fixed during the run: live regtest purchase backups could not be imported in a fresh browser context (`src/browser/purchases.ts`). Fixed after the run: `logos-node.ts stop` false failure (daemon status `not_running` was not accepted). Open: leaked `logosctl watch` processes; report provenance names only the first of two builds used.

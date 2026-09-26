@@ -120,3 +120,65 @@ Spike Waku: `@waku/sdk@0.0.36` (Task 1). Not constructed in the composed app.
 5. ZIP-321 QR / wallet-open / Zashi/Zodl handoff
 6. Open browser checkout / reopen same browser (Chromium not launched; live not attempted)
 7. Overall `demo-check` pass (`ok: false`, `liveAttempted: false`). Adapters **SKIP** because live would construct memory. Replica absence is fail-fast. Prior-run faucet txid is chain evidence, not fulfillment PASS
+
+## Live L run (2026-09-26, regtest)
+
+Generated from `.runtime/live/demo/report.json` (0600, local only), written by `scripts/live-observe.ts finalize` and re-read through `validateLiveReport` (ok, no errors).
+Totals: 33 PASS, 0 FAIL, 1 NOT_RUN.
+
+- Network: regtest (local regtest only; no testnet or mainnet claim, not production).
+- Build: commit `bd5e53ca343c`, dirty working tree (diff sha256 `dc4fc78d2122`), clean build at 2026-09-26T07:22:55.447Z. Two builds were used: the report records the first. The import fix forced a rebuild and seller restart mid-run, so `fresh-context-import`, `decrypt-equal`, `normal-delivery` and `response-loss-reconnect` ran on a second, unrecorded dirty build. `live-observe` captures provenance only at `init`.
+- Adapters: scanner `zcash-scanner-socket` 0.1.0, storage `logos-storage` dd6529621abf, messaging `waku-lightpush-filter` 0.0.36.
+- Run: manual session driven by the user in the browser, with the orchestrator doing publish, funding, mining, node stop/start and seller DB checks. Run 1 was abandoned (stale demo product served, first-press invoice and interrupt missed) and archived; this section records run 2 only.
+
+### Matrix rows
+
+| Row | Status | Evidence |
+|---|---|---|
+| L01 | PASS | ['publish: fresh seller db; published version v-run2, 14 plaintext bytes, replica ok, served at /api/product'] |
+| L02 | PASS | ['suite: F1 gate cargo test --locked: 101 scanner tests pass incl protocol_vectors and projection tests; fmt and clippy clean'] |
+| L03 | PASS | ['two-invoices: two Buy presses; seller db holds two v-run2 invoices, both 100000 zat', 'fund-a: faucet funded invoice A only, 100000 zat; invoice B never funded', 'b-stays-locked: invoice B never funded; seller delivery state locked with 0 packages for the whole run'] |
+| L04 | PASS | ['restart: 10th block mined while seller down; after restart ready products=1, invoice A released once (1 package, transport-accepted), invoice B still locked', 'suite: live run2: seller restarted twice, invoices and allocations unchanged; fulfillment-crash.test.ts 12/12 in F1 gate'] |
+| L05 | PASS | ['below-threshold: 9 confirmations: seller settlement confirming, release_eligible 0, delivery locked, 0 packages; browser showed Locked', 'threshold: 10th confirmation mined; seller released invoice A once after restart'] |
+| L06 | PASS | ['suite: deterministic fault tests (labelled deterministic): fulfillment.test.ts reorg cases and invoice-reduce.test.ts in F1 gate 580/580'] |
+| L07 | PASS | ['interrupt: seller wrapper stopped at 9 confirmations with delivery locked and 0 packages; no release before stop', 'restart: 10th block mined while seller down; after restart ready products=1, invoice A released once (1 package, transport-accepted), invoice B still locked', 'suite: fulfillment-crash.test.ts 12/12 per-openStore crash boundaries in F1 gate'] |
+| L08 | PASS | ['suite: invoice-reduce.test.ts and payments.test.ts in F1 gate; scanner projection tests in cargo test 101 pass'] |
+| L09 | PASS | ['waku-recover: after seller restart, request id pressed; page Paid/Sent/Verification available; downloaded file, no new payment', 'ack: seller delivery_state for invoice A moved sent_unacknowledged -> acknowledged after browser decrypt', 'normal-delivery: uninterrupted purchase: 10 confirmations, seller released one package and it was acknowledged, 14 bytes equal to published, no restart'] |
+| L10 | PASS | ['normal-delivery: uninterrupted purchase: 10 confirmations, seller released one package and it was acknowledged, 14 bytes equal to published, no restart', 'suite: live seller refuses POST /api/orders with 404 in real-demo; browser-r3-minors M1/M7 select unavailable not HTTP'] |
+| L11 | PASS | ['interrupt: seller wrapper stopped at 9 confirmations with delivery locked and 0 packages; no release before stop', 'restart: 10th block mined while seller down; after restart ready products=1, invoice A released once (1 package, transport-accepted), invoice B still locked', 'waku-recover: after seller restart, request id pressed; page Paid/Sent/Verification available; downloaded file, no new payment', 'fresh-context-import: new browser profile imported the invoice A backup; same request id listed'] |
+| L12 | PASS | ['replica-b: strict doctor logos-replication PASS after publish of a new cid', 'origin-stop: node A stopped (status stopped, doctor logos-a FAIL); seller still served ciphertext 200 and availability storageReplica true. logos-node stop exited 1 despite the stop (known F2.1 defect)', 'gateway-restart: node A restarted via logos-node start, infra:up re-proved replication digest_match, strict doctor 6/6', 'fresh-context-import: new browser profile imported the invoice A backup; same request id listed', 'decrypt-equal: fresh-context decrypt downloaded 14 bytes, cmp-equal to the published plaintext'] |
+| L13 | PASS | ['two-invoices: two Buy presses; seller db holds two v-run2 invoices, both 100000 zat', 'suite: F1.4 Rust zip321 parser round trip plus zip321-roundtrip.test.ts 4/4; payment-request.test.ts decodes the QR image'] |
+| L14 | PASS | ['suite: live run2: node A stopped, availability stayed storageReplica true and paid purchases still delivered; scanner-outage-http tests in gate'] |
+| L15 | PASS | ['suite: SSF_LIVE_BACKUP=1 live-backup.test.ts 7/7 on the live stack in F2.1'] |
+| L16 | PASS | ['publish: fresh seller db; published version v-run2, 14 plaintext bytes, replica ok, served at /api/product', 'decrypt-equal: fresh-context decrypt downloaded 14 bytes, cmp-equal to the published plaintext', 'suite: SSF_STRICT_LIVE=1 storage.test.ts 5/5 in F2.1 (41B ok, 42B and 74B rejected, tamper rejected); three browser decrypts cmp-equal'] |
+
+### Workflow stages
+
+| Stage | Status | Evidence |
+|---|---|---|
+| publish | PASS | ['fresh seller db; published version v-run2, 14 plaintext bytes, replica ok, served at /api/product'] |
+| replica-b | PASS | ['strict doctor logos-replication PASS after publish of a new cid'] |
+| two-invoices | PASS | ['two Buy presses; seller db holds two v-run2 invoices, both 100000 zat'] |
+| fund-a | PASS | ['faucet funded invoice A only, 100000 zat; invoice B never funded'] |
+| below-threshold | PASS | ['9 confirmations: seller settlement confirming, release_eligible 0, delivery locked, 0 packages; browser showed Locked'] |
+| threshold | PASS | ['10th confirmation mined; seller released invoice A once after restart'] |
+| interrupt | PASS | ['seller wrapper stopped at 9 confirmations with delivery locked and 0 packages; no release before stop'] |
+| restart | PASS | ['10th block mined while seller down; after restart ready products=1, invoice A released once (1 package, transport-accepted), invoice B still locked'] |
+| waku-recover | PASS | ['after seller restart, request id pressed; page Paid/Sent/Verification available; downloaded file, no new payment'] |
+| origin-stop | PASS | ['node A stopped (status stopped, doctor logos-a FAIL); seller still served ciphertext 200 and availability storageReplica true. logos-node stop exited 1 despite the stop (known F2.1 defect)'] |
+| gateway-restart | PASS | ['node A restarted via logos-node start, infra:up re-proved replication digest_match, strict doctor 6/6'] |
+| fresh-context-import | PASS | ['new browser profile imported the invoice A backup; same request id listed'] |
+| decrypt-equal | PASS | ['fresh-context decrypt downloaded 14 bytes, cmp-equal to the published plaintext'] |
+| ack | PASS | ['seller delivery_state for invoice A moved sent_unacknowledged -> acknowledged after browser decrypt'] |
+| b-stays-locked | PASS | ['invoice B never funded; seller delivery state locked with 0 packages for the whole run'] |
+| normal-delivery | PASS | ['uninterrupted purchase: 10 confirmations, seller released one package and it was acknowledged, 14 bytes equal to published, no restart'] |
+| response-loss-reconnect | PASS | ['reload then request id again showed the same delivered purchase; seller still 3 orders, 1 invoice each, no second payment'] |
+| T01 | NOT RUN | Not run by decision D4. |
+
+### Scope notes
+
+- L12 covers the origin (node A) stop plus serving from replica B, the node A restart with replication re-proved (`gateway-restart`), and a fresh-context import and decrypt (`fresh-context-import`, `decrypt-equal`).
+- L02, L06, L07 and L08 rest on deterministic unit and Rust tests from the F1 gate, not on live fault injection; their evidence says so.
+- Fresh-context import initially failed: the browser importer only accepted legacy test-network invoices with `attributionRef`, so no live regtest backup could be imported. Fixed in `src/browser/purchases.ts` (`sanitizeLiveInvoice`, covered by `tests/unit/purchases-live-invoice-import.test.ts`) and re-run in the same session.
+- Automated `storage-origin-stop` (F2.1) failed: `logos-node.ts stop` threw "daemon still running after daemon stop" because the daemon reports `not_running` once stopped and the stop poll only accepted `stopped`/`not_configured`. Fixed after the run (`scripts/live-infra/logos-node.ts`, unit case added); a real stop/start of node A then exited 0 and doctor stayed 6/6. The automated suite was not re-run.
+- Two `logosctl watch storageDownloadDone` processes on node B outlived their callers during this run and were killed by hand. Watcher cleanup is an open leak.

@@ -122,7 +122,7 @@ Tasks 3 and 4 do not depend on Task 2. They may run before Task 2 finishes, in t
 | | | fixed zcash-up: stale scanner.json after chain recreate made O_EXCL provision exit 1 → clearStaleScannerState (refuses while serving, 2 tests); Task 10 note at plan line 590 | |
 | Task 5 | done | whole-plan Done met: 6/6 strict PASS, storage IT ran, strict waku IT on pinned peers, cycle clean | 2026-09-25 |
 | Plan | done | Tasks 1–5 done; Task 6 remains user-gated; infra left running for Task 10 | 2026-09-25 |
-| Task 6 | gated | needs user decision | |
+| Task 6 | deferred | user decision 2026-09-25: self-host later; app stays on public cluster 1 | 2026-09-25 |
 
 ## Whole-plan Done
 
