@@ -277,3 +277,34 @@ test('openDelivery fails for the wrong credentialId', async () => {
   const opened = await crypto.openDelivery(envelope, buyer.credentialId);
   expect(opened.productKey.byteLength).toBe(32);
 });
+
+test('per-product availability probes that product replica, not the first published one', async () => {
+  const inner = createMemoryStorageAdapter();
+  const crypto = createCryptoAdapter();
+  let missingCid = '';
+  const storage = {
+    publish: (bytes: Uint8Array) => inner.publish(bytes),
+    fetch: (cid: string) => inner.fetch(cid),
+    verifyReplica: async (cid: string, replicaId: string) => cid !== missingCid && inner.verifyReplica(cid, replicaId),
+  };
+  const v1 = await publishProduct({
+    dbPath, version: 'book-v1', description: 'Book', amountZat: '100000000', network: 'test',
+    plaintext: FIXTURE_V1, crypto, storage, replicaId: 'replica-b',
+  });
+  const v2 = await publishProduct({
+    dbPath, version: 'book-v2', description: 'Book 2', amountZat: '100000000', network: 'test',
+    plaintext: FIXTURE_V2, crypto, storage, replicaId: 'replica-b',
+  });
+  missingCid = v2.ciphertextCid ?? '';
+  expect(v1.ciphertextCid).not.toBe(v2.ciphertextCid);
+  catalogue = openCatalogue({ dbPath, storage, probes: { messaging: probes().messaging, scanner: probes().scanner } });
+  const first = await catalogue.productAvailability('book-v1');
+  expect(first).toEqual({ productPublished: true, messaging: true, storageReplica: true, scanner: true });
+  const second = await catalogue.productAvailability('book-v2');
+  expect(second.productPublished).toBe(true);
+  expect(second.storageReplica).toBe(false);
+  expect(allowNewCheckout(second)).toBe(false);
+  const unknown = await catalogue.productAvailability('book-v9');
+  expect(unknown.productPublished).toBe(false);
+  expect(unknown.storageReplica).toBe(false);
+});

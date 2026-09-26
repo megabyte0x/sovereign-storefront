@@ -7,6 +7,12 @@ import { createMemoryMessaging } from '../../src/adapters/messaging.ts';
 import { MemoryScanner } from '../../src/adapters/scanner.ts';
 import { loadConfig } from '../../src/config.ts';
 import { startSeller, type SellerServer } from '../../src/seller/server.ts';
+import {
+  HARNESS_LABEL,
+  STRICT_LIVE,
+  startWakuSellerHarness,
+  type WakuSellerHarness,
+} from '../support/waku-seller-harness.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ORIGIN = 'http://127.0.0.1:4175';
@@ -140,3 +146,73 @@ test('checkout requests stay first-party with no credentials in URLs or plaintex
   expect(body.includes(Buffer.from(PLAINTEXT_MARK))).toBe(false);
   expect(ciphertext.headers()['content-type'] ?? '').not.toMatch(/html/i);
 });
+
+/**
+ * Real-demo privacy (Waku live, payment fixture): the order path never
+ * touches the HTTP order routes, and every WebSocket the page opens goes to a
+ * configured Waku bootstrap peer. Missing live peers → SKIP with the reason;
+ * FAIL under SSF_STRICT_LIVE=1.
+ */
+test.describe(`real-demo (${HARNESS_LABEL})`, () => {
+  test.describe.configure({ timeout: 180_000 });
+
+  let harness: WakuSellerHarness | undefined;
+  let skipReason = '';
+
+  test.beforeAll(async () => {
+    test.setTimeout(120_000);
+    const result = await startWakuSellerHarness(ROOT);
+    if (result.ok) {
+      harness = result.harness;
+      return;
+    }
+    if (STRICT_LIVE) throw new Error(`SSF_STRICT_LIVE=1: ${result.reason}`);
+    skipReason = result.reason;
+  });
+
+  test.afterAll(async () => {
+    await harness?.close();
+  });
+
+  test('no HTTP order routes; WebSockets only to configured Waku peers', async ({ page }) => {
+    test.skip(!harness, `${HARNESS_LABEL} precondition: ${skipReason}`);
+    const h = harness!;
+    const requests = capture(page);
+    const sockets: string[] = [];
+    page.on('websocket', (ws) => sockets.push(ws.url()));
+
+    await page.goto(h.url + '/');
+    const buy = page.getByRole('button', { name: 'Buy' });
+    await expect(buy).toBeEnabled({ timeout: 30_000 });
+    await buy.click();
+    // A create request reached the seller: it can only have come over Waku.
+    await expect.poll(() => h.invoiceCount(), { timeout: 90_000 }).toBe(1);
+    await page.getByRole('button', { name: 'My purchases' }).click();
+
+    const forbidden = ['/api/orders', '/api/status', '/api/recover', '/api/acknowledge'];
+    for (const req of requests) {
+      const url = new URL(req.url());
+      expect(forbidden.includes(url.pathname), req.url()).toBe(false);
+    }
+    // The real-demo seller is the only HTTP origin.
+    for (const req of requests) {
+      const url = new URL(req.url());
+      if (url.protocol === 'http:' || url.protocol === 'https:') {
+        expect(url.origin, req.url()).toBe(new URL(h.url).origin);
+      }
+    }
+
+    const allowed = new Set(h.bootstrapPeers.map(peerSocketOrigin));
+    expect(sockets.length, 'the page opened no Waku WebSocket').toBeGreaterThan(0);
+    for (const target of sockets) {
+      expect(allowed.has(new URL(target).origin), target).toBe(true);
+    }
+  });
+});
+
+/** `/dns4/host/tcp/443/wss/p2p/<id>` → `wss://host` (default port elided, as URL does). */
+function peerSocketOrigin(peer: string): string {
+  const match = /^\/(?:dns4|dns6|dns|ip4|ip6)\/([^/]+)\/tcp\/([0-9]+)\/(?:wss|tls\/ws)\//.exec(peer);
+  if (!match) throw new Error('unexpected peer multiaddr shape');
+  return new URL(`wss://${match[1]}:${match[2]}`).origin;
+}

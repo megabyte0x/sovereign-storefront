@@ -16,6 +16,8 @@ import { createInvoiceIssuer } from '../../src/seller/issuance.ts';
 import { createSellerApplication } from '../../src/seller/messages.ts';
 import { attachSellerApplication } from '../../src/seller/messages.ts';
 import { DEFAULT_POLICY, createPayments } from '../../src/seller/payments.ts';
+import { WalletScannerUnavailableError } from '../../src/adapters/wallet-scanner.ts';
+import { createOperationalLogger } from '../../src/ops/log.ts';
 
 const scratchRoot = process.env.TMPDIR ?? tmpdir();
 const availability: ServiceAvailability = { productPublished: true, messaging: true, storageReplica: true, scanner: true };
@@ -297,4 +299,55 @@ test('attachSellerApplication ignores decoded SellerResponse bodies looping back
   };
   await handler!({ signerKeyId: 'buyer-x', body: loopedResponse, wireEnvelope: new Uint8Array() });
   expect(received).toHaveLength(0);
+});
+
+// --- Fix round 1 (Critical #1): a scanner outage never escapes the Waku handler.
+function failScanner(scanner: MemoryScanner): void {
+  scanner.snapshot = async () => { throw new WalletScannerUnavailableError(); };
+}
+
+test('status during a scanner outage still replies with a status whose verification is unavailable', async () => {
+  const { application, scanner } = await harness();
+  const created = await application.handle({ signerKeyId: 'buyer-1', body: {
+    ...header(), type: 'create', requestId: 'req-outage-status', productVersion: 'book-v1', expectedAmountZat: '100',
+  } });
+  if (created.type !== 'invoice') throw new Error('expected invoice');
+  failScanner(scanner);
+  const response = await application.handle({ signerKeyId: 'buyer-1', body: { ...header(), type: 'status', orderId: created.invoice.orderId } });
+  expect(response.type).toBe('status');
+  if (response.type === 'status') expect(response.status.verification).toBe('unavailable');
+});
+
+test('recover during a scanner outage replies unavailable instead of throwing', async () => {
+  const { application, scanner } = await harness();
+  const created = await application.handle({ signerKeyId: 'buyer-1', body: {
+    ...header(), type: 'create', requestId: 'req-outage-recover', productVersion: 'book-v1', expectedAmountZat: '100',
+  } });
+  if (created.type !== 'invoice') throw new Error('expected invoice');
+  failScanner(scanner);
+  const response = await application.handle({ signerKeyId: 'buyer-1', body: { ...header(), type: 'recover', orderId: created.invoice.orderId } });
+  expect(response).toMatchObject({ type: 'error', code: 'unavailable' });
+});
+
+test('attachSellerApplication never lets a handler failure escape: sanitized log plus unavailable reply', async () => {
+  const received: Array<{ recipientKeyId: string; body: unknown }> = [];
+  let handler: ((message: { signerKeyId: string; body: BuyerRequest; wireEnvelope: Uint8Array }) => Promise<void>) | null = null;
+  const fakeSession = {
+    async ready() { return true; },
+    async send(recipientKeyId: string, body: unknown) { received.push({ recipientKeyId, body }); },
+    async subscribe(callback: typeof handler) { handler = callback; return async () => { handler = null; }; },
+    async decodeStored() { throw new Error('not used'); },
+    async close() { handler = null; },
+  };
+  const secret = 'secret-socket-path-/run/x.sock';
+  const exploding = { async handle() { throw new Error(secret); } };
+  const logger = createOperationalLogger(() => undefined);
+  await attachSellerApplication(fakeSession as never, exploding, { logger, now });
+  const request: BuyerRequest = { ...header({ messageId: 'msg-explode' }), type: 'status', orderId: 'order-x' };
+  await expect(handler!({ signerKeyId: 'buyer-x', body: request, wireEnvelope: new Uint8Array() })).resolves.toBeUndefined();
+  expect(received).toHaveLength(1);
+  expect(received[0]!.body).toMatchObject({ type: 'error', code: 'unavailable', inReplyTo: 'msg-explode', buyerKeyId: 'buyer-x' });
+  const lines = logger.lines();
+  expect(lines.some((line) => /waku\.handler/.test(line))).toBe(true);
+  for (const line of lines) expect(line).not.toContain(secret);
 });

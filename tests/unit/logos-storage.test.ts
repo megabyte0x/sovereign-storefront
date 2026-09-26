@@ -1,5 +1,8 @@
 import { EventEmitter } from 'node:events';
-import { expect, test, vi } from 'vitest';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, expect, test, vi } from 'vitest';
 import {
   DOWNLOAD_DONE_EVENT,
   UPLOAD_DONE_EVENT,
@@ -47,6 +50,21 @@ const ORIGIN = '/origin-config';
 const REPLICA = '/replica-config';
 const runtime = { logosctlPath: '/bin/logosctl', originConfigDir: ORIGIN, replicaConfigDir: REPLICA };
 
+const tmpRoot = process.env.TMPDIR ?? tmpdir();
+function logosTmpDirs(): Set<string> {
+  return new Set(readdirSync(tmpRoot).filter((name) => name.startsWith('ssf-logos-')));
+}
+const logosTmpBefore = logosTmpDirs();
+
+// Every adapter gets a workDir under this file's own scratch root (removed
+// in afterAll): without one, createLogosStorageAdapter mkdtemps
+// $TMPDIR/ssf-logos-* and nothing ever removes it.
+const unitScratch = mkdtempSync(join(tmpRoot, 'ssf-unit-logos-'));
+afterAll(() => rmSync(unitScratch, { recursive: true, force: true }));
+function makeAdapter(...[rt, deps, opts]: Parameters<typeof createLogosStorageAdapter>) {
+  return createLogosStorageAdapter(rt, { workDir: mkdtempSync(join(unitScratch, 'w-')), ...deps }, opts);
+}
+
 test('publish connects origin to replica, but fetching a warmed CID invokes only the replica', async () => {
   const ciphertext = new Uint8Array([1, 2, 3, 4]);
   let readFile: (path: string) => Uint8Array = () => ciphertext;
@@ -57,7 +75,7 @@ test('publish connects origin to replica, but fetching a warmed CID invokes only
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: (p) => readFile(p), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: (p) => readFile(p), writeFile: () => undefined });
 
   const cid = await adapter.publish(ciphertext);
   expect(cid).toBe('cid-1');
@@ -80,7 +98,7 @@ test('verifyReplica also touches only the replica, never the origin', async () =
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => ciphertext, writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => ciphertext, writeFile: () => undefined });
   const ok = await adapter.verifyReplica('cid-2', REPLICA);
   expect(ok).toBe(true);
   expect(calls.every((c) => c.configDir === REPLICA)).toBe(true);
@@ -93,7 +111,7 @@ test('a download event reporting a different CID than requested is not accepted 
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
   await expect(adapter.fetch('cid-requested')).rejects.toThrow();
 });
 
@@ -104,7 +122,7 @@ test('a download event reporting success:false is rejected, not read as a partia
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
   await expect(adapter.fetch('cid-3')).rejects.toThrow();
 });
 
@@ -115,7 +133,7 @@ test('an upload-done event whose reported filename does not match the operation 
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
   await expect(adapter.publish(new Uint8Array([1, 2]))).rejects.toThrow();
 });
 
@@ -123,7 +141,7 @@ test('a hung watch (timeout, no event ever arrives) fails the operation rather t
   const { runner } = fakeRunner({
     waitForEvent: async () => null, // simulates timeout: runner itself bounds the wait and gives up
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
   await expect(adapter.fetch('cid-hangs')).rejects.toThrow(/timed out|no event/i);
 });
 
@@ -131,7 +149,7 @@ test('a process failure surfaces as a rejected operation, not a silently empty r
   const { runner } = fakeRunner({
     call: () => { throw new Error('logosctl exited with status 1: connection refused'); },
   });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined });
   await expect(adapter.publish(new Uint8Array([1]))).rejects.toThrow(/exited with status 1/);
 });
 
@@ -143,7 +161,7 @@ test('oversize downloaded content is rejected rather than returned', async () =>
       return null;
     },
   });
-  const adapter = createLogosStorageAdapter(
+  const adapter = makeAdapter(
     runtime,
     { runner, readFile: () => big, writeFile: () => undefined },
     { maxBytes: 100 },
@@ -164,7 +182,7 @@ test('two concurrent same-size publications each correlate to their own upload e
       return { event: eventName, success: true, cid: `cid-for-${filename}`, filename };
     },
   });
-  const adapter = createLogosStorageAdapter(runtime, {
+  const adapter = makeAdapter(runtime, {
     runner,
     readFile: () => new Uint8Array([1, 2, 3]),
     writeFile: (path) => {
@@ -241,7 +259,7 @@ function busRunner(opts: { uploadCid?: string; downloadEventSessionId?: string; 
 
 test('publish observes a storageUploadDone event fired synchronously during uploadUrl (watch armed before the call)', async () => {
   const { runner, calls, cancelledCount } = busRunner({ uploadCid: 'cid-sync-up' });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
   const cid = await adapter.publish(new Uint8Array([1, 2]));
   expect(cid).toBe('cid-sync-up');
   const watchIdx = calls.findIndex((c) => c.method === `watch:${UPLOAD_DONE_EVENT}`);
@@ -254,7 +272,7 @@ test('publish observes a storageUploadDone event fired synchronously during uplo
 test('fetch observes a storageDownloadDone event fired synchronously during downloadToUrl (watch armed before the call)', async () => {
   const bytes = new Uint8Array([7, 7, 7]);
   const { runner, calls, cancelledCount } = busRunner();
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => bytes, writeFile: () => undefined }, { downloadTimeoutMs: 50 });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => bytes, writeFile: () => undefined }, { downloadTimeoutMs: 50 });
   expect(await adapter.fetch('cid-dl')).toEqual(bytes);
   const watchIdx = calls.findIndex((c) => c.method === `watch:${DOWNLOAD_DONE_EVENT}`);
   const dlIdx = calls.findIndex((c) => c.method === 'downloadToUrl');
@@ -266,7 +284,7 @@ test('fetch observes a storageDownloadDone event fired synchronously during down
 
 test('a download event (live shape: sessionId, no cid) for a different session is not accepted as completion', async () => {
   const { runner } = busRunner({ downloadEventSessionId: 'someone-elses-session' });
-  const adapter = createLogosStorageAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { downloadTimeoutMs: 50 });
+  const adapter = makeAdapter(runtime, { runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { downloadTimeoutMs: 50 });
   await expect(adapter.fetch('cid-dl')).rejects.toThrow(/session/);
 });
 
@@ -285,7 +303,7 @@ test('a missed upload event falls back to the origin manifest list, matched by t
     sub.cancel();
     return { ...sub, event: Promise.resolve(null) };
   };
-  const adapter = createLogosStorageAdapter(runtime, { runner: bus.runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
+  const adapter = makeAdapter(runtime, { runner: bus.runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
   expect(await adapter.publish(new Uint8Array([1, 2]))).toBe('cid-from-manifest');
 });
 
@@ -298,7 +316,7 @@ test('a missed upload event with no matching manifest still fails as a timeout',
     sub.cancel();
     return { ...sub, event: Promise.resolve(null) };
   };
-  const adapter = createLogosStorageAdapter(runtime, { runner: bus.runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
+  const adapter = makeAdapter(runtime, { runner: bus.runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined }, { uploadTimeoutMs: 50 });
   await expect(adapter.publish(new Uint8Array([1, 2]))).rejects.toThrow(/timed out/);
 });
 
@@ -308,4 +326,11 @@ test('detectLogosRuntime requires explicit env configuration; no hardcoded histo
   expect(source).not.toMatch(/\.worktrees\/feat-mvp-t2/);
   expect(source).not.toMatch(/appimage_extracted_/);
   expect(typeof detectLogosRuntime).toBe('function');
+});
+
+// Leak guard: an adapter created without a workDir mkdtemps
+// $TMPDIR/ssf-logos-*; this file must not leave any behind.
+test('this file leaves no new $TMPDIR/ssf-logos-* dirs behind', () => {
+  const leaked = [...logosTmpDirs()].filter((name) => !logosTmpBefore.has(name));
+  expect(leaked).toEqual([]);
 });

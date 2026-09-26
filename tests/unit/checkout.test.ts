@@ -323,3 +323,16 @@ test('expired unpaid invoices do not present ordinary payment instructions', () 
     expiresAt: 2000,
   });
 });
+
+test('beginCheckout binds the invoice to the expected network (regtest in real-demo, test by default)', async () => {
+  const regtestInvoice: Invoice = {
+    id: 'inv-r', orderId: 'ord-r', productVersion: 'book-v1', buyerKeyId: 'buyer-1', network: 'regtest',
+    amountZat: '100000000', destination: 'uregtest1dest', attributionRef: 'attr-r', expiresAt: 86_400_000,
+  };
+  const ok = await beginCheckout(memoryStore(), mockTransport(regtestInvoice), mockCredentials(), draft, { network: 'regtest' });
+  expect(ok.network).toBe('regtest');
+  await expect(beginCheckout(memoryStore(), mockTransport(regtestInvoice), mockCredentials(), draft))
+    .rejects.toThrow('invoice network does not match');
+  await expect(beginCheckout(memoryStore(), mockTransport(), mockCredentials(), draft, { network: 'regtest' }))
+    .rejects.toThrow('invoice network does not match');
+});

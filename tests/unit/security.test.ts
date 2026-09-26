@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
@@ -748,13 +748,33 @@ test('real-demo mode disables direct HTTP checkout/status/recover routes', async
   scanner.replaceSnapshot([], { id: 'rev-10', height: 10 }, true, Date.now());
   const storage = createMemoryStorageAdapter();
   const messaging = { sent: [], sendInitiatedFor: [], async send() {} };
+  const publicDir = join(scratchDir, 'browser');
+  mkdirSync(publicDir, { recursive: true });
+  writeFileSync(join(publicDir, 'index.html'), '<!DOCTYPE html><title>built</title>');
+  const base: RuntimeConfig = {
+    ...env(join(scratchDir, 'seller.sqlite')),
+    mode: 'real-demo',
+    adapters: { messaging: 'real', storage: 'real', scanner: 'real' },
+  };
+  // startSeller rejects real-demo without a live block (Task 10.3).
+  await expect(startSeller({ config: base, seedProduct: false, publicDir, scanner, credentials, storage, messaging }))
+    .rejects.toThrow(/live config block/);
   const seller = await startSeller({
-    config: env(join(scratchDir, 'seller.sqlite'), {
-      SSF_MODE: 'real-demo',
-      SSF_ADAPTER_MESSAGING: 'real',
-      SSF_ADAPTER_STORAGE: 'real',
-      SSF_ADAPTER_SCANNER: 'real',
-    }),
+    // Route gating only: build a real-demo shaped config directly, since the
+    // full real-demo loader now requires live endpoint files (Task 10).
+    config: {
+      ...base,
+      live: {
+        dataDir: scratchDir,
+        scannerSocket: join(scratchDir, 's.sock'),
+        scannerAccountId: 'seller-account-0',
+        chain: { network: 'regtest', genesisHash: 'ab'.repeat(32), consensusFingerprint: 'cd'.repeat(32) },
+        activations: {},
+        waku: { contentTopic: '/ssf/1/security-test/proto', bootstrapPeers: ['/dns4/peer.example/tcp/8000/wss/p2p/16Uiu2HAmPeer'], peerTimeoutMs: 1000 },
+        logos: { logosctlPath: '/opt/logos/logosctl', originConfigDir: join(scratchDir, 'a'), replicaConfigDir: join(scratchDir, 'b') },
+      } as unknown as NonNullable<RuntimeConfig['live']>,
+    },
+    publicDir,
     seedProduct: false,
     scanner,
     credentials,

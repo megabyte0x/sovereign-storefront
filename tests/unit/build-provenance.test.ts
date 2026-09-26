@@ -105,7 +105,7 @@ test('clean build removes stale adapters and records source-linked provenance in
   const { scratchDirectory, repository } = createRepository();
   const staleAdapterPaths = [
     'dist/service/adapters/orphan-probe.js',
-    'dist/service/adapters/live.js',
+    'dist/service/adapters/stale-live.js',
     'dist/service/adapters/zakura-scanner.js',
   ];
   const sourceMarker = `build-provenance-marker-${randomUUID()}`;

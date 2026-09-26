@@ -205,6 +205,9 @@ describe('createWakuOrderTransport', () => {
     const stored = await purchases.getDelivery(invoice.orderId);
     expect(stored).not.toBeNull();
     expect(stored!.wireEnvelope.byteLength).toBeGreaterThan(0);
+    // The wire package has no packageId; recover must carry the response's id
+    // so the caller can acknowledge exactly the package it decrypted.
+    expect(pkg.packageId).toBe(stored!.packageId);
 
     await transport.acknowledge(invoice.orderId, credentialId, stored!.packageId);
     const finalStatus = await transport.status(invoice.orderId, credentialId);
