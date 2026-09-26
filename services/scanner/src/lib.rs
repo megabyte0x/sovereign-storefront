@@ -12,6 +12,7 @@ pub mod lease;
 pub mod private_fs;
 pub mod projection;
 pub mod receipt;
+pub mod restore;
 pub mod rpc;
 pub mod scan;
 pub(crate) mod snapshot;

@@ -84,26 +84,38 @@ pub(crate) fn ensure_view_only_account<Db: WalletWrite>(
     unified_key: &UnifiedFullViewingKey,
     birthday: &AccountBirthday,
 ) -> Result<Db::Account, &'static str> {
-    match db
-        .get_account_for_ufvk(unified_key)
-        .map_err(|_| "view-only wallet account lookup failed")?
-    {
-        Some(account) => {
-            if account.purpose() != AccountPurpose::ViewOnly {
-                return Err("configured account is not view-only");
-            }
-            if db
-                .get_account_birthday(account.id())
-                .map_err(|_| "view-only wallet birthday lookup failed")?
-                != birthday.height()
-            {
-                return Err("configured account birthday does not match trusted tree state");
-            }
-            Ok(account)
-        }
+    match find_view_only_account(db, unified_key, birthday)? {
+        Some(account) => Ok(account),
         None => import_view_only_account(db, account_name, unified_key, birthday)
             .map_err(|_| "view-only wallet account import failed"),
     }
+}
+
+/// Read-only lookup of the configured view-only account at the trusted
+/// birthday. Restore acknowledgement uses this so it never imports a key into
+/// a restored wallet that lost its account.
+pub(crate) fn find_view_only_account<Db: WalletRead>(
+    db: &Db,
+    unified_key: &UnifiedFullViewingKey,
+    birthday: &AccountBirthday,
+) -> Result<Option<Db::Account>, &'static str> {
+    let Some(account) = db
+        .get_account_for_ufvk(unified_key)
+        .map_err(|_| "view-only wallet account lookup failed")?
+    else {
+        return Ok(None);
+    };
+    if account.purpose() != AccountPurpose::ViewOnly {
+        return Err("configured account is not view-only");
+    }
+    if db
+        .get_account_birthday(account.id())
+        .map_err(|_| "view-only wallet birthday lookup failed")?
+        != birthday.height()
+    {
+        return Err("configured account birthday does not match trusted tree state");
+    }
+    Ok(Some(account))
 }
 
 /// Persists and returns the next externally exposed unified address.
@@ -282,7 +294,7 @@ mod tests {
         WalletAllocationDeriver, allocate_next_external_address,
         allocate_next_external_orchard_address, ensure_view_only_account,
         external_orchard_receiver_hex, import_view_only_account, open_persistent_wallet_db,
-        seed_allocation_watermark, view_only_account_purpose,
+        seed_allocation_watermark, view_only_account_purpose, zip321_payment_uri,
     };
     use crate::allocate::{AllocationDeriver, AllocationJournal, AllocationRequest, ChainIdentity};
     use crate::enhance::store_full_transaction;
@@ -305,6 +317,7 @@ mod tests {
         value::Zatoshis,
     };
     use zip32::AccountId;
+    use zip321::TransactionRequest;
 
     fn regtest_parameters() -> LocalNetwork {
         LocalNetwork {
@@ -364,6 +377,62 @@ mod tests {
     fn scanner_wallet_entrypoints_type_check<Db: WalletWrite>() {
         let _ = import_view_only_account::<Db>;
         let _ = allocate_next_external_address::<Db>;
+    }
+
+    /// Cross-language vector shared with `tests/unit/zip321-roundtrip.test.ts`:
+    /// fixed public test seed, regtest, Orchard-only default address, 100000 zat.
+    /// Not a secret: derived from the all-0x5a public test seed.
+    const ZIP321_VECTOR_URI: &str = "zcash:uregtest1swq6jh60987eysqul5q97nklr60h30yyf0yu44f2pa0glwffk2r562vanhmfa867vtrk36yj0tw20ex4fn390tuu25m6ptst3c4dey2e?amount=0.001";
+
+    fn zip321_fixture_destination() -> String {
+        let params = regtest_parameters();
+        let spending_key = UnifiedSpendingKey::from_seed(&params, &[0x5a_u8; 32], AccountId::ZERO)
+            .expect("derive fixed public test fixture");
+        let (address, _) = spending_key
+            .to_unified_full_viewing_key()
+            .default_address(zcash_keys::keys::UnifiedAddressRequest::ORCHARD)
+            .expect("fixture Orchard default address");
+        address.encode(&params)
+    }
+
+    #[test]
+    fn zip321_payment_uri_round_trips_through_the_zip321_parser_exactly() {
+        let destination = zip321_fixture_destination();
+        for (amount_zat, canonical_zec) in [
+            (1_u64, "0.00000001"),
+            (100_000, "0.001"),
+            (2_100_000_000_000_000, "21000000"),
+        ] {
+            let uri = zip321_payment_uri(&destination, &amount_zat.to_string())
+                .expect("form ZIP-321 payment URI");
+            assert_eq!(uri, format!("zcash:{destination}?amount={canonical_zec}"));
+            let parsed = TransactionRequest::from_uri(&uri).expect("zip321 parses scanner URI");
+            assert_eq!(parsed.payments().len(), 1);
+            let payment = parsed
+                .payments()
+                .get(&0)
+                .expect("single payment at index 0");
+            assert_eq!(payment.recipient_address().encode(), destination);
+            assert_eq!(payment.amount(), Some(Zatoshis::const_from_u64(amount_zat)));
+            assert!(payment.memo().is_none());
+            assert!(payment.label().is_none());
+            assert!(payment.message().is_none());
+            assert!(payment.other_params().is_empty());
+            assert_eq!(parsed.to_uri(), uri);
+        }
+        assert_eq!(
+            zip321_payment_uri(&destination, "100000").expect("vector URI"),
+            ZIP321_VECTOR_URI
+        );
+    }
+
+    #[test]
+    fn zip321_payment_uri_rejects_zero_overflow_and_non_canonical_amounts() {
+        let destination = zip321_fixture_destination();
+        for amount in ["0", "2100000000000001", "-1", "1.0", "", "abc"] {
+            assert!(zip321_payment_uri(&destination, amount).is_err());
+        }
+        assert!(zip321_payment_uri("not-an-address", "1").is_err());
     }
 
     #[test]

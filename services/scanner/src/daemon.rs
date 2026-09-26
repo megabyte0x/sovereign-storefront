@@ -19,7 +19,7 @@ use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
 
 use crate::{
     allocate::AllocationJournal,
-    api::ApiService,
+    api::{ApiService, HttpRequest, HttpResponse},
     cache::PersistentBlockCache,
     config::{
         acquire_config_writer_lease, decode_regtest_orchard_ufvk, open_runtime_paths,
@@ -29,6 +29,7 @@ use crate::{
     enhance::{capped_backoff, fulfill_pending_transaction_requests},
     private_fs::PrivateDir,
     projection::{ProjectedOutput, read_wallet_history},
+    restore::{bind_state, verify_state_binding},
     scan::{GRPC_CONNECT_DEADLINE, GRPC_RPC_DEADLINE, SYNC_DEADLINE, within_deadline},
     snapshot::{Snapshot, SnapshotStore},
     wallet::{
@@ -124,6 +125,9 @@ impl PersistentScanner {
         let writer_lease = acquire_config_writer_lease(config_path)?;
         let runtime = open_runtime_paths(config_path)?;
         let ufvk = decode_regtest_orchard_ufvk(&runtime.params, &runtime.ufvk)?;
+        // Restored state must be explicitly acknowledged (new source epoch,
+        // freshness reset) before any writable open or snapshot is served.
+        verify_state_binding(&runtime.state)?;
         // The held lifecycle lease makes this first-import record a single
         // scanner-owned trust decision, rather than a mutable reflection of
         // later configuration. Do this before opening either writable DB.
@@ -157,6 +161,7 @@ impl PersistentScanner {
             runtime.chain.clone(),
             &account_id,
         )?;
+        bind_state(&runtime.state, &account_id)?;
         let wallet = Arc::new(Mutex::new(wallet));
         let deriver = Arc::new(WalletAllocationDeriver::from_shared(
             Arc::clone(&wallet),
@@ -185,6 +190,16 @@ impl PersistentScanner {
             api,
             state,
         })
+    }
+
+    /// The wallet-owned view-only account UUID this scanner serves.
+    pub fn account_id(&self) -> &str {
+        &self.lifecycle.account_id
+    }
+
+    /// Handles one in-process API request exactly as the socket would.
+    pub fn handle(&self, request: HttpRequest) -> Result<HttpResponse, &'static str> {
+        self.api.handle(request)
     }
 
     pub fn serve(self) -> Result<(), &'static str> {

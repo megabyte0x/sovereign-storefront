@@ -58,6 +58,7 @@ impl SnapshotStore {
         let connection =
             Connection::open(path).map_err(|_| "scanner snapshot store cannot open")?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS snapshots (generation INTEGER PRIMARY KEY NOT NULL, body BLOB NOT NULL);").map_err(|_| "scanner snapshot store cannot initialize")?;
+        crate::restore::ensure_schema(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             source_id: source_id.to_owned(),
@@ -127,12 +128,7 @@ impl SnapshotStore {
             }
         }
         receipts.sort_by(|a, b| a.output_id.cmp(&b.output_id));
-        let generation = prior
-            .as_ref()
-            .and_then(|snapshot| snapshot.generation.parse::<u64>().ok())
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("snapshot generation overflow")?;
+        let generation = next_generation(&connection, prior.as_ref())?;
         let complete = caught_up && enhancement_complete;
         let snapshot = Snapshot {
             version: 1,
@@ -176,17 +172,7 @@ impl SnapshotStore {
         hash: String,
         checked_at: u64,
     ) -> Result<Snapshot, &'static str> {
-        let generation = prior
-            .map(|snapshot| {
-                snapshot
-                    .generation
-                    .parse::<u64>()
-                    .map_err(|_| "snapshot generation is invalid")?
-                    .checked_add(1)
-                    .ok_or("snapshot generation overflow")
-            })
-            .transpose()?
-            .unwrap_or(1);
+        let generation = next_generation(connection, prior)?;
         let previous_receipts = prior
             .map(|snapshot| snapshot.receipts.clone())
             .unwrap_or_default();
@@ -227,18 +213,10 @@ impl SnapshotStore {
             .lock()
             .map_err(|_| "scanner snapshot mutex poisoned")?;
         let previous = latest(&connection)?;
-        let (generation, mut receipts) = match previous {
-            Some(previous) => (
-                previous
-                    .generation
-                    .parse::<u64>()
-                    .map_err(|_| "snapshot generation is invalid")?
-                    .checked_add(1)
-                    .ok_or("snapshot generation overflow")?,
-                previous.receipts,
-            ),
-            None => (1, Vec::new()),
-        };
+        let generation = next_generation(&connection, previous.as_ref())?;
+        let mut receipts = previous
+            .map(|previous| previous.receipts)
+            .unwrap_or_default();
         for receipt in &mut receipts {
             receipt.canonical = false;
         }
@@ -284,6 +262,23 @@ impl SnapshotStore {
             .map_err(|_| "snapshot generation is unavailable")
             .and_then(|body| decode_snapshot(&body))
     }
+}
+
+/// Next durable generation: strictly after the latest persisted one and never
+/// below the current source epoch's floor recorded by an acknowledged restore.
+fn next_generation(connection: &Connection, prior: Option<&Snapshot>) -> Result<u64, &'static str> {
+    let after_prior = prior
+        .map(|snapshot| {
+            snapshot
+                .generation
+                .parse::<u64>()
+                .map_err(|_| "snapshot generation is invalid")
+        })
+        .transpose()?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("snapshot generation overflow")?;
+    Ok(after_prior.max(crate::restore::generation_floor(connection)?))
 }
 
 fn latest(connection: &Connection) -> Result<Option<Snapshot>, &'static str> {

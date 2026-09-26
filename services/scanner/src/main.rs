@@ -6,6 +6,9 @@ use sovereign_storefront_scanner::{
     config::{ActivationHeights, validate_lightwalletd_endpoint},
     consensus::verify_lightd_consensus,
     daemon::PersistentScanner,
+    restore::{
+        MAX_RESERVE_GAP, UNBOUND_BACKUP, acknowledge_restore, backup_info, parse_reserve_gap,
+    },
     scan::{GRPC_CONNECT_DEADLINE, GRPC_RPC_DEADLINE, Stage, run, within_deadline},
 };
 use zcash_client_backend::proto::service::{
@@ -213,6 +216,31 @@ fn service_config() -> Option<PathBuf> {
     Some(config)
 }
 
+/// `restore-ack --config FILE --new-epoch --reserve-gap N`: `--new-epoch` is
+/// the explicit operator acknowledgement that the restored snapshot
+/// generation is not preserved; `--reserve-gap N` (required) burns N
+/// diversifier indices past the restored high-water mark so receivers the
+/// original scanner may have issued after the backup are never reissued.
+fn restore_ack_arguments() -> Option<(PathBuf, u64)> {
+    let mut values = env::args().skip(2);
+    let mut config = None;
+    let mut new_epoch = false;
+    let mut gap = None;
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--config" if config.is_none() => config = values.next().map(PathBuf::from),
+            "--new-epoch" if !new_epoch => new_epoch = true,
+            "--reserve-gap" if gap.is_none() => {
+                gap = Some(parse_reserve_gap(&values.next()?).ok()?);
+            }
+            _ => return None,
+        }
+    }
+    let config = config?;
+    let gap = gap?;
+    (new_epoch && config.is_file()).then_some((config, gap))
+}
+
 fn run_service(config: PathBuf, serve: bool) -> ExitCode {
     let scanner = match PersistentScanner::open(&config) {
         Ok(scanner) => scanner,
@@ -248,6 +276,43 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             return run_service(config, true);
+        }
+        Some("backup-info") => {
+            let Some(config) = service_config() else {
+                return ExitCode::FAILURE;
+            };
+            return match backup_info(&config).map(|info| serde_json::to_string(&info)) {
+                Ok(Ok(encoded)) => {
+                    println!("{encoded}");
+                    ExitCode::SUCCESS
+                }
+                Err(UNBOUND_BACKUP) => {
+                    eprintln!("scanner backup info unavailable: {UNBOUND_BACKUP}");
+                    ExitCode::FAILURE
+                }
+                _ => {
+                    eprintln!("scanner backup info unavailable");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("restore-ack") => {
+            let Some((config, gap)) = restore_ack_arguments() else {
+                eprintln!(
+                    "restore-ack requires --config FILE --new-epoch --reserve-gap N (1..={MAX_RESERVE_GAP})"
+                );
+                return ExitCode::FAILURE;
+            };
+            return match acknowledge_restore(&config, gap) {
+                Ok(()) => {
+                    println!("scanner_restore_acknowledged");
+                    ExitCode::SUCCESS
+                }
+                Err(_) => {
+                    eprintln!("scanner restore acknowledgement failed");
+                    ExitCode::FAILURE
+                }
+            };
         }
         Some("inspect-lightwalletd") => {
             let Some(arguments) = parse_inspection_arguments() else {

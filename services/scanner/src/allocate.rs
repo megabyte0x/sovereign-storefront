@@ -428,7 +428,6 @@ impl AllocationJournal {
         Ok(allocation)
     }
 
-    #[cfg(test)]
     pub(crate) fn high_water_mark(&self, account_id: &str) -> Result<Option<String>, &'static str> {
         let connection = self
             .connection

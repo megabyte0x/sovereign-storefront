@@ -325,6 +325,25 @@ pub(crate) fn persist_or_verify_birthday_attestation(
     }
 }
 
+/// Restore-only variant: a coordinated backup may omit the scanner-owned
+/// attestation, so an explicitly acknowledged restore re-derives it from the
+/// restored configuration. An attestation that is present must still match.
+pub(crate) fn persist_or_verify_restored_birthday_attestation(
+    state: &crate::private_fs::PrivateDir,
+    expected: &BirthdayAttestation,
+) -> Result<(), &'static str> {
+    match state.read_file(BIRTHDAY_ATTESTATION_FILE) {
+        Ok(_) => persist_or_verify_birthday_attestation(state, expected),
+        Err(_) => {
+            let encoded = serde_json::to_vec(expected)
+                .map_err(|_| "scanner birthday attestation cannot encode")?;
+            state
+                .write_file_atomic(BIRTHDAY_ATTESTATION_FILE, &encoded)
+                .map_err(|_| "scanner birthday attestation cannot persist")
+        }
+    }
+}
+
 /// Opens only a fully specified, owner-private daemon configuration. Missing or
 /// unknown activation data makes runtime startup unavailable rather than falling
 /// back to guessed network parameters.

@@ -316,6 +316,23 @@ impl PrivateDir {
         Ok(())
     }
 
+    /// Returns this held directory's `(device, inode)` identity. A copied or
+    /// restored state directory never shares it with its source.
+    pub(crate) fn identity(&self) -> Result<(u64, u64), &'static str> {
+        let stat = fstat(&self.dir).map_err(|_| "private directory cannot be inspected")?;
+        validate_directory_stat(&stat)?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+
+    /// Returns a validated private regular child's `(device, inode)` identity.
+    pub(crate) fn file_identity(&self, name: &str) -> Result<(u64, u64), &'static str> {
+        validate_component(name)?;
+        let stat = fstatat(&self.dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map_err(|_| "private file cannot be inspected")?;
+        validate_file_stat(&stat)?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+
     /// Ensures no caller can treat the descriptor as an unvalidated path.
     pub fn verify(&self) -> Result<(), &'static str> {
         validate_directory(&self.dir)
