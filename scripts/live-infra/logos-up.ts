@@ -273,7 +273,7 @@ async function ensureArchive(): Promise<string> {
   return appImagePath;
 }
 
-async function bringUpNode(
+export async function bringUpNode(
   logosctlPath: string,
   node: { dir: string; listenPort: number; discPort: number },
 ): Promise<{ peerId: string }> {

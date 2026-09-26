@@ -9,9 +9,23 @@ import { createMemoryMessaging } from '../src/adapters/messaging.ts';
 import { MemoryScanner } from '../src/adapters/scanner.ts';
 import { createMemoryStorageAdapter, detectLogosRuntime } from '../src/adapters/storage.ts';
 import { BEARER_SECRET_WARNING } from '../src/browser/purchases.ts';
-import { ConfigError, loadConfig } from '../src/config.ts';
+import { ConfigError, loadConfig, MissingLiveKeyError } from '../src/config.ts';
 import type { Invoice } from '../src/contracts/types.ts';
 import { startSeller } from '../src/seller/server.ts';
+import { buildLiveEnv } from './start-live.ts';
+import {
+  L_MATRIX_IDS,
+  TESTNET_STAGE_ID,
+  WORKFLOW_STAGE_IDS,
+  adapterIdentityErrors,
+  validateLiveReport,
+  type AdapterIdentity,
+  type BuildProvenance,
+  type LMatrixId,
+  type LiveReport,
+  type LiveStage,
+  type WorkflowStageId,
+} from './live-report.ts';
 
 export type CheckStatus = 'PASS' | 'FAIL' | 'SKIP';
 
@@ -291,7 +305,14 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
     }));
   } catch (error) {
     const message = error instanceof ConfigError ? error.message : error instanceof Error ? error.message : 'config failed';
-    checks.push(check('adapters', 'FAIL', message));
+    const live = input.liveAdapters ?? { messaging: 'memory' as const, storage: 'memory' as const, scanner: 'memory' as const };
+    const substituted = live.messaging === 'memory' && live.storage === 'memory' && live.scanner === 'memory';
+    // The legacy substituted demo path never reads real-demo live endpoints,
+    // so an incomplete live block is reported as SKIP (never PASS) there.
+    // Only a typed missing-live-key error may SKIP; every other config error FAILs.
+    checks.push(substituted && error instanceof MissingLiveKeyError
+      ? check('adapters', 'SKIP', `substituted memory adapters; real-demo live config incomplete (${message})`)
+      : check('adapters', 'FAIL', message));
   }
 
   const ths = input.ths;
@@ -714,6 +735,280 @@ async function runLiveDemo(preflight: PreflightInput, ths: ThsProbe): Promise<Li
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// demo:live (Task 12 / R4.5): strict built-app live acceptance harness.
+// Pure pieces are exported for unit tests; runDemoLive takes its effects as deps.
+// ---------------------------------------------------------------------------
+
+export const D4_TESTNET_REASON =
+  'not run: no public-testnet wallet or lightwalletd endpoint is available (gate D4); L results do not imply testnet readiness';
+
+export type DemoLivePaths = {
+  dbPath: string;
+  adminTokenFile: string;
+  scannerConfig: string;
+  publicPort: number;
+  adminPort: number;
+};
+
+/** File-based real-demo env for the owned seller: live.env + forced real-demo, demo paths/ports, no inline secrets. */
+export function buildDemoLiveEnv(
+  liveEnvText: string,
+  callerEnv: NodeJS.Dict<string>,
+  paths: DemoLivePaths,
+): Record<string, string> {
+  const env = buildLiveEnv(liveEnvText, callerEnv, {
+    scannerConfig: paths.scannerConfig,
+    adminTokenFile: paths.adminTokenFile,
+    dbPath: paths.dbPath,
+  });
+  env.SSF_SCANNER_CONFIG = paths.scannerConfig;
+  env.SSF_ADMIN_TOKEN_FILE = paths.adminTokenFile;
+  env.SSF_DB_PATH = paths.dbPath;
+  env.SSF_PUBLIC_HOST = '127.0.0.1';
+  env.SSF_ADMIN_HOST = '127.0.0.1';
+  env.SSF_PUBLIC_PORT = String(paths.publicPort);
+  env.SSF_ADMIN_PORT = String(paths.adminPort);
+  delete env.SSF_ADMIN_TOKEN;
+  delete env.SSF_SELLER_KEY_ID;
+  return env;
+}
+
+const HEX40_RE = /^[0-9a-f]{40}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+/** Map dist/build-info.json (written only by build:clean) to report provenance. */
+export function readBuildProvenance(info: unknown, emptyDiffSha256: string): BuildProvenance {
+  const record = (info ?? {}) as Record<string, unknown>;
+  const commit = record.sourceCommit;
+  const digest = record.dirtyDiffDigest;
+  const builtAt = record.buildTimestamp;
+  if (typeof commit !== 'string' || !HEX40_RE.test(commit)
+    || typeof digest !== 'string' || !HEX64_RE.test(digest)
+    || typeof builtAt !== 'string' || !ISO_RE.test(builtAt)) {
+    throw new Error('build-info.json is missing or not from build:clean (sourceCommit/dirtyDiffDigest/buildTimestamp)');
+  }
+  const dirty = digest !== emptyDiffSha256;
+  return dirty
+    ? { commit, dirty, diffSha256: digest, cleanBuild: true, builtAt }
+    : { commit, dirty, cleanBuild: true, builtAt };
+}
+
+export type SellerLine =
+  | { kind: 'public' | 'admin'; url: string }
+  | { kind: 'ready'; scanner: boolean; messaging: boolean; checkout: boolean; products: number }
+  | { kind: 'failed'; reason: string };
+
+/** Parse the seller's plain stdout protocol (src/main.ts); JSON log lines are ignored. */
+export function parseSellerLine(line: string): SellerLine | undefined {
+  const text = line.trim();
+  let match = /^(public|admin) (http:\/\/\S+)$/.exec(text);
+  if (match) return { kind: match[1] as 'public' | 'admin', url: match[2]! };
+  match = /^ready scanner=(true|false) messaging=(true|false) checkout=(true|false) products=(\d+)$/.exec(text);
+  if (match) {
+    return { kind: 'ready', scanner: match[1] === 'true', messaging: match[2] === 'true', checkout: match[3] === 'true', products: Number(match[4]) };
+  }
+  if (/^(startup|shutdown) failed/.test(text)) return { kind: 'failed', reason: text };
+  return undefined;
+}
+
+const SENSITIVE_EVIDENCE = [
+  /zcash:/i,
+  // Unified and Sapling addresses/keys, with or without a word boundary (addr_uregtest1…).
+  /(?:u(?:regtest|test)?|z(?:regtest|test)?sapling|zs)1[0-9a-z]{3,}/i,
+  // Transparent addresses (tm…, t1…, t2…, t3…).
+  /\bt[m1-3][A-Za-z0-9]{25,40}\b/,
+  /bearer\s/i,
+  /uview|uivk|ufvk/i,
+  /secret/i,
+  /token/i,
+  /mnemonic|seed/i,
+  /private/i,
+  /password/i,
+];
+
+/** Evidence strings go into a shareable report: refuse anything address-, URI- or secret-shaped. */
+export function sanitizeEvidence(evidence: readonly string[]): string[] {
+  for (const [index, item] of evidence.entries()) {
+    if (SENSITIVE_EVIDENCE.some((pattern) => pattern.test(item))) {
+      // Never echo the refused value.
+      throw new Error(`sensitive evidence refused at index ${index}`);
+    }
+  }
+  return [...evidence];
+}
+
+export type SuiteRow = { ok: boolean; evidence: string[] };
+/**
+ * `rows` carries the named suite evidence each matrix row requires (the gate
+ * column of the acceptance matrix); a global `ok` alone never passes a row.
+ */
+export type SuitesResult = { ok: boolean; evidence: string[]; rows?: Partial<Record<LMatrixId, SuiteRow>> };
+
+/** Which observed workflow stages (and suites/provenance) each L row requires. */
+const L_ROW_REQUIREMENTS: Record<LMatrixId, { stages: WorkflowStageId[]; suites?: true; provenance?: true; adapters?: true }> = {
+  L01: { stages: ['publish'], provenance: true, adapters: true },
+  L02: { stages: [], suites: true },
+  L03: { stages: ['two-invoices', 'fund-a', 'b-stays-locked'] },
+  L04: { stages: ['restart'], suites: true },
+  L05: { stages: ['below-threshold', 'threshold'] },
+  L06: { stages: [], suites: true },
+  L07: { stages: ['interrupt', 'restart'], suites: true },
+  L08: { stages: [], suites: true },
+  L09: { stages: ['waku-recover', 'ack', 'normal-delivery'] },
+  L10: { stages: ['normal-delivery'], suites: true },
+  // fresh-context-import is the browser reopen (new context, imported backup).
+  L11: { stages: ['interrupt', 'restart', 'waku-recover', 'fresh-context-import'] },
+  L12: { stages: ['replica-b', 'origin-stop', 'gateway-restart', 'fresh-context-import', 'decrypt-equal'] },
+  // L13 needs the Rust URI round-trip + image QR decode as named suite evidence.
+  L13: { stages: ['two-invoices'], suites: true },
+  L14: { stages: [], suites: true },
+  L15: { stages: [], suites: true },
+  L16: { stages: ['publish', 'decrypt-equal'], suites: true },
+};
+
+export function deriveMatrixRows(
+  stages: readonly LiveStage[],
+  context: { suites: SuitesResult; provenanceOk: boolean; adaptersOk: boolean },
+): LiveStage[] {
+  const byId = new Map(stages.map((stage) => [stage.id, stage]));
+  return L_MATRIX_IDS.map((id): LiveStage => {
+    const req = L_ROW_REQUIREMENTS[id];
+    const problems: string[] = [];
+    const evidence: string[] = [];
+    for (const stageId of req.stages) {
+      const stage = byId.get(stageId);
+      if (!stage) problems.push(`${stageId} not run`);
+      else if (stage.status !== 'PASS') problems.push(`${stageId} ${stage.status}`);
+      else evidence.push(`${stageId}: ${stage.evidence?.[0] ?? 'PASS'}`);
+    }
+    if (req.suites) {
+      const row = context.suites.rows?.[id];
+      if (!row || row.evidence.length === 0) problems.push('no named suite evidence for this row');
+      else if (!row.ok || !context.suites.ok) problems.push('suite FAIL');
+      else evidence.push(...row.evidence.map((item) => `suite: ${item}`));
+    }
+    if (req.provenance && !context.provenanceOk) problems.push('build provenance missing');
+    if (req.adapters && !context.adaptersOk) problems.push('adapter identity not live');
+    if (problems.length > 0) {
+      const failed = problems.some((problem) => /\bFAIL$/.test(problem));
+      return { id, status: failed ? 'FAIL' : 'NOT_RUN', reason: problems.join('; ') };
+    }
+    return { id, status: 'PASS', evidence };
+  });
+}
+
+export type AdapterIdentities = { scanner: AdapterIdentity; storage: AdapterIdentity; messaging: AdapterIdentity };
+
+export function assembleLiveReport(input: {
+  build: BuildProvenance | undefined;
+  adapters: AdapterIdentities;
+  stages: readonly LiveStage[];
+  suites: SuitesResult;
+  adaptersOk: boolean;
+}): LiveReport {
+  const observed = new Map(input.stages.map((stage) => [stage.id, safeStage(stage)]));
+  const workflow = WORKFLOW_STAGE_IDS.map((id): LiveStage => observed.get(id) ?? { id, status: 'NOT_RUN', reason: 'stage not reached in this run' });
+  const matrix = deriveMatrixRows(workflow, { suites: safeSuites(input.suites), provenanceOk: input.build !== undefined, adaptersOk: input.adaptersOk });
+  return {
+    schemaVersion: 1,
+    liveAttempted: true,
+    network: 'regtest',
+    build: input.build as BuildProvenance,
+    scanner: input.adapters.scanner,
+    storage: input.adapters.storage,
+    messaging: input.adapters.messaging,
+    stages: [...matrix, ...workflow, { id: TESTNET_STAGE_ID, status: 'NOT_RUN', reason: D4_TESTNET_REASON }],
+  };
+}
+
+/** Sanitize a stage before it can reach the report; refused evidence turns the stage into FAIL. */
+function safeStage(stage: LiveStage): LiveStage {
+  try {
+    const evidence = stage.evidence ? sanitizeEvidence(stage.evidence) : undefined;
+    const reason = stage.reason !== undefined ? sanitizeEvidence([stage.reason])[0] : undefined;
+    return { id: stage.id, status: stage.status, ...(evidence ? { evidence } : {}), ...(reason !== undefined ? { reason } : {}) };
+  } catch {
+    return { id: stage.id, status: 'FAIL', reason: 'evidence refused by sanitizer (sensitive value)' };
+  }
+}
+
+function safeSuites(suites: SuitesResult): SuitesResult {
+  const clean = (row: SuiteRow): SuiteRow => {
+    try {
+      return { ok: row.ok, evidence: sanitizeEvidence(row.evidence) };
+    } catch {
+      return { ok: false, evidence: ['evidence refused by sanitizer (sensitive value)'] };
+    }
+  };
+  const rows: Partial<Record<LMatrixId, SuiteRow>> = {};
+  for (const [id, row] of Object.entries(suites.rows ?? {})) if (row) rows[id as LMatrixId] = clean(row);
+  const top = clean({ ok: suites.ok, evidence: suites.evidence });
+  return { ok: top.ok, evidence: top.evidence, rows };
+}
+
+export type DemoLiveDeps = {
+  cleanBuild(): Promise<BuildProvenance>;
+  doctor(): Promise<{ ok: boolean; rows: string[] }>;
+  startSeller(): Promise<{ publicUrl: string; adminUrl: string }>;
+  runSuites(): Promise<SuitesResult>;
+  runPlaywright(seller: { publicUrl: string; adminUrl: string }): Promise<{ exitCode: number }>;
+  readStages(): Promise<LiveStage[]>;
+  adapters(): AdapterIdentities;
+  writeReport(report: LiveReport): Promise<void>;
+  cleanup(): Promise<{ ok: boolean }>;
+  log(message: string): void;
+};
+
+export type DemoLiveResult = { exitCode: number; errors: string[]; report: LiveReport | undefined };
+
+/** build:clean -> strict doctor -> owned seller -> suites -> live Playwright -> report -> validate; cleanup always last. */
+export async function runDemoLive(deps: DemoLiveDeps): Promise<DemoLiveResult> {
+  const errors: string[] = [];
+  let build: BuildProvenance | undefined;
+  let stages: LiveStage[] = [];
+  let suites: SuitesResult = { ok: false, evidence: [] };
+  let report: LiveReport | undefined;
+  let playwrightOk = false;
+  try {
+    build = await deps.cleanBuild();
+    const doctor = await deps.doctor();
+    if (!doctor.ok) {
+      // Row ids only: doctor reasons can name hosts or paths.
+      const failing = doctor.rows.filter((row) => !/ PASS\b/.test(row)).map((row) => row.trim().split(/\s+/)[0]);
+      errors.push(`strict doctor failed: ${failing.join(', ') || 'not all rows PASS'}`);
+    } else {
+      const seller = await deps.startSeller();
+      suites = await deps.runSuites();
+      const playwright = await deps.runPlaywright(seller);
+      playwrightOk = playwright.exitCode === 0;
+      if (!playwrightOk) errors.push(`live Playwright exited ${playwright.exitCode}`);
+      stages = await deps.readStages();
+    }
+  } catch (error) {
+    errors.push(`demo:live aborted: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    try {
+      const adapters = deps.adapters();
+      const adaptersOk = (['scanner', 'storage', 'messaging'] as const)
+        .every((name) => adapterIdentityErrors(name, adapters[name]).length === 0);
+      report = assembleLiveReport({ build, adapters, stages, suites, adaptersOk });
+      await deps.writeReport(report);
+    } catch (error) {
+      errors.push(`report not written: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const cleaned = await deps.cleanup().catch(() => ({ ok: false }));
+    if (!cleaned.ok) errors.push('cleanup incomplete: an owned resource was skipped or still running');
+  }
+  const validation = report ? validateLiveReport(report) : { ok: false, errors: ['no report'] };
+  errors.push(...validation.errors);
+  const ok = validation.ok && playwrightOk && errors.length === 0;
+  for (const error of errors) deps.log(error);
+  return { exitCode: ok ? 0 : 1, errors, report };
+}
+
 function isMain(): boolean {
   const current = fileURLToPath(import.meta.url);
   const invoked = process.argv[1] ? join(process.cwd(), process.argv[1]) : '';
@@ -735,12 +1030,10 @@ async function main(): Promise<void> {
       SSF_MAX_PLAINTEXT_BYTES: '41',
       SSF_INVOICE_TTL_MS: '86400000',
       SSF_DB_PATH: '/tmp/ssf-demo-check.sqlite',
-      SSF_SELLER_KEY_ID: 'seller-key-1',
       SSF_DESTINATION: 'uregtest1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq',
       SSF_ADAPTER_MESSAGING: 'real',
       SSF_ADAPTER_STORAGE: 'real',
       SSF_ADAPTER_SCANNER: 'real',
-      SSF_ADMIN_TOKEN: 'demo-check-admin-token',
     },
     ths,
     logos: logosDetected.ok

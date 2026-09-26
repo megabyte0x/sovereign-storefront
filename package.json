@@ -15,7 +15,9 @@
     "test:browser": "playwright test",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "backup-check": "node --experimental-strip-types scripts/backup-check.ts",
+    "backup:live": "node --experimental-strip-types scripts/backup-live.ts",
     "demo-check": "node --experimental-strip-types scripts/demo-check.ts",
+    "start:live": "node --experimental-strip-types scripts/start-live.ts",
     "infra:doctor": "node --experimental-strip-types scripts/live-infra/doctor.ts",
     "infra:up": "node --experimental-strip-types scripts/live-infra/up.ts",
     "infra:down": "node --experimental-strip-types scripts/live-infra/down.ts"
