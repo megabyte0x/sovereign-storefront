@@ -16,6 +16,7 @@ import type {
   SellerStore,
   Verification,
 } from '../contracts/types.ts';
+import { isReceiptPool } from '../contracts/live.ts';
 import type { ReceiptSource, Receipt, ScanSnapshot } from '../contracts/live.ts';
 
 export const DEFAULT_MIN_CONFIRMATIONS = 10;
@@ -187,7 +188,7 @@ function receiptMatchesInvoice(invoice: Invoice, snapshot: ScanSnapshot, receipt
     pool: 'orchard',
     diversifierIndex: invoice.attribution.receiver.diversifierIndex,
     receiverHex: receipt.receiverHex,
-  }) && receipt.scope === 'external' && receipt.pool === 'orchard';
+  }) && receipt.scope === 'external' && isReceiptPool(receipt.pool);
 }
 
 export type PaymentHooks = {
@@ -328,7 +329,7 @@ export function createPayments(deps: PaymentDeps): Payments {
 
     const observations: Observation[] = [];
     for (const receipt of raw.receipts) {
-      if (receipt.pool !== 'orchard' || receipt.scope !== 'external') continue;
+      if (!isReceiptPool(receipt.pool) || receipt.scope !== 'external') continue;
       const matched = knownInvoices.find((invoice) => receiptMatchesInvoice(invoice, raw, receipt));
       observations.push({
         outputId: receipt.outputId,

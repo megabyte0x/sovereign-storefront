@@ -3,6 +3,9 @@ import path from 'node:path';
 import { createLightNode, DefaultNetworkConfig, Protocols } from '@waku/sdk';
 import type { LightNode } from '@waku/sdk';
 import { LIVE_ROOT, ensurePrivateDir, mergeLiveEnv } from './paths.ts';
+import { withoutOwnedPeers } from '../../src/adapters/waku.ts';
+
+export { withoutOwnedPeers };
 
 const WAKU_ROOT = path.join(LIVE_ROOT, 'waku');
 const PEER_TIMEOUT_MS = 90_000;
@@ -151,7 +154,7 @@ async function main(argv: string[]): Promise<void> {
       const sample = await collectPeers(node);
       connected = sample.connected;
       both = sample.peers.filter((p) => supportsLightPushAndFilter(p.protocols));
-      return dialableFromPeers(sample.peers);
+      return withoutOwnedPeers(dialableFromPeers(sample.peers));
     }, { min: dryRun ? 0 : MIN_PEERS, intervalMs: POLL_INTERVAL_MS, deadlineMs: POLL_DEADLINE_MS });
 
     if (dryRun) {

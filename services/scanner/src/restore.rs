@@ -24,8 +24,8 @@ use serde::Serialize;
 use crate::{
     allocate::AllocationJournal,
     config::{
-        acquire_config_writer_lease, decode_regtest_orchard_ufvk, open_private_config,
-        open_runtime_paths, persist_or_verify_restored_birthday_attestation,
+        acquire_config_writer_lease, decode_orchard_ufvk, open_private_config, open_runtime_paths,
+        persist_or_verify_restored_birthday_attestation,
     },
     private_fs::PrivateDir,
     snapshot::SnapshotStore,
@@ -317,7 +317,7 @@ pub fn acknowledge_restore(config_path: &Path, reserve_gap: u64) -> Result<(), &
     if classify(&runtime.state, &connection)? != Binding::Restored {
         return Err("scanner state has no restore to acknowledge");
     }
-    let ufvk = decode_regtest_orchard_ufvk(&runtime.params, &runtime.ufvk)?;
+    let ufvk = decode_orchard_ufvk(&runtime.params, &runtime.chain.network, &runtime.ufvk)?;
     persist_or_verify_restored_birthday_attestation(&runtime.state, &runtime.birthday_attestation)?;
     let wallet = open_persistent_wallet_db(&runtime.wallet_path, runtime.params)?;
     let account = find_view_only_account(&wallet, &ufvk, &runtime.birthday)?

@@ -13,11 +13,13 @@ import type { BuyerRequest } from '../../src/contracts/messages.ts';
 import { openStore } from '../../src/seller/db.ts';
 import { createFulfillment } from '../../src/seller/fulfillment.ts';
 import { createInvoiceIssuer } from '../../src/seller/issuance.ts';
-import { createSellerApplication } from '../../src/seller/messages.ts';
-import { attachSellerApplication } from '../../src/seller/messages.ts';
+import { attachSellerApplication, createSellerApplication } from '../../src/seller/messages.ts';
 import { DEFAULT_POLICY, createPayments } from '../../src/seller/payments.ts';
 import { WalletScannerUnavailableError } from '../../src/adapters/wallet-scanner.ts';
 import { createOperationalLogger } from '../../src/ops/log.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { mapWakuSellerError } from '../../src/browser/waku-transport.ts';
+import { IssuanceLimiter } from '../../src/seller/orders.ts';
 
 const scratchRoot = process.env.TMPDIR ?? tmpdir();
 const availability: ServiceAvailability = { productPublished: true, messaging: true, storageReplica: true, scanner: true };
@@ -350,4 +352,74 @@ test('attachSellerApplication never lets a handler failure escape: sanitized log
   const lines = logger.lines();
   expect(lines.some((line) => /waku\.handler/.test(line))).toBe(true);
   for (const line of lines) expect(line).not.toContain(secret);
+});
+
+test('rate_limited create is signed to the requesting buyer and the browser maps it to Too many open checkouts', async () => {
+  store = await openStore(dbPath);
+  const limiterDb = new DatabaseSync(dbPath);
+  try {
+    const scanner = new MemoryScanner();
+    const issuer = createInvoiceIssuer({
+      store, scanner, chain, accountId, ttlMs: 60_000, now,
+      availability: async () => availability,
+      limiter: new IssuanceLimiter({
+        db: limiterDb,
+        config: { limits: { openInvoicesPerBuyer: 1, invoicesPerMinute: 30 } },
+        now,
+      }),
+    });
+    const payments = createPayments({
+      store, scanner, now,
+      preparePackage: async (invoice) => ({
+        orderId: invoice.orderId, productVersion: invoice.productVersion, buyerKeyId: invoice.buyerKeyId,
+        encryptedEnvelope: new Uint8Array([9, 9, 9]),
+      }),
+    });
+    const application = createSellerApplication({
+      store, issuer, payments, sellerKeyId: SELLER_KEY_ID, network: chain.network, now,
+    });
+    const first = await application.handle({ signerKeyId: 'buyer-limited', body: {
+      ...header({ messageId: 'msg-limit-1' }), type: 'create', requestId: 'req-limit-1', productVersion: 'book-v1', expectedAmountZat: '100',
+    } });
+    expect(first.type).toBe('invoice');
+
+    const limited = await application.handle({ signerKeyId: 'buyer-limited', body: {
+      ...header({ messageId: 'msg-limit-2' }), type: 'create', requestId: 'req-limit-2', productVersion: 'book-v1', expectedAmountZat: '100',
+    } });
+    expect(limited).toMatchObject({
+      type: 'error',
+      code: 'rate_limited',
+      buyerKeyId: 'buyer-limited',
+      sellerKeyId: SELLER_KEY_ID,
+      inReplyTo: 'msg-limit-2',
+    });
+    expect(mapWakuSellerError('rate_limited')).toBe('Too many open checkouts');
+
+    const received: Array<{ recipientKeyId: string; body: unknown }> = [];
+    let handler: ((message: { signerKeyId: string; body: BuyerRequest; wireEnvelope: Uint8Array }) => Promise<void>) | null = null;
+    const fakeSession = {
+      async ready() { return true; },
+      async send(recipientKeyId: string, body: unknown) { received.push({ recipientKeyId, body }); },
+      async subscribe(callback: typeof handler) { handler = callback; return async () => { handler = null; }; },
+      async decodeStored() { throw new Error('not used'); },
+      async close() { handler = null; },
+    };
+    await attachSellerApplication(fakeSession as never, application, { now });
+    await handler!({
+      signerKeyId: 'buyer-limited',
+      body: { ...header({ messageId: 'msg-limit-3' }), type: 'create', requestId: 'req-limit-3', productVersion: 'book-v1', expectedAmountZat: '100' },
+      wireEnvelope: new Uint8Array(),
+    });
+    expect(received).toHaveLength(1);
+    expect(received[0]!.recipientKeyId).toBe('buyer-limited');
+    expect(received[0]!.body).toMatchObject({
+      type: 'error',
+      code: 'rate_limited',
+      buyerKeyId: 'buyer-limited',
+      sellerKeyId: SELLER_KEY_ID,
+      inReplyTo: 'msg-limit-3',
+    });
+  } finally {
+    limiterDb.close();
+  }
 });

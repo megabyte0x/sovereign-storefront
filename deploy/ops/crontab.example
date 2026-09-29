@@ -1,0 +1,13 @@
+# Public-testnet host cron. Install on the Pi. Do not put secrets in this file.
+# Put SSF_HEALTH_URL (an ntfy or healthchecks.io URL) in /srv/ssf/ops.env mode 0600.
+# healthcheck.sh reads that file and never prints the URL.
+# ship.sh does not copy scripts/backup-live.ts or scripts/public-doctor.ts.
+# Set SSF_REPO_ROOT to a checkout that contains them. /path/to/checkout is a placeholder.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Nightly coordinated backup. Stops seller and scanner only for the export.
+15 3 * * * home SSF_REPO_ROOT=/path/to/checkout SSF_COMPOSE_FILE=/srv/ssf/deploy/compose.yaml SSF_ENV_FILE=/srv/ssf/public-testnet.env sh /srv/ssf/deploy/ops/backup.sh export
+
+# Doctor every 5 minutes. Posts a sanitized FAIL body when SSF_HEALTH_URL is set.
+*/5 * * * * home SSF_REPO_ROOT=/path/to/checkout SSF_COMPOSE_FILE=/srv/ssf/deploy/compose.yaml SSF_ENV_FILE=/srv/ssf/public-testnet.env sh /srv/ssf/deploy/ops/healthcheck.sh

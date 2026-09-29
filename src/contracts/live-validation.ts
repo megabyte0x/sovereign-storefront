@@ -1,4 +1,5 @@
-import type { ChainIdentity, ReceiverAllocation, ReceiverRef, ScanSnapshot } from './live.ts';
+import { isReceiptPool } from './live.ts';
+import type { ChainIdentity, ReceiptPool, ReceiverAllocation, ReceiverRef, ScanSnapshot } from './live.ts';
 import { ValidationError } from './validation.ts';
 
 export const MAX_SNAPSHOT_RECEIPTS = 10_000;
@@ -14,7 +15,7 @@ type Row = Record<string, unknown>;
 type Revision = { height: number; hash: string };
 type ProtocolIdentity = ChainIdentity & { accountId: string };
 type ProtocolProduct = { version: string; amountZat: string; network: ChainIdentity['network']; ciphertextCid: string; ciphertextDigest: string };
-type ProtocolObservation = { outputId: string; sourceId: string; generation: string; chainNetwork: ChainIdentity['network']; txid: string; pool: 'orchard'; outputIndex: number };
+type ProtocolObservation = { outputId: string; sourceId: string; generation: string; chainNetwork: ChainIdentity['network']; txid: string; pool: ReceiptPool; outputIndex: number };
 type ProtocolPackage = { orderId: string; productVersion: string; buyerKeyId: string; packageId: string; encryptedEnvelopeBytes: number };
 type NegativeCase = { name: string; candidate: Row };
 type ProtocolNegative = { snapshots: NegativeCase[]; allocations: NegativeCase[]; vectors: NegativeCase[] };
@@ -152,12 +153,13 @@ function validateReceipt(value: unknown, index: number): ScanSnapshot['receipts'
   const field = `snapshot.receipts.${index}`;
   const row = record(value, field);
   exact(row, field, ['outputId', 'txid', 'pool', 'outputIndex', 'accountId', 'scope', 'receiverHex', 'amountZat', 'firstSeenAt', 'mined', 'canonical']);
-  if (row.pool !== 'orchard') fail(`${field}.pool`);
+  if (!isReceiptPool(row.pool)) fail(`${field}.pool`);
+  const pool = row.pool;
   if (row.scope !== 'external' && row.scope !== 'internal') fail(`${field}.scope`);
   return {
     outputId: boundedText(row.outputId, `${field}.outputId`, 256),
     txid: hash(row.txid, `${field}.txid`),
-    pool: 'orchard',
+    pool,
     outputIndex: nonNegativeInteger(row.outputIndex, `${field}.outputIndex`),
     accountId: boundedText(row.accountId, `${field}.accountId`, 256),
     scope: row.scope,
@@ -215,14 +217,15 @@ function validateObservation(value: unknown): ProtocolObservation {
   const row = record(value, 'observation');
   exact(row, 'observation', ['outputId', 'sourceId', 'generation', 'chainNetwork', 'txid', 'pool', 'outputIndex']);
   if (row.chainNetwork !== 'test' && row.chainNetwork !== 'regtest') fail('observation.chainNetwork');
-  if (row.pool !== 'orchard') fail('observation.pool');
+  if (!isReceiptPool(row.pool)) fail('observation.pool');
+  const pool = row.pool;
   return {
     outputId: boundedText(row.outputId, 'observation.outputId', 256),
     sourceId: boundedText(row.sourceId, 'observation.sourceId', 256),
     generation: generation(row.generation, 'observation.generation'),
     chainNetwork: row.chainNetwork,
     txid: hash(row.txid, 'observation.txid'),
-    pool: 'orchard',
+    pool,
     outputIndex: nonNegativeInteger(row.outputIndex, 'observation.outputIndex'),
   };
 }

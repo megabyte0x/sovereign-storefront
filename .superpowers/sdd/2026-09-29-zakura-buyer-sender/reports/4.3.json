@@ -1,0 +1,25 @@
+{"subtask":"4.3","status":"done",
+ "changed_files":["tools/buyer-sender/src/pay.rs","tools/buyer-sender/src/main.rs","tools/buyer-sender/src/state.rs","tools/buyer-sender/src/chain.rs"],
+ "commands":[
+  {"cmd":"RUSTFLAGS=\"-D warnings\" cargo build --locked --release --manifest-path tools/buyer-sender/Cargo.toml","exit":0},
+  {"cmd":"npm run build:buyer-sender","exit":0},
+  {"cmd":"rustfmt --edition 2024 tools/buyer-sender/src/pay.rs tools/buyer-sender/src/main.rs","exit":0},
+  {"cmd":"npm run build:buyer-sender (after rustfmt)","exit":0},
+  {"cmd":"ssf-buyer-sender --state-dir <probe> tx-status --attempt-id <missing 64-hex>","exit":2},
+  {"cmd":"ssf-buyer-sender --state-dir <probe> tx-status --attempt-id <probe id, txid 64 zeros, expiry 1>","exit":0},
+  {"cmd":"ssf-buyer-sender --state-dir <probe> rebroadcast --attempt-id <same probe id>","exit":2}
+ ],
+ "evidence":[
+  "Both builds exit 0; grep -cE '^(warning|error)' on .runtime/public/diag/buyer-sender-4.3.log = 0 (with -D warnings, no crate-level allow(dead_code))",
+  "missing attempt: {\"error\":\"no attempt recorded\"} exit 2",
+  "zero txid, expiry 1: state=expired, minedHeight=null, tip=4414378, exit 0 (server returned NOT_FOUND)",
+  "rebroadcast of the same probe: {\"error\":\"attempt has expired; nothing was sent\"} exit 2, nothing sent",
+  "probe state dir is under $TMPDIR/bs43 (0700 at both levels); no real wallet state touched"
+ ],
+ "deviations":[
+  {"file":"tools/buyer-sender/src/pay.rs","line":0,"text":"tx_status/rebroadcast handlers placed in pay.rs (main.rs wrappers delegate)","why":"pay.rs owns attempt_output/broadcast_exit; keeps main.rs thin like pay()"},
+  {"file":"tools/buyer-sender/src/state.rs","line":8,"text":"removed #![allow(dead_code)]; no item-level allows needed","why":"every item is now used; -D warnings build is clean"},
+  {"file":"tools/buyer-sender/src/chain.rs","line":10,"text":"removed #![allow(dead_code)]; no item-level allows needed","why":"every item is now used; -D warnings build is clean"},
+  {"file":"tools/buyer-sender/src/pay.rs","line":176,"text":"rustfmt rewrapped the existing pay_guard signature","why":"layout only (rustfmt on main.rs may also have reformatted the chain.rs/state.rs modules); no behaviour change"}
+ ],
+ "notes_for_next_subtask":"pay.rs: pub async fn tx_status(&StateDir, &dyn ChainFactory, &str) -> CommandResult; pub async fn rebroadcast(same) -> CommandResult; private fn recorded_attempt(state, id) -> Result<Attempt,(u8,&str)> (None -> exit 2 'no attempt recorded'); broadcast_exit is now pub(crate).\ntx-status: exit 0 on any definite state; exit 3 only for 'transaction status unavailable' (chain::tx_status error); connect/tip errors are exit 2 via refuse. A txid in the attempt file that fails to parse gives exit 2 'attempt file is invalid'.\nrebroadcast: raw_hex that fails hex-decode gives exit 2 'attempt file is invalid' before connect; tip > expiry gives exit 2; otherwise broadcast_exit (0 accepted, 3 rejected/unknown).\nNeither command reads the seed or syncs; both still take the flock through StateDir::open_or_create.\nThe server (testnet.zec.rocks) returns NOT_FOUND for an unknown txid, so the NOT_FOUND rule holds.\nWave 6 can test both handlers with a fake ChainFactory; a missing attempt refuses before connect() is called."}

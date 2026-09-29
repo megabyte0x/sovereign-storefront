@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>embedder</title>
+</head>
+<body>
+  <p id="origin"></p>
+  <button id="buy" type="button">Buy</button>
+  <p id="message">none</p>
+  <div id="frame-slot"></div>
+  <script>
+    const STOREFRONT = 'http://s.localhost:5002';
+    const params = new URLSearchParams(location.search);
+    const model = params.get('model') || 'popup';
+    const id = params.get('id') || 'purchase-1';
+    document.getElementById('origin').textContent = location.origin;
+    window.__ssfMessage = null;
+
+    window.addEventListener('message', (event) => {
+      if (event.origin !== STOREFRONT) return;
+      window.__ssfMessage = event.data;
+      document.getElementById('message').textContent = JSON.stringify(event.data);
+    });
+
+    document.getElementById('buy').addEventListener('click', () => {
+      const url = STOREFRONT + '/storefront.html?write=' + encodeURIComponent(id);
+      window.open(url, 'ssf-checkout', 'popup,width=480,height=760');
+    });
+
+    if (model === 'iframe') {
+      const iframe = document.createElement('iframe');
+      iframe.id = 'storefront-frame';
+      iframe.src = STOREFRONT + '/storefront.html?write=' + encodeURIComponent(id);
+      iframe.width = 480;
+      iframe.height = 320;
+      document.getElementById('frame-slot').appendChild(iframe);
+    }
+  </script>
+</body>
+</html>

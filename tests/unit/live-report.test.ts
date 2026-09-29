@@ -188,3 +188,60 @@ describe('validateLiveReport', () => {
     });
   });
 });
+
+describe('public profile', () => {
+  const adapters = {
+    scanner: { kind: 'zcash-scanner-socket', version: '0.1.0' },
+    storage: { kind: 'logos-storage', version: '0.2.0' },
+    messaging: { kind: 'waku-lightpush-filter', version: '0.0.30' },
+  };
+  const stages = [
+    'embed-invoice',
+    'receipt-observed',
+    'three-confirmations',
+    'bytes-match',
+    'recover-without-repay',
+    'restart-between',
+    'origin-stop',
+    'funds-received',
+  ].map((id) => ({ id, status: 'PASS' as const, evidence: [`synthetic ${id}`] }));
+  const report = {
+    schemaVersion: 1,
+    liveAttempted: true,
+    profile: 'public' as const,
+    network: 'test' as const,
+    build: passingReport.build,
+    ...adapters,
+    stages: [
+      ...stages,
+      {
+        id: 'T01',
+        status: 'PASS' as const,
+        evidence: ['three confirmations'],
+        testnet: {
+          network: 'test',
+          wallet: 'ExternalWallet',
+          walletVersion: '1.2.3',
+          lightwalletd: 'lwd.example:9067',
+          txid: 'd'.repeat(64),
+          confirmations: 3,
+        },
+      },
+    ],
+  };
+
+  it('accepts three confirmations and rejects two', () => {
+    expect(validateLiveReport(report)).toEqual({ ok: true, errors: [] });
+    const short = {
+      ...report,
+      stages: report.stages.map((stage) => stage.id === 'T01' && 'testnet' in stage
+        ? { ...stage, testnet: { ...stage.testnet, confirmations: 2 } }
+        : stage),
+    };
+    expect(validateLiveReport(short).ok).toBe(false);
+  });
+
+  it('does not accept a public report that is missing a stage', () => {
+    expect(validateLiveReport({ ...report, stages: report.stages.filter((stage) => stage.id !== 'funds-received') }).ok).toBe(false);
+  });
+});

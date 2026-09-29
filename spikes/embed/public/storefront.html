@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>storefront</title>
+</head>
+<body>
+  <p id="origin"></p>
+  <p id="status">idle</p>
+  <pre id="value"></pre>
+  <script type="module">
+    import { idbWrite, idbRead } from './idb.js';
+
+    const EMBEDDER = 'http://a.localhost:5001';
+    const params = new URLSearchParams(location.search);
+    const writeId = params.get('write');
+    const readId = params.get('read');
+    const originEl = document.getElementById('origin');
+    const statusEl = document.getElementById('status');
+    const valueEl = document.getElementById('value');
+    originEl.textContent = location.origin;
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function setValue(value) {
+      valueEl.textContent = value == null ? 'null' : JSON.stringify(value);
+    }
+
+    window.__ssf = { written: false, record: null, posted: false };
+
+    if (writeId) {
+      const record = {
+        id: writeId,
+        product: 'v1',
+        kind: 'purchase',
+        writtenAt: Date.now(),
+        href: location.href,
+      };
+      try {
+        await idbWrite(record);
+        const roundTrip = await idbRead(writeId);
+        window.__ssf.written = roundTrip != null && roundTrip.id === writeId;
+        window.__ssf.record = roundTrip;
+        setValue(roundTrip);
+        setStatus(window.__ssf.written ? 'written' : 'write-mismatch');
+        if (window.opener) {
+          window.opener.postMessage(
+            { type: 'ssf-checkout', state: 'invoiced', id: writeId },
+            EMBEDDER,
+          );
+          window.__ssf.posted = true;
+        }
+      } catch (err) {
+        setStatus('write-failed');
+        setValue({ error: String(err && err.message ? err.message : err) });
+      }
+    } else if (readId) {
+      try {
+        const record = await idbRead(readId);
+        window.__ssf.record = record;
+        setValue(record);
+        setStatus(record ? 'found' : 'missing');
+      } catch (err) {
+        setStatus('read-failed');
+        setValue({ error: String(err && err.message ? err.message : err) });
+      }
+    } else {
+      setStatus('ready');
+    }
+  </script>
+</body>
+</html>

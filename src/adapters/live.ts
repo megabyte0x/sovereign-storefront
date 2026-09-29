@@ -10,6 +10,8 @@ import type { SellerResponse, WakuConfig, WakuSession } from '../contracts/messa
 import type { DeliveryPackage, StorageAdapter } from '../contracts/types.ts';
 import type { FulfillmentMessaging } from './messaging.ts';
 import { createLogosStorageAdapter, defaultLogosRunner, type LogosRunner } from './storage.ts';
+import { sha256Hex } from './crypto.ts';
+import { confirmRemoteReplica, createRemoteReplica } from './remote-replica.ts';
 import { createWakuSession, type WakuNode } from './waku.ts';
 import { createWalletScanner } from './wallet-scanner.ts';
 
@@ -19,7 +21,11 @@ export type LiveAdapterKind = 'scanner' | 'storage' | 'waku';
  * Storage with the independent-replica startup check the runtime gates on, and
  * a close() that removes its private Logos work directory.
  */
-export type LiveStorage = StorageAdapter & { assertIndependentReplicas(): Promise<void>; close(): Promise<void> };
+export type LiveStorage = StorageAdapter & {
+  assertIndependentReplicas(): Promise<void>;
+  verifyPublished(cid: string, digest: string, sizeBytes: number): Promise<boolean>;
+  close(): Promise<void>;
+};
 
 export type LiveAdapters = {
   scanner: ReceiptSource;
@@ -119,19 +125,76 @@ export function readOriginListenPort(originConfigDir: string): number | undefine
   }
 }
 
-function liveStorage(config: NonNullable<RuntimeConfig['live']>, runner: LogosRunner, workRoot: string): LiveStorage {
+const REMOTE_REPLICA_TIMEOUT_MS = 90_000;
+
+function liveStorage(
+  config: NonNullable<RuntimeConfig['live']>,
+  runner: LogosRunner,
+  workRoot: string,
+  maxBytes: number,
+): LiveStorage {
   // Owned here (not inside the Logos adapter) so close() can remove it.
   const workDir = mkdtempSync(join(workRoot, 'ssf-logos-'));
   const originListenPort = readOriginListenPort(config.logos.originConfigDir);
+  const remote = config.replicaAgent === undefined
+    ? undefined
+    : createRemoteReplica({
+        url: config.replicaAgent.url,
+        tokenFile: config.replicaAgent.tokenFile,
+        timeoutMs: REMOTE_REPLICA_TIMEOUT_MS,
+        maxBytes,
+      });
   const adapter = createLogosStorageAdapter(
     originListenPort === undefined ? config.logos : { ...config.logos, originListenPort },
     { runner, workDir },
+    { maxBytes, ...(remote ? { connectReplica: false } : {}) },
   );
+  const known = new Map<string, { digest: string; sizeBytes: number }>();
   return {
-    publish: (ciphertext) => adapter.publish(ciphertext),
-    fetch: (cid) => adapter.fetch(cid),
-    verifyReplica: (cid, replicaId) => adapter.verifyReplica(cid, replicaId),
+    async publish(ciphertext) {
+      const cid = await adapter.publish(ciphertext);
+      if (!remote || config.replicaAgent === undefined) return cid;
+      const originPeerId = await runner.call(config.logos.originConfigDir, 'peerId');
+      if (typeof originPeerId !== 'string' || originPeerId.length === 0) {
+        throw new Error('replica verification failed');
+      }
+      const digest = sha256Hex(ciphertext);
+      const sizeBytes = ciphertext.byteLength;
+      known.set(cid, { digest, sizeBytes });
+      const port = originListenPort ?? 8091;
+      const ok = await confirmRemoteReplica(remote, {
+        cid,
+        originMultiaddr: `/ip4/${config.replicaAgent.advertiseHost}/tcp/${port}/p2p/${originPeerId}`,
+        digest,
+        sizeBytes,
+      });
+      if (!ok) throw new Error('replica verification failed');
+      return cid;
+    },
+    fetch: (cid) => (remote ? remote.fetch(cid) : adapter.fetch(cid)),
+    async verifyReplica(cid, replicaId) {
+      if (!remote) return adapter.verifyReplica(cid, replicaId);
+      const noted = known.get(cid);
+      if (noted) remote.noteExpected(cid, noted.digest, noted.sizeBytes);
+      return remote.verifyReplica(cid, replicaId);
+    },
+    async verifyPublished(cid, digest, sizeBytes) {
+      if (remote) {
+        known.set(cid, { digest, sizeBytes });
+        remote.noteExpected(cid, digest, sizeBytes);
+        return remote.verifyReplica(cid, 'replica');
+      }
+      return adapter.verifyReplica(cid, 'replica');
+    },
     async assertIndependentReplicas() {
+      if (remote) {
+        const origin = await runner.call(config.logos.originConfigDir, 'peerId');
+        if (typeof origin !== 'string' || origin.length === 0) {
+          throw new Error('logos storage peer identity unavailable');
+        }
+        await remote.assertIndependentReplicas(origin);
+        return;
+      }
       const [a, b] = await Promise.all([
         runner.call(config.logos.originConfigDir, 'peerId'),
         runner.call(config.logos.replicaConfigDir, 'peerId'),
@@ -142,6 +205,7 @@ function liveStorage(config: NonNullable<RuntimeConfig['live']>, runner: LogosRu
       if (a === b) throw new Error('logos origin and replica are not independent peers');
     },
     async close() {
+      remote?.close();
       rmSync(workDir, { recursive: true, force: true });
     },
   };
@@ -185,11 +249,13 @@ export function createWakuFulfillmentMessaging(session: WakuSession, sellerKeyId
 
 export async function createLiveAdapters(config: RuntimeConfig, options: LiveAdapterOptions): Promise<LiveAdapters> {
   const live = config.live;
-  if (config.mode !== 'real-demo' || !live) throw new Error('live adapters require real-demo configuration');
+  if ((config.mode !== 'real-demo' && config.mode !== 'public-testnet') || !live) {
+    throw new Error('live adapters require real-demo configuration');
+  }
   const runner = options.logosRunner ?? defaultLogosRunner(live.logos.logosctlPath);
   return {
     scanner: brand('scanner', createLiveReceiptSource(live)),
-    storage: brand('storage', liveStorage(live, runner, options.logosWorkRoot ?? process.env.TMPDIR ?? tmpdir())),
+    storage: brand('storage', liveStorage(live, runner, options.logosWorkRoot ?? process.env.TMPDIR ?? tmpdir(), config.maxCiphertextBytes)),
     waku: brand('waku', createWakuSession(live.waku, options.sellerPrivateKey, {
       ...(options.wakuCreateNode ? { createNode: options.wakuCreateNode } : {}),
       ...(options.onWakuHandlerError ? { onHandlerError: options.onWakuHandlerError } : {}),

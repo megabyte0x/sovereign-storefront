@@ -1,0 +1,7 @@
+state/node-a
+state/node-b
+state/files
+state/*.log
+state/*.json
+bin
+compose.yml

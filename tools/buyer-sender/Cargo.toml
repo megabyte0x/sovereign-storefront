@@ -1,0 +1,40 @@
+[package]
+name = "ssf-buyer-sender"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[[bin]]
+name = "ssf-buyer-sender"
+path = "src/main.rs"
+
+[dependencies]
+sovereign-storefront-scanner = { path = "../../services/scanner" }
+getrandom = "=0.4.3"
+hex = "=0.4.3"
+nix = { version = "=0.31.3", default-features = false, features = ["dir", "fs", "user"] }
+prost = "=0.14.4"
+rand_core = "=0.10.1"
+rusqlite = "=0.37.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "=0.14.6", features = ["tls-ring"] }
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc5", features = ["orchard", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc5", features = ["orchard"] }
+# Feature unification: the matching same-source PCZT release gates the SQLite
+# Orchard migration's `Pczt::into_effects` behind `io-finalizer`.
+zakura_pczt = { package = "zakura-pczt", version = "=0.1.0-rc3", features = ["io-finalizer"] }
+zcash_keys = { package = "zakura-keys", version = "=1.2.0", features = ["orchard"] }
+zcash_primitives = { package = "zakura-primitives", version = "=1.2.0", default-features = false, features = ["std"] }
+zcash_protocol = { version = "=0.10.6", default-features = false, features = ["local-consensus", "std"] }
+zcash_address = "=0.13.0"
+zip32 = { version = "=0.2.1", default-features = false }
+zip321 = "=0.9.0"
+zcash_proofs = { package = "zakura-proofs", version = "=1.2.0", default-features = false, features = ["bundled-prover", "multicore"] }
+orchard = { package = "zakura-orchard", version = "=1.2.0", default-features = false }
+bip39 = { version = "=2.2.2", default-features = false, features = ["std"] }
+secrecy = "=0.8.0"
+zeroize = "=1.9.0"

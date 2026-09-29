@@ -1,0 +1,10 @@
+# Render with deploy/cloudflared/render-config.ts. The wss rule is omitted when
+# WSS_HOSTNAME is empty (D1=a). No ingress for 8788.
+tunnel: ssf-store
+credentials-file: /etc/cloudflared/creds/ssf-store.json
+ingress:
+  - hostname: store.agentmascot.app
+    service: http://seller:8787
+  - hostname: ${WSS_HOSTNAME}
+    service: http://delivery:8000
+  - service: http_status:404

@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import type { ProductSummary } from '../contracts/public.ts';
 import type { ServiceAvailability, StorageAdapter } from '../contracts/types.ts';
 import {
   assertCanonicalAmountZat,
@@ -83,10 +84,14 @@ export function openCatalogue(options: {
    * only thing that downloads, and a missing/stale entry means unavailable.
    */
   replicaReady?: (productVersion: string) => boolean;
+  /** Ciphertext cap. Defaults to the real-demo 73-byte ceiling. */
+  maxCiphertextBytes?: number;
 }): {
   getPublishedCiphertext(productVersion: string): Promise<Uint8Array>;
   getManifest(productVersion: string): ProductManifest | null;
   listPublished(): ProductManifest[];
+  listSummaries(): Promise<ProductSummary[]>;
+  summaryFor(productVersion: string): Promise<ProductSummary | null>;
   listProductKeys(): Array<{
     keyRef: string;
     productVersion: string;
@@ -115,6 +120,7 @@ export function openCatalogue(options: {
   close(): void;
 } {
   assertRequiredString(options.dbPath, 'dbPath');
+  const maxCiphertextBytes = options.maxCiphertextBytes ?? FIRST_RELEASE_MAX_CIPHERTEXT_BYTES;
   mkdirSync(dirname(options.dbPath), { recursive: true });
   const db = new DatabaseSync(options.dbPath);
   db.exec('PRAGMA foreign_keys = ON');
@@ -149,6 +155,27 @@ export function openCatalogue(options: {
     }),
   };
 
+  async function toSummary(row: ProductRow): Promise<ProductSummary> {
+    const published = row.published === 1 && Boolean(row.ciphertext_cid);
+    let available = false;
+    if (published && row.ciphertext_cid) {
+      available = options.replicaReady
+        ? options.replicaReady(row.version)
+        : await options.storage.verifyReplica(row.ciphertext_cid, 'replica').catch(() => false);
+    }
+    const sizeBytes = row.file_size === null || row.file_size === undefined ? 0 : Number(row.file_size);
+    return {
+      version: row.version,
+      title: row.description,
+      description: row.description,
+      amountZat: row.amount_zat,
+      network: row.network,
+      sizeBytes,
+      mediaType: 'application/octet-stream',
+      available,
+    };
+  }
+
   return {
     async getPublishedCiphertext(productVersion) {
       assertProductVersion(productVersion);
@@ -157,8 +184,8 @@ export function openCatalogue(options: {
         throw new Error('unpublished product');
       }
       const body = await options.storage.fetch(row.ciphertext_cid);
-      if (body.byteLength > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) {
-        throw new PayloadTooLarge(body.byteLength, FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
+      if (body.byteLength > maxCiphertextBytes) {
+        throw new PayloadTooLarge(body.byteLength, maxCiphertextBytes);
       }
       if (row.ciphertext_digest && sha256Hex(body) !== row.ciphertext_digest) {
         throw new Error('ciphertext digest mismatch');
@@ -174,9 +201,25 @@ export function openCatalogue(options: {
       const rows = db.prepare(
         `SELECT version, description, amount_zat, network, ciphertext_cid, ciphertext_digest,
                 file_format_version, file_size, seller_key_ref, published
-         FROM products WHERE published = 1 ORDER BY created_at ASC`,
+         FROM products WHERE published = 1 ORDER BY created_at ASC, rowid ASC`,
       ).all() as ProductRow[];
       return rows.map(rowToManifest);
+    },
+    async listSummaries() {
+      const rows = db.prepare(
+        `SELECT version, description, amount_zat, network, ciphertext_cid, ciphertext_digest,
+                file_format_version, file_size, seller_key_ref, published
+         FROM products WHERE published = 1 ORDER BY created_at ASC, rowid ASC`,
+      ).all() as ProductRow[];
+      const summaries: ProductSummary[] = [];
+      for (const row of rows) summaries.push(await toSummary(row));
+      return summaries;
+    },
+    async summaryFor(productVersion) {
+      if (!PRODUCT_VERSION_RE.test(productVersion)) return null;
+      const row = read(productVersion);
+      if (!row || row.published !== 1) return null;
+      return toSummary(row);
     },
     listProductKeys() {
       const rows = db.prepare(
@@ -251,8 +294,8 @@ export function openCatalogue(options: {
     },
     completePublication(input) {
       assertProductVersion(input.version);
-      if (input.fileSize > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) {
-        throw new PayloadTooLarge(input.fileSize, FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
+      if (input.fileSize > maxCiphertextBytes) {
+        throw new PayloadTooLarge(input.fileSize, maxCiphertextBytes);
       }
       db.exec('BEGIN IMMEDIATE');
       try {

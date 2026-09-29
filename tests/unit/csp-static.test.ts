@@ -116,6 +116,53 @@ function liveAdapters() {
   return { scanner, storage: createMemoryStorageAdapter(), messaging: createMemoryMessaging() };
 }
 
+function publicTestnetEnv(): NodeJS.Dict<string> {
+  const scannerConfig = join(scratch, 'scanner-test.json');
+  writeFileSync(scannerConfig, JSON.stringify({
+    ufvk: 'not-a-real-ufvk',
+    runtime: {
+      sourceId: 'fixture-scanner',
+      chain: {
+        network: 'test',
+        genesisHash: GENESIS,
+        consensusFingerprint: consensusFingerprint('test', ACTIVATIONS),
+      },
+      activations: ACTIVATIONS,
+    },
+  }), { mode: 0o600 });
+  chmodSync(scannerConfig, 0o600);
+  const tokenFile = join(scratch, 'public-admin.token');
+  writeFileSync(tokenFile, 'admin-token-from-file\n', { mode: 0o600 });
+  chmodSync(tokenFile, 0o600);
+  return {
+    SSF_MODE: 'public-testnet',
+    SSF_NETWORK: 'test',
+    SSF_PUBLIC_ORIGIN: 'https://store.example.org',
+    SSF_EMBED_ORIGINS: 'https://books.example.org',
+    SSF_MIN_CONFIRMATIONS: '3',
+    SSF_MAX_HEALTH_AGE_MS: '120000',
+    SSF_MAX_PLAINTEXT_BYTES: '41',
+    SSF_INVOICE_TTL_MS: '86400000',
+    SSF_PUBLIC_HOST: '127.0.0.1',
+    SSF_PUBLIC_PORT: '0',
+    SSF_ADMIN_HOST: '127.0.0.1',
+    SSF_ADMIN_PORT: '0',
+    SSF_DB_PATH: join(scratch, 'public.sqlite'),
+    SSF_ADAPTER_MESSAGING: 'real',
+    SSF_ADAPTER_STORAGE: 'real',
+    SSF_ADAPTER_SCANNER: 'real',
+    SSF_ADMIN_TOKEN_FILE: tokenFile,
+    SSF_SCANNER_SOCKET: join(scratch, 's.sock'),
+    SSF_SCANNER_ACCOUNT_ID: 'seller-account-0',
+    SSF_SCANNER_CONFIG: scannerConfig,
+    SSF_WAKU_CONTENT_TOPIC: '/ssf/1/csp-test/proto',
+    WAKU_BOOTSTRAP_PEERS: `${PEER_A},${PEER_B}`,
+    LOGOSCTL: '/opt/logos/logosctl',
+    LOGOS_NODE_A: join(scratch, 'node-a'),
+    LOGOS_NODE_B: join(scratch, 'node-b'),
+  };
+}
+
 test('fixture CSP keeps connect-src self only', () => {
   const csp = buildCsp(fixtureConfig());
   expect(connectSrc(csp)).toBe("connect-src 'self'");
@@ -185,4 +232,26 @@ test('fixture startSeller keeps its fallback static serving', async () => {
   const res = await fetch(`${seller.publicUrl}/`);
   expect(res.status).toBe(200);
   expect(connectSrc(res.headers.get('content-security-policy') ?? '')).toBe("connect-src 'self'");
+});
+
+test('public-testnet CSP lists configured wss peers and keeps frame-ancestors none', () => {
+  const csp = buildCsp(loadConfig(publicTestnetEnv()));
+  expect(connectSrc(csp)).toBe("connect-src 'self' wss://peer-a.example:8000 wss://peer-b.example:8443");
+  expect(csp).toContain("frame-ancestors 'none'");
+  expect(csp).not.toContain('*');
+});
+
+test('embed.js is cross-origin and immutable; app pages are not', async () => {
+  const dir = browserDir();
+  writeFileSync(join(dir, 'embed.js'), '/* embed */');
+  seller = await startSeller({ config: fixtureConfig(), seedProduct: false, publicDir: dir, startLoops: false });
+  const page = await fetch(`${seller.publicUrl}/`);
+  expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+  expect(page.headers.get('access-control-allow-origin')).not.toBe('*');
+  const embed = await fetch(`${seller.publicUrl}/embed.js`);
+  expect(embed.status).toBe(200);
+  expect(await embed.text()).toBe('/* embed */');
+  expect(embed.headers.get('cross-origin-resource-policy')).toBe('cross-origin');
+  expect(embed.headers.get('access-control-allow-origin')).toBe('*');
+  expect(embed.headers.get('cache-control')).toMatch(/immutable/);
 });

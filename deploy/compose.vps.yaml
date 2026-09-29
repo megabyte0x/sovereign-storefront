@@ -1,0 +1,111 @@
+# Single-host main stack on ssf-replica (linux/amd64), beside compose.replica.yaml
+# (logos-b + replica-agent). Replaces the Pi stack (compose.yaml) after the Pi
+# went offline. Both Logos nodes share this host, so origin-stop proves only
+# same-host fallback. 8091 and 8790 publish on the tailnet IP; admin on loopback.
+name: ssf-public
+
+x-logging: &logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  logos-a:
+    image: ssf-logos:amd64
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    volumes:
+      - logos-a-data:/data
+      - logos-ipc:/tmp
+    ports:
+      - "${REPLICA_TAILNET_IP}:8091:8091"
+    environment:
+      QT_QPA_PLATFORM: offscreen
+      LOGOS_LISTEN_PORT: "8091"
+      LOGOS_DISC_PORT: "8090"
+    healthcheck:
+      # daemon status stays "running" after storage_module crashes; check the module.
+      test: ["CMD-SHELL", "/opt/logos/squashfs-root/usr/bin/logosctl --config-dir /data --json module ls | grep -q '\"storage_module\",\"status\":\"loaded\"'"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  scanner:
+    image: ssf-scanner:amd64
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    volumes:
+      - scanner-state:/var/lib/ssf/scanner
+      - ssf-run:/run/ssf
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/ssf/live/scanner.sock"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  seller:
+    image: ssf-seller:amd64
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    depends_on:
+      scanner:
+        condition: service_healthy
+      logos-a:
+        condition: service_healthy
+    environment:
+      SSF_ENV_FILE: /etc/ssf/public-testnet.env
+      SSF_REPLICA_AGENT_URL: http://${REPLICA_TAILNET_IP}:8790
+      SSF_REPLICA_TOKEN_FILE: /var/lib/ssf/replica.token
+      SSF_LOGOS_ADVERTISE_HOST: ${REPLICA_TAILNET_IP}
+    volumes:
+      - seller-data:/var/lib/ssf
+      - scanner-state:/var/lib/ssf/scanner
+      - logos-a-data:/data
+      - logos-ipc:/tmp
+      - ssf-run:/run/ssf
+      - /srv/ssf/public-testnet.env:/etc/ssf/public-testnet.env:ro
+    expose:
+      - "8787"
+    ports:
+      - "127.0.0.1:8788:8788"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.1.1
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    command: ["tunnel", "--config", "/etc/cloudflared/config.yml", "--no-autoupdate", "run", "--token-file", "/etc/cloudflared/token"]
+    volumes:
+      - ./cloudflared/config.vps.yml:/etc/cloudflared/config.yml:ro
+      - /srv/ssf/secrets/ssf-store.token:/etc/cloudflared/token:ro
+    tmpfs:
+      - /tmp
+
+volumes:
+  logos-a-data:
+  logos-ipc:
+  scanner-state:
+  ssf-run:
+  seller-data:

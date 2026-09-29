@@ -14,10 +14,7 @@
 //! A new upgrade name is a new fingerprint version, never an ignored field.
 
 use sha2::{Digest, Sha256};
-use zcash_protocol::{
-    consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters},
-    local_consensus::LocalNetwork,
-};
+use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters};
 
 use crate::config::ActivationHeights;
 
@@ -55,7 +52,7 @@ pub fn consensus_fingerprint(
 /// force at lightwalletd's reported tip. The node's chain label is not used;
 /// local regtest backends may report it as `test`.
 pub fn verify_lightd_consensus(
-    params: &LocalNetwork,
+    params: &impl Parameters,
     sapling_activation_height: u64,
     consensus_branch_id: &str,
     block_height: u64,

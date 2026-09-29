@@ -179,6 +179,13 @@ impl Fixture {
     /// Insert deterministic note data only into this disposable library-migrated
     /// fixture. Runtime wallet tables are never written by scanner code.
     fn insert_received(&self, id: i64, address: usize, spent: bool) {
+        self.insert_received_in("orchard", id, address, spent);
+    }
+
+    /// `pool` names the wallet library's note table family (`orchard` or
+    /// `ironwood`). NU6.3 testnet payments to an Orchard receiver land in
+    /// the Ironwood table.
+    fn insert_received_in(&self, pool: &str, id: i64, address: usize, spent: bool) {
         let connection = Connection::open(&self.wallet_path).expect("open disposable fixture");
         let txid = vec![id as u8; 32];
         connection
@@ -196,10 +203,12 @@ impl Fixture {
             .expect("insert mined transaction into disposable fixture");
         connection
             .execute(
-                "INSERT INTO orchard_received_notes
-                 (id, transaction_id, action_index, account_id, diversifier, value, rho, rseed,
-                  is_change, recipient_key_scope, address_id)
-                 VALUES (?1, ?1, ?1, ?2, X'00', ?3, X'00', X'00', 0, 0, ?4)",
+                &format!(
+                    "INSERT INTO {pool}_received_notes
+                     (id, transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+                      is_change, recipient_key_scope, address_id, note_version)
+                     VALUES (?1, ?1, ?1, ?2, X'00', ?3, X'00', X'00', 0, 0, ?4, 2)"
+                ),
                 params![
                     id,
                     self.account_row_id,
@@ -207,7 +216,7 @@ impl Fixture {
                     self.address_ids[address]
                 ],
             )
-            .expect("insert external Orchard note into disposable fixture");
+            .expect("insert external received note into disposable fixture");
         if spent {
             let spend_tx = 1_000 + id;
             connection
@@ -219,8 +228,10 @@ impl Fixture {
                 .expect("insert fixture spending transaction");
             connection
                 .execute(
-                    "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
-                     VALUES (?1, ?2)",
+                    &format!(
+                        "INSERT INTO {pool}_received_note_spends ({pool}_received_note_id, transaction_id)
+                         VALUES (?1, ?2)"
+                    ),
                     params![id, spend_tx],
                 )
                 .expect("mark deterministic fixture note spent through migrated wallet relation");
@@ -581,4 +592,58 @@ fn a_lookalike_table_with_projection_columns_is_schema_drift_not_empty_history()
         read_wallet_history(&fixture.wallet_path, &fixture.params, &fixture.account_id),
         Err(ProjectionError::Unavailable)
     );
+}
+
+#[test]
+fn nu6_3_ironwood_payment_to_an_external_orchard_receiver_is_a_receipt() {
+    let fixture = Fixture::new();
+    fixture.insert_received(1, 0, false);
+    fixture.insert_received_in("ironwood", 2, 1, false);
+
+    let history = read_wallet_history(&fixture.wallet_path, &fixture.params, &fixture.account_id)
+        .expect("project Orchard and Ironwood received history");
+    assert_eq!(history.outputs.len(), 2);
+    let ironwood = history
+        .outputs
+        .iter()
+        .find(|output| output.pool == "ironwood")
+        .expect("Ironwood note is projected");
+    assert_eq!(
+        ironwood.output_id,
+        format!("{}:ironwood:2", "02".repeat(32))
+    );
+    assert_eq!(ironwood.receiver_hex, fixture.receiver_hexes[1]);
+    assert_eq!(ironwood.amount_zat, "100000002");
+    assert!(!ironwood.spent);
+    assert!(ironwood.mined.is_some());
+
+    let receipt = super::receipt_from_output(ironwood.clone(), &fixture.account_id)
+        .expect("Ironwood output is a valid public receipt");
+    assert_eq!(receipt.pool, "ironwood");
+    assert!(receipt.canonical);
+}
+
+#[test]
+fn spent_ironwood_note_is_projected_as_spent() {
+    let fixture = Fixture::new();
+    fixture.insert_received_in("ironwood", 3, 0, true);
+
+    let history = read_wallet_history(&fixture.wallet_path, &fixture.params, &fixture.account_id)
+        .expect("project spent Ironwood history");
+    assert_eq!(history.outputs.len(), 1);
+    assert_eq!(history.outputs[0].pool, "ironwood");
+    assert!(history.outputs[0].spent);
+}
+
+#[test]
+fn receipt_rejects_pools_other_than_orchard_and_ironwood() {
+    let fixture = Fixture::new();
+    fixture.insert_received(1, 0, false);
+    let mut output =
+        read_wallet_history(&fixture.wallet_path, &fixture.params, &fixture.account_id)
+            .expect("project Orchard history")
+            .outputs
+            .remove(0);
+    output.pool = "sapling".to_owned();
+    assert!(super::receipt_from_output(output, &fixture.account_id).is_none());
 }

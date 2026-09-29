@@ -189,7 +189,116 @@ export function normalizeRegtestBirthdayTree(value: unknown): BirthdayTree {
   return { ...tree, network: 'regtest' } as BirthdayTree;
 }
 
+/** `zcash_protocol` 0.10.6 `TestNetwork` activation heights. Not copied from a node. */
+export const TESTNET_ACTIVATIONS: Required<ActivationSchedule> = {
+  overwinter: 207_500,
+  sapling: 280_000,
+  blossom: 584_000,
+  heartwood: 903_800,
+  canopy: 1_028_500,
+  nu5: 1_842_420,
+  nu6: 2_976_000,
+  'nu6-1': 3_536_500,
+  'nu6-2': 4_052_000,
+  'nu6-3': 4_134_000,
+};
+
+export type ProvisionerArgs =
+  | { network: 'regtest'; config: string; rpc: string; dashboard: string; lightwalletd: string; sourceId: string }
+  | { network: 'test'; config: string; lightwalletd: string; sourceId: string; genesisHash: string };
+
+function flagValues(argv: readonly string[]): Map<string, string> {
+  const flags = new Map<string, string>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!flag?.startsWith('--') || !value || value.startsWith('--') || flags.has(flag)) {
+      throw new Error('invalid provisioner arguments');
+    }
+    flags.set(flag, value);
+    index += 1;
+  }
+  return flags;
+}
+
+function requiredFlag(flags: Map<string, string>, name: string): string {
+  const value = flags.get(name);
+  if (!value) throw new Error('invalid provisioner arguments');
+  return value;
+}
+
+/** Parses the provisioner CLI. `test` does not require an owned node RPC. */
+export function parseProvisionerArgs(argv: readonly string[]): ProvisionerArgs {
+  const flags = flagValues(argv);
+  const network = flags.get('--network') ?? 'regtest';
+  if (network !== 'regtest' && network !== 'test') throw new Error('scanner network is not permitted');
+  const config = requiredFlag(flags, '--config');
+  const lightwalletd = requiredFlag(flags, '--lightwalletd');
+  const sourceId = requiredFlag(flags, '--source-id');
+  if (network === 'test') {
+    const genesisHash = requiredFlag(flags, '--genesis-hash');
+    if (!/^[0-9a-f]{64}$/.test(genesisHash)) throw new Error('runtime chain identity is invalid');
+    if (!lightwalletd.startsWith('https://')) throw new Error('plaintext lightwalletd endpoint is not allowed');
+    for (const name of flags.keys()) {
+      if (!['--network', '--config', '--lightwalletd', '--source-id', '--genesis-hash'].includes(name)) {
+        throw new Error('invalid provisioner arguments');
+      }
+    }
+    return { network, config, lightwalletd, sourceId, genesisHash };
+  }
+  return {
+    network,
+    config,
+    rpc: requiredFlag(flags, '--rpc'),
+    dashboard: requiredFlag(flags, '--dashboard'),
+    lightwalletd,
+    sourceId,
+  };
+}
+
+export function buildTestnetRuntimeConfig(
+  base: BaseConfig,
+  input: { sourceId: string; genesisHash: string; lightwalletd: string },
+) {
+  if (!/^[0-9a-f]{64}$/.test(input.genesisHash) || input.sourceId.length === 0) {
+    throw new Error('runtime chain identity is invalid');
+  }
+  if (!input.lightwalletd.startsWith('https://')) throw new Error('plaintext lightwalletd endpoint is not allowed');
+  return {
+    ufvk: base.ufvk,
+    birthday: base.birthday,
+    runtime: {
+      sourceId: input.sourceId,
+      chain: {
+        network: 'test' as const,
+        genesisHash: input.genesisHash,
+        consensusFingerprint: consensusFingerprint('test', TESTNET_ACTIVATIONS),
+      },
+      lightwalletd: input.lightwalletd,
+      activations: TESTNET_ACTIVATIONS,
+    },
+  };
+}
+
+/** Writes a testnet `scanner.json` at mode 0600. Birthday tree is fetched by `init-view`. */
+export async function writeTestnetScannerConfig(
+  path: string,
+  input: { sourceId: string; genesisHash: string; lightwalletd: string },
+): Promise<void> {
+  const raw = await readPrivateBaseConfig(path);
+  const base = validateProvisioningInput(raw, raw.birthday);
+  await writePrivateConfig(path, buildTestnetRuntimeConfig(base, input));
+}
+
+
 async function main(): Promise<void> {
+  if (process.argv.includes('--network') && argument('--network') === 'test') {
+    const parsed = parseProvisionerArgs(process.argv.slice(2));
+    if (parsed.network !== 'test') throw new Error('scanner network is not permitted');
+    await writeTestnetScannerConfig(parsed.config, parsed);
+    process.stdout.write('status=SCANNER_RUNTIME_PROVISIONED fields=runtime network=test\n');
+    return;
+  }
   const config = argument('--config');
   const rpcEndpoint = argument('--rpc');
   const dashboard = argument('--dashboard');

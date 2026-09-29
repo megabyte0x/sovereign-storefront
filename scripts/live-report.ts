@@ -36,6 +36,18 @@ export const WORKFLOW_STAGE_IDS = [
 
 export const TESTNET_STAGE_ID = 'T01' as const;
 export const MIN_CONFIRMATIONS = 10;
+/** D8=b. Public T01 is three confirmations, not the regtest floor of 10. */
+export const PUBLIC_MIN_CONFIRMATIONS = 3;
+export const PUBLIC_STAGE_IDS = [
+  'embed-invoice',
+  'receipt-observed',
+  'three-confirmations',
+  'bytes-match',
+  'recover-without-repay',
+  'restart-between',
+  'origin-stop',
+  'funds-received',
+] as const;
 
 export type LMatrixId = (typeof L_MATRIX_IDS)[number];
 export type WorkflowStageId = (typeof WORKFLOW_STAGE_IDS)[number];
@@ -44,7 +56,7 @@ export type RequiredStageId = LMatrixId | WorkflowStageId;
 export type LiveStageStatus = 'PASS' | 'FAIL' | 'SKIP' | 'NOT_RUN';
 
 export type LiveStage = {
-  id: RequiredStageId;
+  id: RequiredStageId | (typeof PUBLIC_STAGE_IDS)[number];
   status: LiveStageStatus;
   evidence?: string[];
   reason?: string;
@@ -77,7 +89,8 @@ export type BuildProvenance = {
 export type LiveReport = {
   schemaVersion: typeof LIVE_REPORT_SCHEMA_VERSION;
   liveAttempted: true;
-  network: 'regtest';
+  profile?: 'public';
+  network: 'regtest' | 'test';
   build: BuildProvenance;
   scanner: AdapterIdentity;
   storage: AdapterIdentity;
@@ -155,7 +168,7 @@ function validateBuild(value: unknown, errors: string[]): void {
   }
 }
 
-function validateTestnetStage(stage: Record<string, unknown>, errors: string[]): void {
+function validateTestnetStage(stage: Record<string, unknown>, errors: string[], minConfirmations = MIN_CONFIRMATIONS): void {
   if (stage.status === 'NOT_RUN') {
     if (!nonEmptyString(stage.reason)) errors.push('T01: NOT_RUN requires a reason');
     return;
@@ -175,9 +188,48 @@ function validateTestnetStage(stage: Record<string, unknown>, errors: string[]):
     if (!nonEmptyString(block[key])) errors.push(`T01.testnet.${key}: required`);
   }
   if (typeof block.txid !== 'string' || !HEX64.test(block.txid)) errors.push('T01.testnet.txid: must be a 64-hex txid');
-  if (typeof block.confirmations !== 'number' || !Number.isInteger(block.confirmations) || block.confirmations < MIN_CONFIRMATIONS) {
-    errors.push(`T01.testnet.confirmations: must be an integer >= ${MIN_CONFIRMATIONS}`);
+  if (typeof block.confirmations !== 'number' || !Number.isInteger(block.confirmations) || block.confirmations < minConfirmations) {
+    errors.push(`T01.testnet.confirmations: must be an integer >= ${minConfirmations}`);
   }
+}
+
+function validatePublicStages(value: unknown, errors: string[]): void {
+  if (!Array.isArray(value)) {
+    errors.push('stages: must be an array');
+    return;
+  }
+  const seen = new Set<string>();
+  for (const [index, stage] of value.entries()) {
+    if (!isRecord(stage) || typeof stage.id !== 'string') {
+      errors.push(`stages[${index}]: must be an object with a string id`);
+      continue;
+    }
+    const { id } = stage;
+    const known = id === TESTNET_STAGE_ID || (PUBLIC_STAGE_IDS as readonly string[]).includes(id);
+    if (!known) {
+      errors.push(`stages[${index}]: unknown public stage id '${id}'`);
+      continue;
+    }
+    if (seen.has(id)) {
+      errors.push(`${id}: duplicate stage`);
+      continue;
+    }
+    seen.add(id);
+    if (id === TESTNET_STAGE_ID) {
+      validateTestnetStage(stage, errors, PUBLIC_MIN_CONFIRMATIONS);
+      if (stage.status !== 'PASS') errors.push('T01: public success requires PASS');
+      continue;
+    }
+    if (stage.status !== 'PASS') {
+      errors.push(`${id}: status ${String(stage.status)} is not PASS`);
+      continue;
+    }
+    if (!nonEmptyEvidence(stage.evidence)) errors.push(`${id}: PASS requires non-empty evidence`);
+  }
+  for (const id of PUBLIC_STAGE_IDS) {
+    if (!seen.has(id)) errors.push(`${id}: required public stage missing`);
+  }
+  if (!seen.has(TESTNET_STAGE_ID)) errors.push('T01: row missing');
 }
 
 function validateStages(value: unknown, errors: string[]): void {
@@ -223,11 +275,17 @@ export function validateLiveReport(value: unknown): LiveReportValidation {
   if (value.schemaVersion !== LIVE_REPORT_SCHEMA_VERSION) errors.push(`schemaVersion: must be ${LIVE_REPORT_SCHEMA_VERSION}`);
   if (value.liveAttempted !== true) errors.push('liveAttempted: must be true');
   if ('synthetic' in value && value.synthetic !== false) errors.push('synthetic: a synthetic report is never live evidence');
-  if (value.network !== 'regtest') errors.push('network: L evidence must come from the local regtest network');
   validateBuild(value.build, errors);
   validateAdapter('scanner', value.scanner, errors);
   validateAdapter('storage', value.storage, errors);
   validateAdapter('messaging', value.messaging, errors);
+  if (value.profile === 'public') {
+    if (value.network !== 'test') errors.push('network: public evidence must be test');
+    validatePublicStages(value.stages, errors);
+    return { ok: errors.length === 0, errors };
+  }
+  if (value.profile !== undefined) errors.push('profile: must be public or omitted');
+  if (value.network !== 'regtest') errors.push('network: L evidence must come from the local regtest network');
   validateStages(value.stages, errors);
   return { ok: errors.length === 0, errors };
 }

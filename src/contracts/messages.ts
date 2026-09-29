@@ -21,7 +21,7 @@ export type SellerResponse = {
   | { type: 'status'; orderId: string; status: OrderStatus }
   | { type: 'delivery'; packageId: string; package: DeliveryPackage }
   | { type: 'acknowledged'; orderId: string; packageId: string }
-  | { type: 'error'; code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible' }
+  | { type: 'error'; code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible' | 'rate_limited' }
 );
 export type AuthenticatedRequest = { signerKeyId: string; body: BuyerRequest };
 export type DecodedWakuMessage = {
@@ -168,7 +168,7 @@ function validateResponse(value: Row): SellerResponse {
       identifier(value.orderId, 'orderId'); identifier(value.packageId, 'packageId'); break;
     case 'error':
       exactKeys(value, ['version', 'messageId', 'inReplyTo', 'sellerKeyId', 'buyerKeyId', 'network', 'issuedAt', 'expiresAt', 'type', 'code'], 'error');
-      if (!['unavailable', 'invalid', 'forbidden', 'not_eligible'].includes(String(value.code))) fail('code'); break;
+      if (!['unavailable', 'invalid', 'forbidden', 'not_eligible', 'rate_limited'].includes(String(value.code))) fail('code'); break;
     default: fail('type');
   }
   return value as SellerResponse;

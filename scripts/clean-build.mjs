@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,6 +32,7 @@ function sourceFiles(directory) {
 function buildSourceManifest() {
   const buildInputs = [
     'index.html',
+    'checkout.html',
     'package.json',
     'package-lock.json',
     'scripts/clean-build.mjs',
@@ -67,6 +68,20 @@ function snapshotsMatch(initialSnapshot, finalSnapshot) {
     && initialSnapshot.sourceManifestDigest === finalSnapshot.sourceManifestDigest;
 }
 
+function setPublicBuildPermissions(directory) {
+  chmodSync(directory, 0o755);
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      setPublicBuildPermissions(path);
+    } else if (entry.isFile()) {
+      chmodSync(path, 0o644);
+    } else {
+      throw new Error(`unexpected build artifact type: ${relative(root, path)}`);
+    }
+  }
+}
+
 function adapterEntrypoints(manifest) {
   return manifest
     .map(({ path }) => path)
@@ -99,3 +114,4 @@ const buildInfo = {
 };
 
 writeFileSync('dist/build-info.json', `${JSON.stringify(buildInfo, null, 2)}\n`, 'utf8');
+setPublicBuildPermissions(resolve(root, 'dist'));

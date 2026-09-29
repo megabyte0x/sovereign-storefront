@@ -1,0 +1,39 @@
+{
+  "subtask": "fix1",
+  "status": "done",
+  "changed_files": [
+    "tools/buyer-sender/src/state.rs",
+    "tools/buyer-sender/src/pay.rs",
+    "tools/buyer-sender/src/main.rs",
+    "scripts/public-t01-wallet.ts",
+    "tests/unit/public-t01-wallet.test.ts"
+  ],
+  "commands": [
+    {"cmd": "cargo test --locked --manifest-path tools/buyer-sender/Cargo.toml (log .runtime/public/diag/buyer-sender-fix1-test.log)", "exit": 0},
+    {"cmd": "cargo clippy --locked --manifest-path tools/buyer-sender/Cargo.toml --all-targets -- -D warnings", "exit": 0},
+    {"cmd": "rustfmt --edition 2024 --check tools/buyer-sender/src/*.rs", "exit": 0},
+    {"cmd": "npx vitest run tests/unit/public-t01-wallet.test.ts tests/unit/public-t01.test.ts", "exit": 0},
+    {"cmd": "npx tsc --noEmit", "exit": 0}
+  ],
+  "evidence": [
+    "cargo test: 34 passed; 0 failed (new: state::tests::write_attempt_creates_attempts_dir_and_syncs_without_error, state::tests::read_attempt_reports_unreadable_entries_distinctly, state::tests::attempt_debug_redacts_raw_hex, tests::unreadable_attempt_exits_3_without_chain, tests::chain_failures_with_recorded_attempt_exit_3)",
+    "vitest: 2 files, 51 tests passed (wallet file 38)",
+    "I-1 fsync itself is not observable in a unit test; the test only proves the synced write path still succeeds on a fresh root (attempts/ created 0700) and an existing attempts/ (files 0600, readable)"
+  ],
+  "findings": {
+    "I-1": "tools/buyer-sender/src/state.rs:95 sync_dir_of (reopen /proc/self/fd/N dir, sync_all); root fsync after new attempts/ at state.rs:289; attempts/ fsync after file at state.rs:324 (file removed + exit-2 error if dir fsync fails, pre-broadcast)",
+    "I-2": "scripts/public-t01-wallet.ts:351 refuses any existing record for the digest ('request a new invoice'); test tests/unit/public-t01-wallet.test.ts:222 (expired re-send refused, no pay/any call) + test.each sent/expired + pending-unresolved refusal",
+    "I-3": "tools/buyer-sender/src/state.rs:75 AttemptReadError{InvalidId,Unreadable}, read_attempt state.rs:333; pay.rs:178 attempt_read_failure maps Unreadable -> (3,'attempt file is unreadable') for pay_guard and recorded_attempt; test main.rs unreadable_attempt_exits_3_without_chain (PanicChain calls == 0)",
+    "I-4": "tools/buyer-sender/src/state.rs:58 manual Debug for Attempt, raw_hex -> '<redacted>'; test state::tests::attempt_debug_redacts_raw_hex",
+    "M1": "tools/buyer-sender/src/pay.rs:346 unknown() -> exit 3 for tx-status (pay.rs:360-364) and rebroadcast (pay.rs:388-389) connect/tip failures; test main.rs chain_failures_with_recorded_attempt_exit_3; TS confirm test public-t01-wallet.test.ts:321",
+    "M2": "scripts/public-t01-wallet.ts:222 requires json.attemptId === record.invoiceDigest before adopting txid/expiry/state; tests public-t01-wallet.test.ts:335 (resolve) and :350 (pay output mismatch)",
+    "M3": "tests/unit/public-t01-wallet.test.ts:300,312 exit-4 fixtures now payOk(digest,'unknown',4); mempool case asserts txid+expiryHeight recorded"
+  },
+  "deviations": [
+    "PrivateDir (scanner private_fs.rs, not owned) exposes no fd accessor, so directory fsync reopens the held descriptor via its /proc/self/fd/N path (same mechanism as proc_path) and calls File::sync_all.",
+    "I-3 also maps attempt-read failures that happen while opening attempts/ (e.g. unsafe attempts/ dir) to exit 3, since an attempt may exist behind it.",
+    "tx-status/rebroadcast 'attempt file is invalid' (unparseable txid/raw_hex in a readable file) also moved to exit 3 for consistency with I-3; rebroadcast 'attempt has expired' stays exit 2 as before.",
+    "Existing test 'an expired attempt does not block...' now uses a different invoice's digest for the expired record (same-digest re-send is now refused by I-2); renamed accordingly.",
+    "Rust files were reformatted with rustfmt --edition 2024 (only touched files)."
+  ]
+}

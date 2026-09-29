@@ -1,0 +1,22 @@
+{"subtask":"6.1","status":"blocked",
+ "blocked_reason":"All 29 tests pass, but the clippy gate fails on 3 pre-existing lints in non-test code that 6.1 may not edit (main.rs:225, main.rs:308 ptr_arg; pay.rs:281 drop_non_drop). My test modules add no clippy findings.",
+ "failing_command":"cargo clippy --locked --manifest-path tools/buyer-sender/Cargo.toml -- -D warnings",
+ "changed_files":["tools/buyer-sender/src/state.rs","tools/buyer-sender/src/chain.rs","tools/buyer-sender/src/pay.rs","tools/buyer-sender/src/main.rs"],
+ "commands":[
+  {"cmd":"cargo test --locked --manifest-path tools/buyer-sender/Cargo.toml (log .runtime/public/diag/buyer-sender-6.1.log)","exit":0},
+  {"cmd":"cargo clippy --locked --manifest-path tools/buyer-sender/Cargo.toml -- -D warnings (log .runtime/public/diag/buyer-sender-6.1-clippy.log)","exit":101},
+  {"cmd":"cargo clippy --locked --manifest-path tools/buyer-sender/Cargo.toml --all-targets -- -D warnings","exit":101}
+ ],
+ "evidence":[
+  "test result: ok. 29 passed; 0 failed; 0 ignored",
+  "clippy: only 3 findings, all outside #[cfg(test)]: main.rs:225:20 and main.rs:308:15 (&PathBuf -> &Path), pay.rs:281:5 (drop(spending_keys) on a type without Drop impl)",
+  "decode_status runs against a real v5 tx built with TransactionData::from_parts(V5, Nu5, ...).freeze(), so it needs no feature-gated helpers and no dev-dependency",
+  "PanicChain factory: pay guard (exit 4), pay refusals (exit 2), tx-status/rebroadcast missing attempt (exit 2 'no attempt recorded') and status without seed all leave calls==0",
+  "Temp roots under std::env::temp_dir() are removed on Drop; none were left after the run"
+ ],
+ "deviations":[
+  {"file":"tools/buyer-sender/src/main.rs","line":225,"text":"mnemonic_file: &PathBuf","why":"Pre-existing clippy::ptr_arg in non-test code, so the clippy gate fails; the fix is &Path. It is outside 6.1's Owns, so I left it."},
+  {"file":"tools/buyer-sender/src/main.rs","line":308,"text":"uri_file: &PathBuf","why":"Same ptr_arg lint; the fix is &Path. Outside Owns."},
+  {"file":"tools/buyer-sender/src/pay.rs","line":281,"text":"drop(spending_keys);","why":"Pre-existing clippy::drop_non_drop. The fix is to remove the line or put the keys in an inner scope (SpendingKeys has no Drop impl, so this drop does nothing). Outside Owns."}
+ ],
+ "notes_for_next_subtask":"Test helpers (cfg(test), pub(crate)): state::tests::{TempRoot::new(tag)/state_path()/open()/write_private(name,bytes), attempt_fixture(id)}, chain::tests::tx_fixture(expiry)->(TxId,Vec<u8>), pay::tests::{valid_invoice()->(uri,id), test_address()}.\nmain::tests::PanicChain implements ChainFactory and panics if connect() is called.\nC2 trailing newline: it fails against the TS digest with ERR_ATTEMPT_ID. With the digest of the exact bytes it is still rejected, but that test only asserts is_err(), not a specific string.\nExtra coverage beyond the brief: argument parsing, flock refusal of a second open, read_uri_file (0644, symlink, missing), the empty-payload/garbage malformed decode, and the u64 height that overflows u32.\nTo make clippy pass, a dev owner must fix main.rs:225 and main.rs:308 (&PathBuf -> &Path) and pay.rs:281 (drop_non_drop). No test changes are needed after that.\nThe Hermes patch-tool lint runs rustc as edition 2015 and reports async fn errors that are false. Cargo (edition 2024) is authoritative."}

@@ -1,0 +1,7 @@
+{
+  // Static ebook demo. No framework, no analytics.
+  // Deploy: npx wrangler pages deploy demo/ebook-shop --project-name sovereign-store
+  "name": "sovereign-store",
+  "compatibility_date": "2026-09-26",
+  "pages_build_output_dir": "."
+}

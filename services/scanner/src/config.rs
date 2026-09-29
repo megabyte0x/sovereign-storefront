@@ -1,4 +1,9 @@
-//! Runtime-observed local-regtest activation handling.
+//! Runtime-observed regtest and public-testnet activation handling.
+//!
+//! Regtest keeps the operator-supplied `LocalNetwork` schedule. Public testnet
+//! uses `zcash_protocol::consensus::Network::TestNetwork` so a `uviewtest` UFVK
+//! can import. `LocalNetwork::network_type` is always regtest, so copied heights
+//! cannot stand in for testnet.
 
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -6,7 +11,10 @@ use crate::{allocate::ChainIdentity, lease::WriterLease, private_fs::private_par
 
 use zcash_client_backend::{data_api::AccountBirthday, proto::service::TreeState};
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::local_consensus::LocalNetwork;
+use zcash_protocol::{
+    consensus::{BlockHeight, Network, NetworkType, NetworkUpgrade, Parameters},
+    local_consensus::LocalNetwork,
+};
 
 const NAMES: [&str; 10] = [
     "overwinter",
@@ -128,17 +136,102 @@ impl ActivationHeights {
     }
 }
 
-/// Decodes a ZIP-316 UFVK against the observed regtest parameters and requires
+const TESTNET_UPGRADES: [(&str, NetworkUpgrade); 10] = [
+    ("overwinter", NetworkUpgrade::Overwinter),
+    ("sapling", NetworkUpgrade::Sapling),
+    ("blossom", NetworkUpgrade::Blossom),
+    ("heartwood", NetworkUpgrade::Heartwood),
+    ("canopy", NetworkUpgrade::Canopy),
+    ("nu5", NetworkUpgrade::Nu5),
+    ("nu6", NetworkUpgrade::Nu6),
+    ("nu6-1", NetworkUpgrade::Nu6_1),
+    ("nu6-2", NetworkUpgrade::Nu6_2),
+    ("nu6-3", NetworkUpgrade::Nu6_3),
+];
+
+/// Consensus parameters for a scanner runtime.
+///
+/// Regtest carries the observed local schedule. Testnet is the built-in
+/// `Network::TestNetwork` and never a `LocalNetwork` with copied heights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerParams {
+    Regtest(LocalNetwork),
+    Test(Network),
+}
+
+impl Parameters for ScannerParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            Self::Regtest(params) => params.network_type(),
+            Self::Test(params) => params.network_type(),
+        }
+    }
+
+    fn activation_height(&self, upgrade: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            Self::Regtest(params) => params.activation_height(upgrade),
+            Self::Test(params) => params.activation_height(upgrade),
+        }
+    }
+}
+
+impl ScannerParams {
+    /// Public testnet parameters. Mainnet is not constructible here.
+    pub fn test_network() -> Self {
+        Self::Test(Network::TestNetwork)
+    }
+
+    pub fn network_name(&self) -> &'static str {
+        match self.network_type() {
+            NetworkType::Regtest => "regtest",
+            NetworkType::Test => "test",
+            NetworkType::Main => "main",
+        }
+    }
+}
+
+fn permitted_network(network: &str) -> Result<NetworkType, &'static str> {
+    match network {
+        "regtest" => Ok(NetworkType::Regtest),
+        "test" => Ok(NetworkType::Test),
+        _ => Err("scanner network is not permitted"),
+    }
+}
+
+/// Public testnet heights are fixed by `Network::TestNetwork`. A config that
+/// disagrees cannot be scanned with those parameters.
+fn testnet_schedule_matches(observed: &ActivationHeights) -> bool {
+    TESTNET_UPGRADES.into_iter().all(|(name, upgrade)| {
+        let expected = Network::TestNetwork
+            .activation_height(upgrade)
+            .map(u32::from);
+        observed.value(name) == Some(expected)
+    })
+}
+
+/// Decodes a ZIP-316 UFVK against the named network's parameters and requires
 /// its real Orchard component before any wallet import is attempted.
-pub fn decode_regtest_orchard_ufvk(
-    params: &LocalNetwork,
+pub fn decode_orchard_ufvk(
+    params: &impl Parameters,
+    network: &str,
     encoded: &str,
 ) -> Result<UnifiedFullViewingKey, &'static str> {
+    if params.network_type() != permitted_network(network)? {
+        return Err("viewing key cannot be decoded for this network");
+    }
     let key = UnifiedFullViewingKey::decode(params, encoded)
         .map_err(|_| "viewing key cannot be decoded for this network")?;
     key.orchard()
         .ok_or("viewing key has no Orchard capability")?;
     Ok(key)
+}
+
+/// Regtest specialization kept for existing callers outside this change.
+pub fn decode_regtest_orchard_ufvk(
+    params: &LocalNetwork,
+    encoded: &str,
+) -> Result<UnifiedFullViewingKey, &'static str> {
+    decode_orchard_ufvk(params, "regtest", encoded)
 }
 
 /// Accepts TLS transport for any non-empty authority, and plaintext only when
@@ -244,7 +337,7 @@ pub struct RuntimePaths {
     pub application_db_path: PathBuf,
     pub socket_path: PathBuf,
     pub ufvk: String,
-    pub params: LocalNetwork,
+    pub params: ScannerParams,
     pub birthday: AccountBirthday,
     pub birthday_attestation: BirthdayAttestation,
     pub source_id: String,
@@ -356,7 +449,8 @@ pub fn open_runtime_paths(path: &std::path::Path) -> Result<RuntimePaths, &'stat
         .ok_or("scanner runtime configuration is missing")?;
     let observed = ActivationHeights::from_config(&runtime.activations)?;
     runtime.chain.validate()?;
-    if runtime.chain.network != "regtest" || runtime.source_id.is_empty() {
+    if !matches!(runtime.chain.network.as_str(), "regtest" | "test") || runtime.source_id.is_empty()
+    {
         return Err("scanner runtime configuration is unsupported");
     }
     // The fingerprint is derived, never trusted: a value that does not bind
@@ -367,7 +461,12 @@ pub fn open_runtime_paths(path: &std::path::Path) -> Result<RuntimePaths, &'stat
         return Err("scanner consensus fingerprint does not match activation parameters");
     }
     validate_lightwalletd_endpoint(&runtime.lightwalletd)?;
-    let params = observed.local_network();
+    let params = match runtime.chain.network.as_str() {
+        "regtest" => ScannerParams::Regtest(observed.local_network()),
+        "test" if testnet_schedule_matches(&observed) => ScannerParams::test_network(),
+        "test" => return Err("scanner testnet activation heights do not match TestNetwork"),
+        _ => return Err("scanner runtime configuration is unsupported"),
+    };
     let (birthday, birthday_attestation) = validated_birthday(&opened.config, &runtime.chain)?;
     let source_id = runtime.source_id.clone();
     let chain = runtime.chain.clone();
@@ -375,7 +474,7 @@ pub fn open_runtime_paths(path: &std::path::Path) -> Result<RuntimePaths, &'stat
     let ufvk = opened.config.ufvk.clone();
     // Reject an encoded key for another network, or a UFVK without Orchard,
     // before creating the scanner runtime directory or either database file.
-    decode_regtest_orchard_ufvk(&params, &ufvk)?;
+    decode_orchard_ufvk(&params, &runtime.chain.network, &ufvk)?;
     let state = opened
         .parent
         .open_or_create_child(&format!(".{}.live-state", opened.name))
@@ -413,7 +512,7 @@ fn validated_birthday(
         .as_ref()
         .ok_or("scanner birthday tree state is missing")?;
     if tree.network != chain.network
-        || tree.network != "regtest"
+        || permitted_network(&tree.network).is_err()
         || tree.height.checked_add(1) != Some(u64::from(config.birthday))
         || !is_lower_hex(&tree.hash, 32)
     {
@@ -438,4 +537,196 @@ fn is_lower_hex(value: &str, bytes: usize) -> bool {
 
 pub fn read_private_config(path: &std::path::Path) -> Result<PrivateScannerConfig, &'static str> {
     Ok(open_private_config(path)?.config)
+}
+
+/// A testnet config that still needs `GetTreeState(birthday-1)` over TLS.
+/// Operator-attested configs, including regtest, are not pending.
+pub(crate) struct PendingTestnetBirthday {
+    pub endpoint: String,
+    pub birthday: u32,
+}
+
+pub(crate) fn pending_testnet_birthday(
+    path: &std::path::Path,
+) -> Result<Option<PendingTestnetBirthday>, &'static str> {
+    let opened = match open_private_config(path) {
+        Ok(opened) => opened,
+        Err(_) => return Ok(None),
+    };
+    let Some(runtime) = opened.config.runtime.as_ref() else {
+        return Ok(None);
+    };
+    if runtime.chain.network != "test" || opened.config.birthday_tree.is_some() {
+        return Ok(None);
+    }
+    validate_lightwalletd_endpoint(&runtime.lightwalletd)?;
+    if !runtime.lightwalletd.starts_with("https://") {
+        return Err("scanner birthday tree state must be fetched over TLS");
+    }
+    if opened.config.birthday == 0 {
+        return Err("scanner birthday cannot be genesis");
+    }
+    Ok(Some(PendingTestnetBirthday {
+        endpoint: runtime.lightwalletd.clone(),
+        birthday: opened.config.birthday,
+    }))
+}
+
+/// Accepts a lightwalletd `TreeState` only when it is the block before `birthday`
+/// on the named network. The block hash is stored lowercase.
+pub fn trusted_birthday_from_tree_state(
+    tree: &TreeState,
+    network: &str,
+    birthday: u32,
+) -> Result<TrustedBirthdayTreeState, &'static str> {
+    permitted_network(network)?;
+    let hash = tree.hash.to_ascii_lowercase();
+    if tree.network != network
+        || tree.height.checked_add(1) != Some(u64::from(birthday))
+        || !is_lower_hex(&hash, 32)
+    {
+        return Err("scanner birthday tree state is invalid");
+    }
+    Ok(TrustedBirthdayTreeState {
+        network: network.to_owned(),
+        height: tree.height,
+        hash,
+        time: tree.time,
+        sapling_tree: tree.sapling_tree.clone(),
+        orchard_tree: tree.orchard_tree.clone(),
+        ironwood_tree: tree.ironwood_tree.clone(),
+    })
+}
+
+/// Writes the fetched tree into the private config so later opens use the
+/// operator-attested path. An existing tree is not overwritten.
+pub(crate) fn write_fetched_birthday_tree(
+    path: &std::path::Path,
+    tree: &TrustedBirthdayTreeState,
+) -> Result<(), &'static str> {
+    let (parent, name) = private_parent(path).map_err(|_| "scanner config boundary is unsafe")?;
+    let name = name
+        .into_string()
+        .map_err(|_| "scanner config name is invalid")?;
+    let bytes = parent
+        .read_file(&name)
+        .map_err(|_| "scanner config cannot be read safely")?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "scanner config is invalid")?;
+    let object = value.as_object_mut().ok_or("scanner config is invalid")?;
+    if object
+        .get("birthdayTree")
+        .is_some_and(|existing| !existing.is_null())
+    {
+        return Err("scanner birthday tree state is already attested");
+    }
+    object.insert(
+        "birthdayTree".to_owned(),
+        serde_json::to_value(tree).map_err(|_| "scanner birthday tree state is invalid")?,
+    );
+    let mut encoded =
+        serde_json::to_vec(&value).map_err(|_| "scanner birthday tree state is invalid")?;
+    encoded.push(b'\n');
+    parent
+        .write_file_atomic(&name, &encoded)
+        .map_err(|_| "scanner birthday tree state cannot persist")
+}
+
+/// `init-view --network test --lightwalletd URL --birthday H --config FILE`.
+/// Flags may appear in any order. Mainnet is rejected.
+pub fn parse_testnet_init_view_args(
+    args: &[String],
+) -> Result<(std::path::PathBuf, String, u32), &'static str> {
+    let mut network = None;
+    let mut lightwalletd = None;
+    let mut birthday = None;
+    let mut config = None;
+    let mut values = args.iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--network" if network.is_none() => network = Some(values.next().map(String::as_str)),
+            "--lightwalletd" if lightwalletd.is_none() => {
+                lightwalletd = Some(values.next().map(String::as_str));
+            }
+            "--birthday" if birthday.is_none() => {
+                birthday = Some(values.next().map(String::as_str))
+            }
+            "--config" if config.is_none() => config = Some(values.next().map(String::as_str)),
+            _ => return Err("scanner runtime initialization failed"),
+        }
+    }
+    if network != Some(Some("test")) {
+        return Err("scanner network is not permitted");
+    }
+    let lightwalletd = lightwalletd
+        .flatten()
+        .filter(|endpoint| !endpoint.is_empty())
+        .ok_or("lightwalletd endpoint scheme is invalid")?;
+    validate_lightwalletd_endpoint(lightwalletd)?;
+    if !lightwalletd.starts_with("https://") {
+        return Err("scanner birthday tree state must be fetched over TLS");
+    }
+    let birthday = birthday
+        .flatten()
+        .ok_or("scanner birthday tree state is invalid")?
+        .parse::<u32>()
+        .map_err(|_| "scanner birthday tree state is invalid")?;
+    if birthday == 0 {
+        return Err("scanner birthday cannot be genesis");
+    }
+    let config = std::path::PathBuf::from(
+        config
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .ok_or("scanner config boundary is unsafe")?,
+    );
+    if !config.is_file() {
+        return Err("scanner config boundary is unsafe");
+    }
+    Ok((config, lightwalletd.to_owned(), birthday))
+}
+
+/// Applies the testnet init-view overrides and clears an attested tree so the
+/// following open fetches `GetTreeState(birthday-1)` for the requested height.
+pub fn apply_testnet_init_view(
+    path: &std::path::Path,
+    lightwalletd: &str,
+    birthday: u32,
+) -> Result<(), &'static str> {
+    validate_lightwalletd_endpoint(lightwalletd)?;
+    if !lightwalletd.starts_with("https://") || birthday == 0 {
+        return Err("scanner birthday tree state must be fetched over TLS");
+    }
+    let (parent, name) = private_parent(path).map_err(|_| "scanner config boundary is unsafe")?;
+    let name = name
+        .into_string()
+        .map_err(|_| "scanner config name is invalid")?;
+    let bytes = parent
+        .read_file(&name)
+        .map_err(|_| "scanner config cannot be read safely")?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "scanner config is invalid")?;
+    let object = value.as_object_mut().ok_or("scanner config is invalid")?;
+    let runtime = object
+        .get_mut("runtime")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("scanner runtime configuration is missing")?;
+    let chain = runtime
+        .get_mut("chain")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("scanner runtime configuration is missing")?;
+    if chain.get("network").and_then(serde_json::Value::as_str) != Some("test") {
+        return Err("scanner network is not permitted");
+    }
+    runtime.insert(
+        "lightwalletd".to_owned(),
+        serde_json::Value::String(lightwalletd.to_owned()),
+    );
+    object.insert("birthday".to_owned(), serde_json::Value::from(birthday));
+    object.remove("birthdayTree");
+    let mut encoded = serde_json::to_vec(&value).map_err(|_| "scanner config is invalid")?;
+    encoded.push(b'\n');
+    parent
+        .write_file_atomic(&name, &encoded)
+        .map_err(|_| "scanner birthday tree state cannot persist")
 }

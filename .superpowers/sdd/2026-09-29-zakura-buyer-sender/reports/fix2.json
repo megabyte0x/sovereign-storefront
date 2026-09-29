@@ -1,0 +1,18 @@
+{
+  "subtask": "fix2",
+  "status": "done",
+  "changed_files": ["tools/buyer-sender/src/state.rs"],
+  "commands": [
+    {"cmd": "cargo test --locked --manifest-path tools/buyer-sender/Cargo.toml", "exit": 0, "summary": "35 passed; 0 failed"},
+    {"cmd": "cargo clippy --locked --manifest-path tools/buyer-sender/Cargo.toml --all-targets -- -D warnings", "exit": 0},
+    {"cmd": "rustfmt --edition 2024 --check tools/buyer-sender/src/*.rs", "exit": 0}
+  ],
+  "evidence": [
+    "StateDir::attempts() (shared helper used by read_attempt and write_attempt) now checks symlink_metadata on the root proc_path for attempts/ before open_or_create_child; if it was NotFound, it calls sync_dir_of(&attempts_entry) right after creating it, which fsyncs the state root. Inspection errors other than NotFound return 'attempt directory cannot be inspected'.",
+    "The failure mapping is unchanged. read_attempt maps every attempts() error to Unreadable (exit 3). write_attempt propagates it with ? before the file exists, so pay refuses before broadcast (exit 2).",
+    "Removed the dead attempts_created branch from write_attempt. The attempts/ fsync after the file write (and the remove-on-failure) is kept.",
+    "Check-then-create race: the flock held by StateDir excludes other sender processes, so no concurrent creator can make created=false wrong. If the directory is created by a non-sender between the check and the create, open_or_create_child still opens it and verifies it.",
+    "D4 test added: state::tests::guard_first_read_then_write_on_fresh_root_succeeds. On a fresh root it asserts attempts/ is absent, read_attempt returns Ok(None) and creates attempts/ as a 0700 dir, write_attempt succeeds, attempts/ is still 0700, the file is a regular file with mode 0600, and read_attempt returns Some(attempt). A test cannot observe fsync; the test comment says so."
+  ],
+  "deviations": []
+}

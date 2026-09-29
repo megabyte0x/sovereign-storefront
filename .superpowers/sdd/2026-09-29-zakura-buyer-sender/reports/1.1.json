@@ -1,0 +1,22 @@
+{"subtask":"1.1","status":"done",
+ "changed_files":["tools/buyer-sender/Cargo.toml","tools/buyer-sender/Cargo.lock","tools/buyer-sender/src/main.rs"],
+ "commands":[
+  {"cmd":"cp services/scanner/Cargo.lock tools/buyer-sender/Cargo.lock","exit":0},
+  {"cmd":"cargo check --manifest-path tools/buyer-sender/Cargo.toml > .runtime/public/diag/buyer-sender-1.1.log 2>&1","exit":0},
+  {"cmd":"cargo check --locked --manifest-path tools/buyer-sender/Cargo.toml","exit":0},
+  {"cmd":"cargo tree --manifest-path tools/buyer-sender/Cargo.toml -d -e normal | grep -E '^(zakura|zcash|orchard|sapling|halo2)'","exit":1},
+  {"cmd":"diff <(grep -A1 '^name = \"zakura' services/scanner/Cargo.lock) <(grep -A1 '^name = \"zakura' tools/buyer-sender/Cargo.lock)","exit":0},
+  {"cmd":"git check-ignore -v tools/buyer-sender/target/x","exit":1}
+ ],
+ "evidence":[
+  "cargo check (unlocked and --locked) exit 0, no error/warning lines in log",
+  "cargo tree -d: no duplicate zakura/zcash/orchard/sapling/halo2 crates",
+  "zakura lock entries identical to scanner lock (diff empty)",
+  "lock (name,version) additions only: bip39 2.2.2, bitcoin_hashes 0.14.101, hex-conservative 0.2.3, unicode-normalization 0.1.25, ssf-buyer-sender; no existing crate got a new version (scanner dev-only deps like proptest pruned)",
+  "zero scanner edits (C5 held)"
+ ],
+ "deviations":[
+  {"file":".gitignore","line":9,"text":"tools/buyer-sender/target/ is NOT ignored (only services/scanner, services/test-wallet, tools/payment-test-wallet targets are)","why":"brief step 7: report, do not edit; orchestrator should add `tools/buyer-sender/target/` after line 9 before any commit"}
+ ],
+ "notes_for_next_subtask":"Package/bin ssf-buyer-sender; scanner lib crate is `sovereign-storefront-scanner` (import as `sovereign_storefront_scanner::...`).\nDep renames match scanner: zcash_client_backend=zakura-client-backend, zcash_client_sqlite=zakura-client-sqlite, zcash_keys=zakura-keys, zcash_primitives=zakura-primitives, zakura_pczt, zcash_proofs=zakura-proofs (bundled-prover,multicore), orchard=zakura-orchard.\nWalletDb type pattern: WalletDb<Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>> using getrandom::SysRng, rand_core::UnwrapErr, zcash_client_sqlite::util::SystemClock — getrandom/rand_core included.\nasync-trait (scanner dep) NOT added; add if needed (=0.1.92, already in lock).\nsrc/main.rs is placeholder `fn main() {}`. tools/buyer-sender/target/ exists and is untracked-not-ignored."
+}

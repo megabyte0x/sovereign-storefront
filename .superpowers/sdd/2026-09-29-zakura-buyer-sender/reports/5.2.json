@@ -1,0 +1,17 @@
+{"subtask":"5.2","status":"done",
+ "changed_files":["scripts/public-t01-live.ts","scripts/public-t01.ts","docs/superpowers/plans/2026-09-26-public-testnet-hosting/README.md"],
+ "commands":[
+  {"cmd":"node --experimental-strip-types -e \"await import('./scripts/public-t01.ts'); await import('./scripts/public-t01-live.ts')\"","exit":0},
+  {"cmd":"grep -rn \"walletStatus\\|spendableZat\" scripts/public-t01-live.ts","exit":0},
+  {"cmd":"git diff --check -- <owned files>","exit":0},
+  {"cmd":"git diff --stat -- <owned files>","exit":0}],
+ "evidence":[
+  "Smoke load exit 0 (5.1's wallet.ts did not yet contain 'resolve' at load time; orchestrator should re-run after 5.1 lands).",
+  "walletStatus reads only status keys spendableZat, sends, pending, remaining (live.ts:366-371, 437-442); 5.1 must keep these.",
+  "git diff --stat is empty: all three owned files are untracked (??) in this worktree, so the diff is not visible to git.",
+  "README: ledger row 5.2g added after 5.2f (line 190); rows 5.2a-5.2f untouched; no new absolute paths.",
+  "WALLET_NAME/WALLET_VERSION set exactly as specified (version 58 chars)."],
+ "deviations":[
+  {"file":"docs/superpowers/plans/2026-09-26-public-testnet-hosting/README.md","line":58,"text":"'pinned testnet CLI wallet' -> 'testnet buyer sender ssf-buyer-sender (replaces zingo-cli; see [plan link])'","why":"The only zingo-cli wallet description outside the frozen 5.2a-f rows is the CUA-scope paragraph; task-5.md (not owned) still describes zingo-cli."},
+  {"file":"scripts/public-t01-live.ts","line":313,"text":"walletSend and WalletSendOptions now exported","why":"test seam for Wave 6 (injectable run, sleep, pollIntervalMs, pollBudgetMs, ledgerPath)"}],
+ "notes_for_next_subtask":"export async function walletSend(uri, options?: WalletSendOptions): Promise<SendResult> in scripts/public-t01-live.ts.\nWalletSendOptions = { pollIntervalMs?=30000, pollBudgetMs?=900000, sleep?, ledgerPath?=.runtime/public/buyer-sends.json, run?: typeof runPublicT01Wallet }.\nOn send exit 3: floor(budget/interval) iterations of sleep(interval) -> run(['resolve']) (output discarded, throws swallowed) -> read ledger record with invoiceDigest=sha256(uri) (last match).\nstatus 'sent' + string txid -> {kind:'sent',txid}; status 'expired' -> stop early; else after budget -> {kind:'ambiguous'}. Never calls 'send' again.\nLedger read is a local read-only helper (ledgerRecordFor) because wallet.ts does not export readLedger/invoiceDigest; digest must stay sha256(uri) without trim to match.\nExit 0 / refused paths unchanged. Pre-existing test failure ('display byte order') not touched."}

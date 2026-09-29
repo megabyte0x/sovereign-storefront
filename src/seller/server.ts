@@ -20,7 +20,7 @@ import type {
 } from '../contracts/types.ts';
 import type { ReceiptSource } from '../contracts/live.ts';
 import { MAX_PAYLOAD_BYTES } from '../contracts/validation.ts';
-import { createCiphertextHandler } from '../gateway/ciphertext.ts';
+import { inspectCiphertextPath, createCiphertextHandler, serveCiphertext } from '../gateway/ciphertext.ts';
 import { publishProduct } from './admin.ts';
 import { openCatalogue, type AvailabilityProbes } from './catalogue.ts';
 import { isScannerUnavailable } from './messages.ts';
@@ -29,6 +29,8 @@ import { createFulfillment } from './fulfillment.ts';
 import { loadOrCreateSellerIdentity } from './identity.ts';
 import { createInvoiceIssuer } from './issuance.ts';
 import { createPayments, type Payments } from './payments.ts';
+import { IssuanceLimiter, RateLimitedError } from './orders.ts';
+import { wakuNetworkSettings } from '../adapters/waku.ts';
 
 const PEER_ADDR_RE = /^\/(dns4|dns6|dns|ip4|ip6)\/([^/]+)\/tcp\/([0-9]{1,5})\/(wss|tls\/ws|ws)(?:\/|$)/;
 const CSP_HOST_RE = /^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+$/;
@@ -58,13 +60,13 @@ function peerOrigin(peer: string): string {
 
 /**
  * Content-Security-Policy for the public server. Fixture mode keeps
- * connect-src 'self'; real-demo adds exactly one origin per configured Waku
- * peer (never a wildcard or bare scheme). Throws ConfigError on a peer that
- * would need plain ws:// to a non-loopback host.
+ * connect-src 'self'; real-demo and public-testnet add exactly one origin
+ * per configured Waku peer (never a wildcard or bare scheme). Throws
+ * ConfigError on a peer that would need plain ws:// to a non-loopback host.
  */
 export function buildCsp(config: RuntimeConfig): string {
   const connect = ["'self'"];
-  if (config.mode === 'real-demo') {
+  if (config.mode === 'real-demo' || config.mode === 'public-testnet') {
     for (const peer of config.live?.waku.bootstrapPeers ?? []) {
       const origin = peerOrigin(peer);
       if (!connect.includes(origin)) connect.push(origin);
@@ -83,11 +85,15 @@ export function buildCsp(config: RuntimeConfig): string {
   ].join('; ');
 }
 
-/** Real-demo serves only an explicit built browser directory; fixture keeps its dev fallback. */
+/** Real-demo and public-testnet serve only an explicit built browser directory; fixture keeps its dev fallback. */
+function isLiveSeller(mode: RuntimeConfig['mode']): boolean {
+  return mode === 'real-demo' || mode === 'public-testnet';
+}
+
 function resolvePublicDir(config: RuntimeConfig, explicit: string | undefined): string {
-  if (config.mode === 'real-demo') {
-    if (explicit === undefined) throw new ConfigError('real-demo mode requires an explicit publicDir (built dist/browser)');
-    if (!existsSync(join(explicit, 'index.html'))) throw new ConfigError('real-demo publicDir must contain index.html');
+  if (isLiveSeller(config.mode)) {
+    if (explicit === undefined) throw new ConfigError(`${config.mode} mode requires an explicit publicDir (built dist/browser)`);
+    if (!existsSync(join(explicit, 'index.html'))) throw new ConfigError(`${config.mode} publicDir must contain index.html`);
     return explicit;
   }
   if (explicit !== undefined) return explicit;
@@ -168,6 +174,7 @@ function applySecurityHeaders(res: ServerResponse, csp?: string): void {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('cache-control', 'no-store');
   res.setHeader('referrer-policy', 'no-referrer');
+  res.setHeader('strict-transport-security', 'max-age=31536000');
 }
 
 function send(res: ServerResponse, status: number, body: string | Uint8Array, headers: Record<string, string> = {}): void {
@@ -251,6 +258,45 @@ function contentTypeFor(filePath: string): string {
   }
 }
 
+const PRODUCT_PATH_RE = /^\/api\/products\/([A-Za-z0-9_-]{1,128})$/;
+const CHECKOUT_PATH_RE = /^\/p\/([A-Za-z0-9_-]{1,128})$/;
+
+function escapeAttr(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char] ?? char));
+}
+
+function decorateHtml(html: string, config: RuntimeConfig): string {
+  const origins = config.embed?.allowedEmbedOrigins;
+  const embedOrigins = origins === '*' ? '*' : (origins ?? []).join(',');
+  const attrs = [
+    `data-min-confirmations="${config.minConfirmations}"`,
+    `data-network="${config.productNetwork}"`,
+    `data-embed-origins="${escapeAttr(embedOrigins)}"`,
+    `data-public-origin="${escapeAttr(config.publicOrigin ?? '')}"`,
+  ].join(' ');
+  if (html.includes('id="app"')) {
+    return html.replace(/<main id="app"[^>]*>/, `<main id="app" ${attrs}>`);
+  }
+  return html;
+}
+
+function pageHtml(publicDir: string, config: RuntimeConfig, preferCheckout: boolean): string {
+  const checkoutPath = join(publicDir, 'checkout.html');
+  const indexPath = join(publicDir, 'index.html');
+  const file = preferCheckout && existsSync(checkoutPath) ? checkoutPath : indexPath;
+  const html = existsSync(file)
+    ? readFileSync(file, 'utf8')
+    : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sovereign Storefront</title></head><body><main id="app"></main></body></html>';
+  return decorateHtml(html, config);
+}
+
+
 function safeJoin(root: string, requestPath: string): string | null {
   const relative = requestPath.replace(/^\/+/, '');
   if (relative.includes('\0') || relative.includes('..')) return null;
@@ -266,19 +312,20 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const config: RuntimeConfig = options.sellerKeyId === undefined
     ? options.config
     : { ...options.config, sellerKeyId: options.sellerKeyId };
-  if (config.mode === 'real-demo') {
+  const liveSeller = isLiveSeller(config.mode);
+  if (liveSeller) {
     if (
       config.adapters.messaging !== 'real'
       || config.adapters.storage !== 'real'
       || config.adapters.scanner !== 'real'
     ) {
-      throw new ConfigError('real-demo mode rejects fixture adapters');
+      throw new ConfigError(`${config.mode} mode rejects fixture adapters`);
     }
     if (!options.storage || !options.scanner || !options.messaging) {
-      throw new ConfigError('real-demo mode requires real adapters; refusing fixture fallback');
+      throw new ConfigError(`${config.mode} mode requires real adapters; refusing fixture fallback`);
     }
     if (!config.live) {
-      throw new ConfigError('real-demo mode requires a live config block');
+      throw new ConfigError(`${config.mode} mode requires a live config block`);
     }
   }
   // Fail before any store/listener work: invalid peers or a missing built UI.
@@ -291,7 +338,11 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const storage = options.storage ?? createMemoryStorageAdapter();
   const scanner = options.scanner ?? new MemoryScanner();
   const credentials = options.credentials ?? createCredentialAdapter();
-  const crypto = createCryptoAdapter({ credentials });
+  const plaintextCap = config.mode === 'public-testnet' ? config.maxPlaintextBytes : undefined;
+  const crypto = createCryptoAdapter({
+    credentials,
+    ...(plaintextCap === undefined ? {} : { maxPlaintextBytes: plaintextCap }),
+  });
   if (config.adapters.messaging === 'real' && !options.messaging) {
     throw new ConfigError('real messaging adapter required; refusing fixture fallback');
   }
@@ -303,7 +354,8 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     crypto,
     storage,
     logger,
-    maxBodyBytes: 4096,
+    maxBodyBytes: config.mode === 'public-testnet' ? config.maxPlaintextBytes * 2 + 8192 : 4096,
+    ...(plaintextCap === undefined ? {} : { maxPlaintextBytes: plaintextCap }),
   });
 
   if (scanner instanceof MemoryScanner) {
@@ -334,6 +386,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       crypto,
       storage,
       replicaId: 'replica',
+      ...(plaintextCap === undefined ? {} : { maxPlaintextBytes: plaintextCap }),
     });
   }
 
@@ -342,6 +395,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const catalogue = openCatalogue({
     dbPath: config.dbPath,
     storage,
+    ...(config.mode === 'public-testnet' ? { maxCiphertextBytes: config.maxCiphertextBytes } : {}),
     ...(options.replicaReady ? { replicaReady: options.replicaReady } : {}),
     probes: options.probes ?? {
       messaging: async () => availabilityOverride.messaging ?? true,
@@ -357,7 +411,8 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   });
 
   const store: SellerStore = await openStore(config.dbPath);
-  applyStoreSettings(config.dbPath, config.mode === 'real-demo' ? null : config.destination, config.invoiceTtlMs);
+  const limiterDb = new DatabaseSync(config.dbPath);
+  applyStoreSettings(config.dbPath, liveSeller ? null : config.destination, config.invoiceTtlMs);
   for (const key of catalogue.listProductKeys()) {
     const raw = key.rawKey instanceof Uint8Array ? key.rawKey : new Uint8Array(key.rawKey);
     await crypto.importProductKey(key.keyRef, raw, key.digestHex);
@@ -396,7 +451,8 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
     accountId,
     ttlMs: config.invoiceTtlMs,
     now: Date.now,
-    availability: config.mode === 'real-demo'
+    limiter: new IssuanceLimiter({ db: limiterDb, config, now: Date.now }),
+    availability: liveSeller
       ? async (productVersion) => catalogue.productAvailability(productVersion)
       : async () => catalogue.currentAvailability(),
   });
@@ -470,25 +526,72 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         sendPublic(req, res, 404, 'not found');
         return;
       }
-      if (config.mode === 'real-demo' && (path === '/api/orders' || path === '/api/status' || path === '/api/recover' || path === '/api/acknowledge')) {
-        // Task 7: real-demo checkout/status/recovery must go through the
-        // authenticated Waku application path (Task 9), not this HTTP
-        // fallback. These routes stay reachable only in fixture mode for
-        // the pre-existing deterministic browser tests that exercise them.
+      if (liveSeller && (path === '/api/orders' || path === '/api/status' || path === '/api/recover' || path === '/api/acknowledge')) {
+        // Live checkout/status/recovery goes through the authenticated Waku
+        // path, not this HTTP fallback. These routes stay reachable only in
+        // fixture mode for the deterministic browser tests that exercise them.
         sendPublic(req, res, 404, 'not found');
         return;
       }
       if (path.startsWith('/ciphertext/')) {
+        if (config.mode === 'public-testnet' && req.method === 'GET') {
+          const inspected = inspectCiphertextPath(req.url);
+          if (!inspected.ok) {
+            sendPublic(req, res, inspected.status, 'rejected');
+            return;
+          }
+          const digest = catalogue.getManifest(inspected.productVersion)?.ciphertextDigest;
+          if (!digest) {
+            sendPublic(req, res, 404, 'not found');
+            return;
+          }
+          await serveCiphertext(req, res, (productVersion) => catalogue.getPublishedCiphertext(productVersion), {
+            maxBytes: config.maxCiphertextBytes,
+            digest,
+          });
+          logResponse(req, res.statusCode || 0);
+          return;
+        }
         ciphertext(req, res);
         logResponse(req, 0);
         return;
       }
+      if (req.method === 'GET' && path === '/embed.js') {
+        const filePath = safeJoin(publicDir, '/embed.js');
+        if (!filePath || !existsSync(filePath)) {
+          sendPublic(req, res, 404, 'not found');
+          return;
+        }
+        sendPublic(req, res, 200, readFileSync(filePath), {
+          'content-type': 'text/javascript; charset=utf-8',
+          'cache-control': 'public, max-age=31536000, immutable',
+          'cross-origin-resource-policy': 'cross-origin',
+          'access-control-allow-origin': '*',
+        });
+        return;
+      }
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
-        const indexPath = join(publicDir, 'index.html');
-        const html = existsSync(indexPath)
-          ? readFileSync(indexPath, 'utf8')
-          : '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sovereign Storefront</title></head><body><main id="app"></main></body></html>';
-        sendPublic(req, res, 200, html, { 'content-type': 'text/html; charset=utf-8' });
+        sendPublic(req, res, 200, pageHtml(publicDir, config, false), { 'content-type': 'text/html; charset=utf-8' });
+        return;
+      }
+      const checkoutMatch = req.method === 'GET' ? CHECKOUT_PATH_RE.exec(path) : null;
+      if (checkoutMatch) {
+        sendPublic(req, res, 200, pageHtml(publicDir, config, true), { 'content-type': 'text/html; charset=utf-8' });
+        return;
+      }
+      if (req.method === 'GET' && path === '/api/products') {
+        sendPublicJson(req, res, 200, await catalogue.listSummaries());
+        return;
+      }
+      const productMatch = req.method === 'GET' ? PRODUCT_PATH_RE.exec(path) : null;
+      if (productMatch) {
+        const version = productMatch[1] ?? '';
+        const summary = await catalogue.summaryFor(version);
+        if (!summary) {
+          sendPublicJson(req, res, 404, { error: 'unpublished product' });
+          return;
+        }
+        sendPublicJson(req, res, 200, summary);
         return;
       }
       if (req.method === 'GET' && (path.startsWith('/assets/') || path.startsWith('/src/'))) {
@@ -518,18 +621,29 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
         return;
       }
       if (req.method === 'GET' && path === '/api/waku-config') {
-        // Real-demo only: the browser's Waku bootstrap. Exactly the frozen
-        // PublicWakuConfig fields; bootstrapPeers is the same list buildCsp()
-        // derives connect-src from. Fixture mode falls through to 404.
-        if (config.mode !== 'real-demo' || !config.live) {
+        // Real-demo and public-testnet: the browser's Waku bootstrap. The Zcash
+        // `network` field stays. `wakuNetwork` is added only after the peers are
+        // accepted; absent means DefaultNetworkConfig.
+        if (!liveSeller || !config.live) {
           sendPublic(req, res, 404, 'not found');
+          return;
+        }
+        let acceptedPeers: string[];
+        try {
+          acceptedPeers = wakuNetworkSettings({
+            network: config.live.waku.network,
+            bootstrapPeers: config.live.waku.bootstrapPeers,
+          }).bootstrapPeers;
+        } catch {
+          sendPublicJson(req, res, 503, { error: 'unavailable' });
           return;
         }
         sendPublicJson(req, res, 200, {
           sellerKeyId: config.sellerKeyId,
           network: config.productNetwork,
           contentTopic: config.live.waku.contentTopic,
-          bootstrapPeers: [...config.live.waku.bootstrapPeers],
+          bootstrapPeers: [...acceptedPeers],
+          ...(config.live.waku.network === undefined ? {} : { wakuNetwork: config.live.waku.network }),
         });
         return;
       }
@@ -625,6 +739,11 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
       }
       sendPublic(req, res, 404, 'not found');
     } catch (error) {
+      if (error instanceof RateLimitedError) {
+        logger.log({ event: 'error', code: 429 });
+        sendPublicJson(req, res, 429, { error: 'rate_limited' });
+        return;
+      }
       const message = error instanceof Error ? error.message : 'error';
       const status = /checkout unavailable/i.test(message)
         ? 503
@@ -664,6 +783,7 @@ export async function startSeller(options: SellerOptions): Promise<SellerServer>
   const closeCore = async (): Promise<void> => {
     if (dispatchTimer) clearInterval(dispatchTimer);
     catalogue.close();
+    limiterDb.close();
     await store.close();
   };
   let publicBind: { url: string; port: number };

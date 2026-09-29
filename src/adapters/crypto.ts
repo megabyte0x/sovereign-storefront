@@ -59,9 +59,13 @@ export async function exportAesKey(key: AesKey): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.exportKey('raw', key));
 }
 
-export async function encryptSsf1(key: AesKey, plaintext: Uint8Array): Promise<Uint8Array> {
-  if (plaintext.byteLength > FIRST_RELEASE_MAX_PLAINTEXT_BYTES) {
-    throw new PayloadTooLarge(plaintext.byteLength, FIRST_RELEASE_MAX_PLAINTEXT_BYTES);
+const AEAD_TAG_BYTES = 16;
+const SSF1_OVERHEAD = SSF1_MAGIC.length + NONCE_BYTES + AEAD_TAG_BYTES;
+export const MAX_PUBLIC_TESTNET_CIPHERTEXT_BYTES = LOCAL_AE_MAX_PLAINTEXT_BYTES + SSF1_OVERHEAD;
+
+export async function encryptProduct(plaintext: Uint8Array, key: AesKey, capBytes: number): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(capBytes) || capBytes < 0 || plaintext.byteLength > capBytes) {
+    throw new PayloadTooLarge(plaintext.byteLength, capBytes);
   }
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
   const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: ALG, iv: nonce }, key, plaintext));
@@ -69,10 +73,15 @@ export async function encryptSsf1(key: AesKey, plaintext: Uint8Array): Promise<U
   out.set(SSF1_MAGIC, 0);
   out.set(nonce, SSF1_MAGIC.length);
   out.set(sealed, SSF1_MAGIC.length + nonce.length);
-  if (out.byteLength > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) {
-    throw new PayloadTooLarge(out.byteLength, FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
+  const maxCiphertext = capBytes + SSF1_OVERHEAD;
+  if (out.byteLength > maxCiphertext) {
+    throw new PayloadTooLarge(out.byteLength, maxCiphertext);
   }
   return out;
+}
+
+export async function encryptSsf1(key: AesKey, plaintext: Uint8Array): Promise<Uint8Array> {
+  return encryptProduct(plaintext, key, FIRST_RELEASE_MAX_PLAINTEXT_BYTES);
 }
 
 export async function decryptSsf1(key: AesKey, ciphertext: Uint8Array): Promise<Uint8Array> {
@@ -91,6 +100,18 @@ export async function decryptSsf1(key: AesKey, ciphertext: Uint8Array): Promise<
     if (err instanceof DecryptionFailed) throw err;
     throw new DecryptionFailed();
   }
+}
+
+export async function decryptProduct(bytes: Uint8Array, key: AesKey, capBytes: number): Promise<Uint8Array> {
+  const maxCiphertext = capBytes + SSF1_OVERHEAD;
+  if (!Number.isSafeInteger(capBytes) || capBytes < 0 || bytes.byteLength > maxCiphertext) {
+    throw new PayloadTooLarge(bytes.byteLength, maxCiphertext);
+  }
+  const plaintext = await decryptSsf1(key, bytes);
+  if (plaintext.byteLength > capBytes) {
+    throw new PayloadTooLarge(plaintext.byteLength, capBytes);
+  }
+  return plaintext;
 }
 
 export type DeliveryHeader = {
@@ -176,7 +197,10 @@ export function encodeManifest(input: {
   }));
 }
 
-export function createManifestVerifier(): ManifestVerifier {
+export function createManifestVerifier(maxCiphertextBytes = FIRST_RELEASE_MAX_CIPHERTEXT_BYTES): ManifestVerifier {
+  if (!Number.isSafeInteger(maxCiphertextBytes) || maxCiphertextBytes < 0 || maxCiphertextBytes > MAX_PUBLIC_TESTNET_CIPHERTEXT_BYTES) {
+    throw new RangeError('invalid manifest ciphertext limit');
+  }
   return {
     async verify(manifest, ciphertext) {
       let parsed: unknown;
@@ -197,7 +221,7 @@ export function createManifestVerifier(): ManifestVerifier {
       ) {
         return false;
       }
-      if (ciphertext.byteLength > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) return false;
+      if (ciphertext.byteLength > maxCiphertextBytes) return false;
       if (!hasSsf1Magic(ciphertext)) return false;
       if (parsed.fileSize !== ciphertext.byteLength) return false;
       return parsed.digestHex === sha256Hex(ciphertext);
@@ -205,21 +229,27 @@ export function createManifestVerifier(): ManifestVerifier {
   };
 }
 
-export function createCryptoAdapter(options?: { credentials?: CredentialAdapter }): CryptoAdapter & {
+export function createCryptoAdapter(options?: {
+  credentials?: CredentialAdapter;
+  /** Defaults to 41 so real-demo is unchanged. */
+  maxPlaintextBytes?: number;
+}): CryptoAdapter & {
   decryptProduct(keyRef: string, ciphertext: Uint8Array): Promise<Uint8Array>;
   exportProductKey(keyRef: string): Promise<Uint8Array>;
   importProductKey(keyRef: string, raw: Uint8Array, digestHex: string): Promise<void>;
 } {
   const keys = new Map<string, KeyRecord>();
   const credentials = options?.credentials;
-
+  const maxPlaintextBytes = options?.maxPlaintextBytes ?? FIRST_RELEASE_MAX_PLAINTEXT_BYTES;
+  const sealPlaintext = encryptProduct;
+  const openPlaintext = decryptProduct;
   return {
     async encryptProduct(plaintext) {
       if (!(plaintext instanceof Uint8Array)) {
         throw new Error('malformed payload: plaintext');
       }
       const key = await generateAesKey();
-      const ciphertext = await encryptSsf1(key, plaintext);
+      const ciphertext = await sealPlaintext(plaintext, key, maxPlaintextBytes);
       const raw = await exportAesKey(key);
       const keyRef = bytesToHex(randomBytes(16));
       keys.set(keyRef, { key, raw, digestHex: sha256Hex(ciphertext) });
@@ -258,7 +288,7 @@ export function createCryptoAdapter(options?: { credentials?: CredentialAdapter 
       if (!record) {
         throw new Error('unknown product key');
       }
-      return decryptSsf1(record.key, ciphertext);
+      return openPlaintext(ciphertext, record.key, maxPlaintextBytes);
     },
     async exportProductKey(keyRef) {
       const record = keys.get(keyRef);

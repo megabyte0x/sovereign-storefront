@@ -1,0 +1,22 @@
+{"subtask":"1.2","status":"done",
+"changed_files":["tools/buyer-sender/src/main.rs","tools/buyer-sender/src/state.rs","package.json"],
+"commands":[
+ {"cmd":"npm run build:buyer-sender > .runtime/public/diag/buyer-sender-1.2.log 2>&1","exit":0},
+ {"cmd":"grep -cE '^(error|warning)' .runtime/public/diag/buyer-sender-1.2.log  # 0","exit":0},
+ {"cmd":"tools/buyer-sender/target/release/ssf-buyer-sender status --state-dir $TMPDIR/ssf-buyer-probe","exit":2},
+ {"cmd":"stat -c %a $TMPDIR/ssf-buyer-probe  # 700; lock file 600","exit":0},
+ {"cmd":"flock -n $P/lock ssf-buyer-sender --state-dir $P status  # lock-held error","exit":2},
+ {"cmd":"rm -r $TMPDIR/ssf-buyer-probe","exit":0},
+ {"cmd":"git diff package.json  # 1 insertion","exit":0}],
+"evidence":[
+ "build: Finished release, 0 error/warning lines in diag log",
+ "status --state-dir probe -> {\"error\":\"not implemented\"} exit 2; dir mode 700",
+ "while lock held externally -> {\"error\":\"another sender process holds the wallet lock\"} exit 2",
+ "--expiry-delta 41, duplicate --state-dir, no args -> {\"error\":\"invalid arguments\"} exit 2",
+ "git diff package.json: exactly one added line"],
+"deviations":[
+ {"file":"tools/buyer-sender/src/main.rs","line":92,"text":"--state-dir/--lightwalletd accepted before the command OR among the command's flags (each at most once)","why":"brief's Verify step invokes `status --state-dir DIR` (flag after command); frozen-contract form (flags before command) also works"},
+ {"file":"tools/buyer-sender/src/main.rs","line":195,"text":"dispatch() opens StateDir (creates dir + takes flock) before any handler; handlers take `state: &StateDir` as first arg","why":"Verify step requires the probe dir to exist at 0700 even though commands are stubs; one lock scope covers every command"},
+ {"file":"tools/buyer-sender/src/state.rs","line":83,"text":"open_root: private_parent+open_or_create_child when the parent is itself 0700; otherwise mkdir 0700 of the final component then PrivateDir::open (O_NOFOLLOW, owner + exact 0700 check)","why":"default parent ~/.local/state is 0755, which private_parent rejects"},
+ {"file":"tools/buyer-sender/src/state.rs","line":8,"text":"#![allow(dead_code)] at module top","why":"API unused until later subtasks; keeps build warning-free. Remove once consumers land"}],
+"notes_for_next_subtask":"state.rs: pub type Db = WalletDb<Connection, ScannerParams, SystemClock, UnwrapErr<SysRng>>; pub struct Attempt{attempt_id,txid,raw_hex:String,target_height,expiry_height:u32,amount_zat,created_at:u64} (snake_case serde).\nStateDir::{open_or_create(Option<PathBuf>), has_seed()->Result<bool>, write_seed(&Path), read_seed()->Result<SecretVec<u8>>, open_wallet(Option<&SecretVec<u8>>)->Result<Db>, block_cache()->Result<PersistentBlockCache>, write_attempt(&Attempt), read_attempt(&str)->Result<Option<Attempt>>}; all errors &'static str.\npub fn validate_attempt_id(&str)->Result<(),&'static str> (pure, 64 lowercase hex).\nmain.rs: pub fn parse_expiry_delta(Option<&str>)->Result<u32,&'static str>; type CommandResult=Result<Value,(u8,&'static str)>; struct Globals{state_dir:Option<PathBuf>,lightwalletd:String} (endpoint NOT yet validated: call validate_lightwalletd_endpoint in the chain layer); enum Command.\nHandlers import/status/pay/tx_status/rebroadcast(state:&StateDir, globals:&Globals, ...) all return Err((2,\"not implemented\")).\nStateDir is opened in dispatch() before handlers, so pay's exit-4 guard can go at the top of pay() via state.read_attempt(id) before any chain factory call.\nwrite_seed rejects symlinked, foreign-owned or non-0600 mnemonic files. No mod chain/pay declared. rustfmt --edition 2024 applied."}

@@ -11,6 +11,7 @@
     "build": "vite build && tsc -p tsconfig.build.json && cp src/seller/schema.sql dist/service/seller/schema.sql",
     "build:clean": "node scripts/clean-build.mjs",
     "build:browser": "vite build",
+    "build:buyer-sender": "cargo build --locked --release --manifest-path tools/buyer-sender/Cargo.toml",
     "build:service": "tsc -p tsconfig.build.json && cp src/seller/schema.sql dist/service/seller/schema.sql",
     "test:browser": "playwright test",
     "test:integration": "vitest run --config vitest.integration.config.ts",

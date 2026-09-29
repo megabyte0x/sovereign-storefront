@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { FIRST_RELEASE_MAX_CIPHERTEXT_BYTES } from '../adapters/crypto.ts';
+import { FIRST_RELEASE_MAX_CIPHERTEXT_BYTES, sha256Hex } from '../adapters/crypto.ts';
+import type { ServeCiphertextOptions } from '../contracts/public.ts';
 
 const CIPHERTEXT_PREFIX = '/ciphertext/';
 const PRODUCT_VERSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -93,4 +94,117 @@ export function createCiphertextHandler(options: {
       }
     })();
   };
+}
+
+const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
+const STREAM_CHUNK = 64 * 1024;
+
+function parseSingleRange(header: string, length: number): { start: number; end: number } | 'multi' | 'unsatisfiable' | 'absent' {
+  if (header === '') return 'absent';
+  const value = header.trim();
+  if (!/^bytes=/i.test(value)) return 'unsatisfiable';
+  const spec = value.slice(value.indexOf('=') + 1).trim();
+  if (spec.includes(',')) return 'multi';
+  const match = /^(\d*)-(\d*)$/.exec(spec);
+  if (!match || (match[1] === '' && match[2] === '')) return 'unsatisfiable';
+  if (match[1] === '') {
+    const suffix = Number(match[2]);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0 || length === 0) return 'unsatisfiable';
+    return { start: Math.max(0, length - suffix), end: length - 1 };
+  }
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= length) return 'unsatisfiable';
+  let end = match[2] === '' ? length - 1 : Number(match[2]);
+  if (!Number.isSafeInteger(end) || end < start) return 'unsatisfiable';
+  if (end >= length) end = length - 1;
+  return { start, end };
+}
+
+function writeBytes(res: ServerResponse, status: number, bytes: Uint8Array, headers: Record<string, string>): void {
+  res.writeHead(status, {
+    ...headers,
+    'content-length': String(bytes.byteLength),
+  });
+  for (let offset = 0; offset < bytes.byteLength; offset += STREAM_CHUNK) {
+    const slice = bytes.subarray(offset, Math.min(offset + STREAM_CHUNK, bytes.byteLength));
+    res.write(Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength));
+  }
+  res.end();
+}
+
+export async function serveCiphertext(
+  req: IncomingMessage,
+  res: ServerResponse,
+  lookup: CiphertextLookup,
+  options: ServeCiphertextOptions,
+): Promise<void> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    write(res, 405, 'rejected');
+    return;
+  }
+  const inspected = inspectCiphertextPath(req.url);
+  if (!inspected.ok) {
+    write(res, inspected.status, 'rejected');
+    return;
+  }
+  let body: Uint8Array;
+  try {
+    body = await lookup(inspected.productVersion);
+  } catch (error) {
+    write(res, statusForLookupError(error), 'rejected');
+    return;
+  }
+  if (body.byteLength > options.maxBytes) {
+    write(res, 413, 'rejected');
+    return;
+  }
+  const digest = sha256Hex(body);
+  const expected = options.digest.trim().replace(/^W\//i, '').replace(/^"+|"+$/g, '').trim().toLowerCase();
+  if (expected !== digest) {
+    write(res, 502, 'rejected');
+    return;
+  }
+  const quoted = `"${digest}"`;
+  const common = {
+    'content-type': 'application/octet-stream',
+    'content-disposition': `attachment; filename="${inspected.productVersion}.ssf1"`,
+    'x-content-type-options': 'nosniff',
+    'cache-control': IMMUTABLE_CACHE,
+    'accept-ranges': 'bytes',
+    etag: quoted,
+  };
+  const ifNoneMatch = req.headers['if-none-match'];
+  const inm = Array.isArray(ifNoneMatch) ? ifNoneMatch.join(',') : ifNoneMatch ?? '';
+  const matched = inm.trim() === '*' || inm.split(',').some((part) => {
+    const token = part.trim().replace(/^W\//i, '').trim();
+    return token === quoted || token.replace(/^"+|"+$/g, '').toLowerCase() === digest;
+  });
+  if (inm !== '' && matched) {
+    res.writeHead(304, common);
+    res.end();
+    return;
+  }
+  const rangeHeader = req.headers.range;
+  const range = parseSingleRange(Array.isArray(rangeHeader) ? rangeHeader.join(',') : rangeHeader ?? '', body.byteLength);
+  if (range === 'multi' || range === 'unsatisfiable') {
+    write(res, 416, 'rejected', {
+      'accept-ranges': 'bytes',
+      'content-range': `bytes */${body.byteLength}`,
+      etag: quoted,
+    });
+    return;
+  }
+  if (req.method === 'HEAD' || range === 'absent') {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { ...common, 'content-length': String(body.byteLength) });
+      res.end();
+      return;
+    }
+    writeBytes(res, 200, body, common);
+    return;
+  }
+  writeBytes(res, 206, body.subarray(range.start, range.end + 1), {
+    ...common,
+    'content-range': `bytes ${range.start}-${range.end}/${body.byteLength}`,
+  });
 }

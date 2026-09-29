@@ -24,9 +24,10 @@ export type MemoryStorageAdapter = StorageAdapter & {
   disconnect(): void;
 };
 
-export function createMemoryStorageAdapter(): MemoryStorageAdapter {
+export function createMemoryStorageAdapter(options?: { maxBytes?: number }): MemoryStorageAdapter {
   const objects = new Map<string, Uint8Array>();
   const uploaded: string[] = [];
+  const maxBytes = options?.maxBytes ?? FIRST_RELEASE_MAX_CIPHERTEXT_BYTES;
   let replicaUp = true;
   let next = 0;
 
@@ -39,8 +40,8 @@ export function createMemoryStorageAdapter(): MemoryStorageAdapter {
       replicaUp = false;
     },
     async publish(ciphertext) {
-      if (ciphertext.byteLength > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) {
-        throw new PayloadTooLarge(ciphertext.byteLength, FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
+      if (ciphertext.byteLength > maxBytes) {
+        throw new PayloadTooLarge(ciphertext.byteLength, maxBytes);
       }
       const cid = `mem-${++next}-${sha256Hex(ciphertext).slice(0, 12)}`;
       objects.set(cid, new Uint8Array(ciphertext));
@@ -260,6 +261,18 @@ export function cidFromManifestList(list: unknown, filename: string): string | u
   return match?.cid;
 }
 
+function manifestForCid(list: unknown, cid: string): { datasetSize?: unknown; digest?: unknown } | undefined {
+  if (!Array.isArray(list)) return undefined;
+  for (const item of list) {
+    if (!item || typeof item !== 'object' || !('cid' in item) || item.cid !== cid) continue;
+    return {
+      datasetSize: 'datasetSize' in item ? item.datasetSize : undefined,
+      digest: 'digest' in item ? item.digest : undefined,
+    };
+  }
+  return undefined;
+}
+
 export type LogosRuntime = {
   logosctlPath: string;
   originConfigDir: string;
@@ -316,6 +329,8 @@ export type LogosAdapterOptions = {
   downloadAttempts?: number;
   /** Delay between those attempts (default 2000 ms). */
   downloadRetryDelayMs?: number;
+  /** When false, publish uploads on origin only. Default keeps the local replica connect. */
+  connectReplica?: boolean;
 };
 
 const DEFAULT_DOWNLOAD_ATTEMPTS = 4;
@@ -350,11 +365,13 @@ export function createLogosStorageAdapter(
   const writeFile = deps.writeFile ?? ((path: string, data: Uint8Array) => writeFileSync(path, data, { mode: 0o600 }));
   const workDir = deps.workDir ?? mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'ssf-logos-'));
   const maxBytes = options.maxBytes ?? FIRST_RELEASE_MAX_CIPHERTEXT_BYTES;
+  const connectReplica = options.connectReplica !== false;
   const uploadTimeoutMs = options.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS;
   const downloadTimeoutMs = options.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
   const downloadAttempts = Math.max(1, options.downloadAttempts ?? DEFAULT_DOWNLOAD_ATTEMPTS);
   const downloadRetryDelayMs = options.downloadRetryDelayMs ?? DEFAULT_DOWNLOAD_RETRY_DELAY_MS;
   const withLock = createQueue();
+  const published = new Map<string, { size: number; digest: string }>();
 
   function tryRead(path: string): Uint8Array {
     try {
@@ -372,23 +389,38 @@ export function createLogosStorageAdapter(
   async function readCompleteDownload(destPath: string, cid: string): Promise<Uint8Array> {
     let bytes = tryRead(destPath);
     let expected: number | undefined;
+    let digest: string | undefined;
     try {
       const list = await runner.call(runtime.replicaConfigDir, 'manifests');
-      const entry = Array.isArray(list)
-        ? (list.find((m) => m && typeof m === 'object' && (m as { cid?: unknown }).cid === cid) as { datasetSize?: unknown } | undefined)
-        : undefined;
+      const entry = manifestForCid(list, cid);
       if (typeof entry?.datasetSize === 'number') expected = entry.datasetSize;
+      if (typeof entry?.digest === 'string' && entry.digest.trim() !== '') digest = entry.digest.trim().toLowerCase();
     } catch {
       expected = undefined;
     }
-    if (expected === undefined) return bytes;
-    const deadline = Date.now() + DOWNLOAD_SETTLE_MS;
-    while (bytes.byteLength !== expected && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      bytes = tryRead(destPath);
+    if (expected !== undefined && bytes.byteLength > expected) {
+      throw new Error(`download size mismatch: ${bytes.byteLength} of ${expected} bytes`);
     }
-    if (bytes.byteLength !== expected && bytes.byteLength <= maxBytes) {
-      throw new Error(`download incomplete: ${bytes.byteLength} of ${expected} bytes at ${destPath}`);
+    if (expected !== undefined && bytes.byteLength !== expected) {
+      const deadline = Date.now() + DOWNLOAD_SETTLE_MS;
+      while (bytes.byteLength !== expected && Date.now() < deadline) {
+        const wait = Promise.withResolvers<void>();
+        setTimeout(wait.resolve, 200);
+        await wait.promise;
+        bytes = tryRead(destPath);
+      }
+      if (bytes.byteLength !== expected && bytes.byteLength <= maxBytes) {
+        throw new Error(`download incomplete: ${bytes.byteLength} of ${expected} bytes at ${destPath}`);
+      }
+    }
+    if (digest !== undefined && sha256Hex(bytes) !== digest) {
+      throw new Error('download digest mismatch');
+    }
+    const known = published.get(cid);
+    if (known && (bytes.byteLength !== known.size || sha256Hex(bytes) !== known.digest)) {
+      throw new Error(bytes.byteLength !== known.size
+        ? `download size mismatch: ${bytes.byteLength} of ${known.size} bytes`
+        : 'download digest mismatch');
     }
     return bytes;
   }
@@ -397,20 +429,21 @@ export function createLogosStorageAdapter(
     return withLock(runtime.originConfigDir, async () => {
       const filePath = join(workDir, `upload-${randomUUID()}.ssf1`);
       const filename = basename(filePath);
-      writeFile(filePath, ciphertext);
-      // Arm the watch BEFORE uploadUrl: the completion event fires within
-      // milliseconds and is not replayed to watches attached later.
-      const sub = runner.subscribe(runtime.originConfigDir, UPLOAD_DONE_EVENT, uploadTimeoutMs);
-      let cid: unknown;
+      let sub: LogosSubscription | undefined;
       try {
+        writeFile(filePath, ciphertext);
+        // Arm the watch BEFORE uploadUrl: the completion event fires within
+        // milliseconds and is not replayed to watches attached later.
+        sub = runner.subscribe(runtime.originConfigDir, UPLOAD_DONE_EVENT, uploadTimeoutMs);
         await sub.ready;
         const sessionId = await runner.call(runtime.originConfigDir, 'uploadUrl', [filePath, String(CHUNK_SIZE)]);
         const event = await sub.event;
+        let cid: unknown;
         if (event) {
           if (event.success !== true) {
             throw new Error(`upload failed: ${JSON.stringify(event)}`);
           }
-          if (event.sessionId !== undefined && sessionId != null && String(event.sessionId) !== String(sessionId)) {
+          if (sessionId != null && String(sessionId) !== '' && String(event.sessionId) !== String(sessionId)) {
             throw new Error(`upload completion event belongs to a different session (${String(event.sessionId)} != ${String(sessionId)})`);
           }
           if (typeof event.filename === 'string' && event.filename !== filename) {
@@ -425,17 +458,19 @@ export function createLogosStorageAdapter(
             throw new Error(`timed out waiting for ${UPLOAD_DONE_EVENT}: no event received within ${uploadTimeoutMs}ms`);
           }
         }
+        if (typeof cid !== 'string' || cid.length === 0) {
+          throw new Error('upload completion event missing cid');
+        }
+        const exists = await runner.call(runtime.originConfigDir, 'exists', [cid]);
+        if (exists !== true) {
+          throw new Error(`uploaded cid ${cid} not confirmed present on origin`);
+        }
+        published.set(cid, { size: ciphertext.byteLength, digest: sha256Hex(ciphertext) });
+        return cid;
       } finally {
-        sub.cancel();
+        sub?.cancel();
+        rmSync(filePath, { force: true });
       }
-      if (typeof cid !== 'string' || cid.length === 0) {
-        throw new Error('upload completion event missing cid');
-      }
-      const exists = await runner.call(runtime.originConfigDir, 'exists', [cid]);
-      if (exists !== true) {
-        throw new Error(`uploaded cid ${cid} not confirmed present on origin`);
-      }
-      return cid;
     });
   }
 
@@ -527,7 +562,7 @@ export function createLogosStorageAdapter(
         throw new PayloadTooLarge(ciphertext.byteLength, maxBytes);
       }
       const cid = await uploadAndWait(ciphertext);
-      await establishReplication();
+      if (connectReplica) await establishReplication();
       return cid;
     },
     async fetch(cid) {

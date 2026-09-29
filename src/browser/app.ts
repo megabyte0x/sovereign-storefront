@@ -1,5 +1,5 @@
 import { createCredentialAdapter } from '../adapters/credentials.ts';
-import { createCryptoAdapter } from '../adapters/crypto.ts';
+import { FIRST_RELEASE_MAX_CIPHERTEXT_BYTES, createCryptoAdapter, splitDeliveryEnvelope } from '../adapters/crypto.ts';
 import { qrSvgMarkup } from './payment-request.ts';
 import {
   allowNewCheckout,
@@ -13,10 +13,11 @@ import {
   type ServiceAvailability,
 } from '../contracts/types.ts';
 import { beginCheckout, paymentInstructions, renderPaymentInstructions } from './checkout.ts';
-import { decryptDownload } from './download.ts';
+import { decryptDownload, downloadCiphertext, PUBLIC_TESTNET_MAX_CIPHERTEXT_BYTES } from './download.ts';
 import { BEARER_SECRET_WARNING, openPurchaseStore, renderBackupGuidance, type PurchaseStoreOptions } from './purchases.ts';
-import { createWakuOrderTransport, type WakuSellerConfig } from './waku-transport.ts';
+import { browserWakuNetworkSettings, createWakuOrderTransport, type WakuSellerConfig } from './waku-transport.ts';
 import type { WakuConfig, WakuSession } from '../contracts/messages.ts';
+import { profileFor, validateCheckoutResult, validateProductSummary, type CheckoutResult, type ProductSummary } from '../contracts/public.ts';
 
 export type ProductViewModel = {
   version: string;
@@ -63,6 +64,17 @@ function zatToAmount(zat: string): string {
 
 export function formatZec(amountZat: string): string {
   return `${zatToAmount(amountZat)} ZEC`;
+}
+
+export function networkBadgeText(network: 'test' | 'regtest'): string {
+  const profile = profileFor(network);
+  const name = profile.network === 'test' ? 'testnet' : 'regtest';
+  return `${name} · ${profile.uaPrefix}`;
+}
+
+export function confirmationNotice(network: 'test' | 'regtest', minConfirmations: number): string {
+  const name = profileFor(network).network === 'test' ? 'testnet' : 'regtest';
+  return `${name}: delivered after ${minConfirmations} confirmations`;
 }
 
 function utf8ToBase64Url(text: string): string {
@@ -253,15 +265,18 @@ export function renderProductView(root: RenderRoot, input: {
   product: ProductViewModel;
   availability: ServiceAvailability;
   sellerKeyId: string;
+  minConfirmations?: number;
 }): void {
   const allowed = allowNewCheckout(input.availability);
   const size = input.product.fileSize == null ? 'unknown size' : `${input.product.fileSize} bytes`;
   const format = input.product.fileFormatVersion ?? 'unknown format';
+  const floor = input.minConfirmations ?? profileFor(input.product.network).minConfirmationsFloor;
   root.innerHTML = `
     <section id="view-product">
       <h1>${escapeHtml(input.product.description)}</h1>
       <p id="product-price">${escapeHtml(formatZec(input.product.amountZat))}</p>
-      <p id="testnet-badge" role="status">Testnet</p>
+      <p id="testnet-badge" role="status">${escapeHtml(networkBadgeText(input.product.network))}</p>
+      <p id="confirmation-floor">${escapeHtml(confirmationNotice(input.product.network, floor))}</p>
       <p id="seller-identity">${escapeHtml(input.sellerKeyId)}</p>
       <p id="file-details">${escapeHtml(format)} · ${escapeHtml(size)}</p>
       <p id="checkout-unavailable" ${allowed ? 'hidden' : ''}>New checkout is unavailable while a required service is down. Existing purchases can still be recovered.</p>
@@ -275,13 +290,18 @@ export function renderCheckoutView(root: RenderRoot, input: {
   purchase: BrowserPurchase;
   now: number;
   persisted: boolean;
+  minConfirmations?: number;
 }): void {
+  const network = input.purchase.network ?? input.purchase.invoice?.network ?? 'test';
+  const floor = input.minConfirmations ?? profileFor(network).minConfirmationsFloor;
+  const notice = `<p id="confirmation-floor">${escapeHtml(confirmationNotice(network, floor))}</p>`;
   const invoice = input.persisted ? paymentInstructions(input.purchase, input.now) : null;
   if (!input.persisted || !input.purchase.invoice) {
     root.innerHTML = `
       <section id="view-checkout">
         <h1>Checkout</h1>
         <p>Saving this purchase locally before any wallet request.</p>
+        ${notice}
         <div id="payment" data-wallet-request="blocked"></div>
         ${navPurchasesMarkup()}
       </section>
@@ -292,6 +312,7 @@ export function renderCheckoutView(root: RenderRoot, input: {
     root.innerHTML = `
       <section id="view-checkout">
         <h1>Checkout</h1>
+        ${notice}
         <div id="payment"></div>
         ${navPurchasesMarkup()}
       </section>
@@ -308,6 +329,7 @@ export function renderCheckoutView(root: RenderRoot, input: {
     <section id="view-checkout">
       <h1>Checkout</h1>
       <p>Pay ${escapeHtml(formatZec(invoice.amountZat))} on testnet.</p>
+      ${notice}
       ${qrMarkup(uri)}
       <pre id="zip321-uri">${escapedUri}</pre>
       <button type="button" id="copy-uri">Copy payment URI</button>
@@ -435,12 +457,13 @@ type AppRoot = RenderRoot & {
   addEventListener(type: string, listener: (event: { target: unknown }) => unknown): void;
 };
 
-/** Frozen R3 contract: GET /api/waku-config (real-demo only; 404 in fixture mode). */
+/** GET /api/waku-config. Fixture mode 404s. Absent wakuNetwork means DefaultNetworkConfig. */
 export type PublicWakuConfig = {
   sellerKeyId: string;
   network: 'regtest' | 'test';
   contentTopic: string;
   bootstrapPeers: string[];
+  wakuNetwork?: { clusterId: number; shards: number[] };
 };
 
 /**
@@ -484,11 +507,29 @@ function parsePublicWakuConfig(body: unknown): PublicWakuConfig | null {
   if (row.network !== 'regtest' && row.network !== 'test') return null;
   if (typeof row.contentTopic !== 'string' || row.contentTopic.length === 0) return null;
   if (!Array.isArray(row.bootstrapPeers) || !row.bootstrapPeers.every((p) => typeof p === 'string' && p.length > 0)) return null;
+  const bootstrapPeers = [...row.bootstrapPeers as string[]];
+  let wakuNetwork: { clusterId: number; shards: number[] } | undefined;
+  if ('wakuNetwork' in row) {
+    const field = row.wakuNetwork;
+    if (typeof field !== 'object' || field === null || Array.isArray(field)) return null;
+    const network = field as Record<string, unknown>;
+    const keys = Object.keys(network);
+    if (keys.length !== 2 || network.clusterId === undefined || network.shards === undefined) return null;
+    if (!Number.isInteger(network.clusterId) || !Array.isArray(network.shards)) return null;
+    if (!network.shards.every((shard) => Number.isInteger(shard))) return null;
+    wakuNetwork = { clusterId: network.clusterId as number, shards: [...network.shards as number[]] };
+    try {
+      browserWakuNetworkSettings({ network: wakuNetwork, bootstrapPeers });
+    } catch {
+      return null;
+    }
+  }
   return {
     sellerKeyId: row.sellerKeyId.toLowerCase(),
     network: row.network,
     contentTopic: row.contentTopic,
-    bootstrapPeers: [...row.bootstrapPeers as string[]],
+    bootstrapPeers,
+    ...(wakuNetwork === undefined ? {} : { wakuNetwork }),
   };
 }
 
@@ -517,6 +558,16 @@ type ScopedTransport = <T>(credentialId: string, fn: (transport: OrderTransport)
 export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {}): Promise<BrowserApp> {
   exposeHooks();
   const fetchImpl: typeof fetch = deps.fetch ?? ((input, init) => fetch(input, init));
+  const pathname = (globalThis as { location?: { pathname?: string } }).location?.pathname || '/';
+  const routeMatch = /^\/p\/([A-Za-z0-9_-]{1,128})$/.exec(pathname);
+  let routeProduct: string | null = null;
+  if (routeMatch?.[1]) {
+    try {
+      routeProduct = decodeURIComponent(routeMatch[1]);
+    } catch {
+      routeProduct = null;
+    }
+  }
   let product: ProductViewModel = {
     version: 'book-v1',
     description: 'Product',
@@ -532,17 +583,47 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
     storageReplica: false,
     scanner: false,
   };
+  let catalogueItems: ProductSummary[] = [];
+  let routeFound = routeProduct === null;
   const wakuProbe = probeWakuConfig(fetchImpl);
   try {
-    const [productRes, availabilityRes] = await Promise.all([
+    const productsPath = routeProduct
+      ? `/api/products/${encodeURIComponent(routeProduct)}`
+      : '/api/products';
+    const availabilityPath = routeProduct
+      ? `/api/availability?productVersion=${encodeURIComponent(routeProduct)}`
+      : '/api/availability';
+    const [productRes, availabilityRes, productsRes] = await Promise.all([
       fetchImpl('/api/product'),
-      fetchImpl('/api/availability'),
+      fetchImpl(availabilityPath),
+      fetchImpl(productsPath),
     ]);
     if (productRes.ok) {
       product = await productRes.json() as ProductViewModel;
     }
     if (availabilityRes.ok) {
       availability = await availabilityRes.json() as ServiceAvailability;
+    }
+    if (productsRes.ok) {
+      const body: unknown = await productsRes.json();
+      if (routeProduct) {
+        const summary = validateProductSummary(body);
+        routeFound = summary.version === routeProduct;
+        product = {
+          ...product,
+          version: summary.version,
+          description: summary.description,
+          amountZat: summary.amountZat,
+          network: summary.network,
+          fileSize: summary.sizeBytes,
+          fileFormatVersion: product.version === summary.version ? product.fileFormatVersion : summary.mediaType,
+        };
+        catalogueItems = [summary];
+      } else if (Array.isArray(body)) {
+        catalogueItems = body.map((item) => validateProductSummary(item));
+      }
+    } else {
+      await productsRes.text().catch(() => undefined);
     }
   } catch {
     // Product metadata is informational until the seller answers.
@@ -580,10 +661,11 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
   } else if (wakuConfigProbe) {
     transportMode = 'waku';
     checkoutNetwork = wakuConfigProbe.network;
-    const wakuConfig: WakuConfig = {
+    const wakuConfig = {
       contentTopic: wakuConfigProbe.contentTopic,
       bootstrapPeers: wakuConfigProbe.bootstrapPeers,
       peerTimeoutMs: deps.peerTimeoutMs ?? DEFAULT_PEER_TIMEOUT_MS,
+      ...(wakuConfigProbe.wakuNetwork === undefined ? {} : { network: wakuConfigProbe.wakuNetwork }),
     };
     const createSession = deps.createSession
       ?? ((credentialId: string, config: WakuConfig) => credentials.createWakuSession(credentialId, config));
@@ -625,12 +707,82 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
     acknowledge: (orderId, credentialId, packageId) => withTransport(credentialId, (t) => t.acknowledge(orderId, credentialId, packageId)),
   };
 
+  const dataset = root as { getAttribute?(name: string): string | null; dataset?: Record<string, string> };
+  const configuredFloor = Number(dataset.dataset?.minConfirmations ?? dataset.getAttribute?.('data-min-confirmations') ?? '');
+  const minConfirmations = Number.isInteger(configuredFloor) && configuredFloor > 0
+    ? configuredFloor
+    : profileFor(product.network).minConfirmationsFloor;
+  const embedOrigins = dataset.dataset?.embedOrigins ?? dataset.getAttribute?.('data-embed-origins') ?? '';
+  const search = (globalThis as { location?: { search?: string } }).location?.search ?? '';
+  const embedCheckout = new URLSearchParams(search).get('embed') === '1';
+  let openerOrigin = '';
+  const referrer = (globalThis as { document?: { referrer?: string } }).document?.referrer ?? '';
+  if (referrer) {
+    try {
+      openerOrigin = new URL(referrer).origin;
+    } catch {
+      openerOrigin = '';
+    }
+  }
+  let postedPurchase: BrowserPurchase | null = null;
+  const originAllowed = (candidate: string): boolean => {
+    if (embedOrigins === '*') return true;
+    return embedOrigins.split(',').map((part) => part.trim()).includes(candidate);
+  };
+  const postCheckout = (purchase: BrowserPurchase): void => {
+    if (!embedCheckout || !openerOrigin || !originAllowed(openerOrigin)) return;
+    const result: CheckoutResult = {
+      type: 'ssf:checkout',
+      version: purchase.productVersion,
+      requestId: purchase.requestId,
+      state: 'invoiced',
+    };
+    try {
+      validateCheckoutResult(result);
+    } catch {
+      return;
+    }
+    const opener = (globalThis as { opener?: { postMessage?(data: CheckoutResult, origin: string): void } | null }).opener;
+    opener?.postMessage?.(result, openerOrigin);
+  };
+  if (embedCheckout) {
+    (globalThis as { addEventListener?(type: string, listener: (event: { origin: string; data: unknown; source: unknown }) => void): void })
+      .addEventListener?.('message', (event) => {
+        if (!event.data || typeof event.data !== 'object' || !('type' in event.data) || event.data.type !== 'ssf:hello') return;
+        if (event.source !== (globalThis as { opener?: unknown }).opener) return;
+        if (!originAllowed(event.origin)) return;
+        openerOrigin = event.origin;
+        if (postedPurchase) postCheckout(postedPurchase);
+      });
+  }
+
   const showProduct = (): void => {
     renderProductView(root, {
       product,
       availability,
       sellerKeyId: product.sellerKeyId,
+      minConfirmations,
     });
+  };
+
+  const showHome = (): void => {
+    if (catalogueItems.length === 0) {
+      showProduct();
+      return;
+    }
+    const rows = catalogueItems.map((item) => (
+      `<li><a href="/p/${escapeHtml(encodeURIComponent(item.version))}">${escapeHtml(item.title)}</a> `
+      + `<span>${escapeHtml(formatZec(item.amountZat))}</span> `
+      + `<span>${escapeHtml(networkBadgeText(item.network))}</span></li>`
+    )).join('');
+    const featured: RenderRoot = { innerHTML: '', querySelector() { return null; } };
+    renderProductView(featured, {
+      product,
+      availability,
+      sellerKeyId: product.sellerKeyId,
+      minConfirmations,
+    });
+    root.innerHTML = `<section id="view-catalogue"><h1>Catalogue</h1><ul>${rows}</ul></section>${featured.innerHTML}`;
   };
 
   const showCheckout = (purchase: BrowserPurchase): void => {
@@ -638,6 +790,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
       purchase,
       now: Date.now(),
       persisted: true,
+      minConfirmations,
     });
   };
 
@@ -667,6 +820,8 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
       throw new Error('purchase draft was not persisted');
     }
     showCheckout(saved);
+    postedPurchase = saved;
+    postCheckout(saved);
   };
 
   const onCopy = async (target: unknown): Promise<void> => {
@@ -723,12 +878,20 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
         renderStatusView(root, orderStatus);
         try {
           const pkg = await transport.recover(orderId, credentialId);
-          const cipherRes = await fetchImpl(`/ciphertext/${encodeURIComponent(pkg.productVersion)}`);
-          if (!cipherRes.ok) return;
-          const ciphertext = new Uint8Array(await cipherRes.arrayBuffer());
+          const maxCiphertextBytes = checkoutNetwork === 'regtest'
+            ? FIRST_RELEASE_MAX_CIPHERTEXT_BYTES
+            : PUBLIC_TESTNET_MAX_CIPHERTEXT_BYTES;
+          const ciphertext = await downloadCiphertext(
+            `/ciphertext/${encodeURIComponent(pkg.productVersion)}`,
+            splitDeliveryEnvelope(pkg.encryptedEnvelope).header.digestHex,
+            undefined,
+            maxCiphertextBytes,
+            fetchImpl,
+          );
           const blob = await decrypt(pkg, ciphertext, {
             crypto: createCryptoAdapter({ credentials }),
             credentialId,
+            maxCiphertextBytes,
           });
           downloadBytes(`${pkg.productVersion}.bin`, new Uint8Array(await blob.arrayBuffer()));
           // Acknowledge only after a verified decrypt, over the same scoped transport.
@@ -772,7 +935,13 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
     if (closestAttribute(event.target, 'id') === 'import-backup') void onImport(event.target);
   });
 
-  showProduct();
+  if (routeProduct && !routeFound) {
+    root.innerHTML = `<section id="view-missing"><h1>Product not found</h1>${navPurchasesMarkup()}</section>`;
+  } else if (routeProduct) {
+    showProduct();
+  } else {
+    showHome();
+  }
   void storePromise;
   return { transportMode };
 }

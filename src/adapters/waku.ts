@@ -48,8 +48,12 @@ function wireBytes(decoded: EciesDecodedMessage): Uint8Array | null {
   }
 }
 
+export type WakuSessionConfig = WakuConfig & {
+  network?: { clusterId: number; shards: number[] };
+};
+
 export type WakuSessionOptions = {
-  createNode?: (config: WakuConfig) => Promise<WakuNode>;
+  createNode?: (config: WakuSessionConfig) => Promise<WakuNode>;
   retryIntervalMs?: number;
   /**
    * Per-instance report of a failed delivery handler. It receives no
@@ -87,11 +91,70 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
-async function defaultCreateNode(config: WakuConfig): Promise<WakuNode> {
+const OWNED_WAKU_HOST = 'agentmascot.app';
+
+/** Public fleet only (D1=a). Drops any multiaddr naming the owned delivery host. */
+export function withoutOwnedPeers(peers: string[]): string[] {
+  return peers.filter((peer) => !peer.includes(OWNED_WAKU_HOST));
+}
+
+export type WakuNetworkInput = {
+  network?: { clusterId: number; shards: number[] };
+  bootstrapPeers: string[];
+};
+
+export type WakuNetworkSettings = {
+  networkConfig: typeof DefaultNetworkConfig | { clusterId: number; shards: number[] };
+  bootstrapPeers: string[];
+};
+
+/** Absent `network` is The Waku Network (`DefaultNetworkConfig`, cluster 1, 8 shards). */
+export function wakuNetworkSettings(input: WakuNetworkInput): WakuNetworkSettings {
+  const bootstrapPeers = withoutOwnedPeers(input.bootstrapPeers);
+  if (bootstrapPeers.length !== input.bootstrapPeers.length) {
+    throw new Error('owned waku peer refused: agentmascot.app');
+  }
+  if (input.network === undefined) {
+    return { networkConfig: DefaultNetworkConfig, bootstrapPeers: [...bootstrapPeers] };
+  }
+  const { clusterId, shards } = input.network;
+  if (!Number.isInteger(clusterId) || clusterId !== DefaultNetworkConfig.clusterId) {
+    throw new Error(`unknown waku cluster id: ${clusterId}`);
+  }
+  const seenShards: Record<number, true> = {};
+  for (const shard of shards) {
+    if (!Number.isInteger(shard) || shard < 0 || shard >= DefaultNetworkConfig.numShardsInCluster || seenShards[shard]) {
+      throw new Error('invalid waku shards');
+    }
+    seenShards[shard] = true;
+  }
+  if (shards.length === 0) throw new Error('invalid waku shards');
+  return { networkConfig: { clusterId, shards: [...shards] }, bootstrapPeers: [...bootstrapPeers] };
+}
+
+/** Seller and browser must call this so a content topic lands on one pubsub topic. */
+export function routingInfoFor(settings: WakuNetworkSettings, contentTopic: string) {
+  const config = settings.networkConfig;
+  if ('numShardsInCluster' in config) return createRoutingInfo(config, { contentTopic });
+  const auto = createRoutingInfo(
+    { clusterId: config.clusterId, numShardsInCluster: DefaultNetworkConfig.numShardsInCluster },
+    { contentTopic },
+  );
+  if (!config.shards.includes(auto.shardId)) {
+    throw new Error(`content topic shard ${auto.shardId} is not in the configured shard set`);
+  }
+  return createRoutingInfo({ clusterId: config.clusterId }, { shardId: auto.shardId });
+}
+
+async function defaultCreateNode(config: WakuSessionConfig): Promise<WakuNode> {
+  const settings = wakuNetworkSettings({ network: config.network, bootstrapPeers: config.bootstrapPeers });
+  const networkConfig = 'numShardsInCluster' in settings.networkConfig
+    ? settings.networkConfig
+    : { clusterId: settings.networkConfig.clusterId };
   const node = await createLightNode({
     defaultBootstrap: config.bootstrapPeers.length === 0,
     bootstrapPeers: config.bootstrapPeers.length > 0 ? config.bootstrapPeers : undefined,
-    networkConfig: DefaultNetworkConfig,
+    networkConfig,
   });
   await node.waitForPeers([Protocols.LightPush, Protocols.Filter], config.peerTimeoutMs);
   return withLibp2pConnectivity(node as unknown as WakuNode);
@@ -139,7 +202,7 @@ export type WakuSessionForTest = WakuSession & {
 };
 
 export function createWakuSession(
-  config: WakuConfig,
+  config: WakuSessionConfig,
   ownPrivateKey: Uint8Array,
   options: WakuSessionOptions = {},
 ): WakuSessionForTest {
@@ -147,7 +210,10 @@ export function createWakuSession(
   const retryIntervalMs = options.retryIntervalMs ?? DEFAULT_RETRY_INTERVAL_MS;
   const ownPublicKey = getPublicKey(ownPrivateKey);
   const ownPublicKeyHex = bytesToHex(ownPublicKey);
-  const routingInfo = createRoutingInfo(DefaultNetworkConfig, { contentTopic: config.contentTopic });
+  const routingInfo = routingInfoFor(
+    wakuNetworkSettings({ network: config.network, bootstrapPeers: config.bootstrapPeers }),
+    config.contentTopic,
+  );
 
   let node: WakuNode | null = null;
   let started = false;
@@ -237,24 +303,63 @@ export function createWakuSession(
     subscribed = true;
   }
 
+  /** Best-effort teardown of a node being replaced; never throws. */
+  async function retireNode(stale: WakuNode): Promise<void> {
+    if (connectionListener) stale.events.removeEventListener(WakuEvent.Connection, connectionListener);
+    connectionListener = null;
+    try {
+      if (ownDecoder) await stale.filter.unsubscribe(ownDecoder);
+    } catch {
+      // The peer is already gone; nothing left to unsubscribe from.
+    }
+    try {
+      await stale.stop();
+    } catch {
+      // A failed stop must not block the replacement node.
+    }
+  }
+
+  /**
+   * A started node that reports no libp2p connections is replaced. libp2p does
+   * not redial once every peer is gone, so reusing it would fail readiness and
+   * every push until the process restarts. Concurrent callers share one start.
+   */
+  let starting: Promise<WakuNode> | null = null;
   async function ensureStarted(): Promise<WakuNode> {
-    if (node && started) return node;
-    node = await withTimeout(createNode(config), config.peerTimeoutMs, 'waku node startup timed out');
-    await subscribeOwnDecoder(node);
-    connectedByEvent = true;
-    connectionListener = (event) => {
-      if (event.detail === true) {
-        connectedByEvent = true;
-        const current = node;
-        if (current) subscribeOwnDecoder(current).catch(() => { subscribed = false; });
-      } else if (event.detail === false) {
-        connectedByEvent = false;
+    if (starting) return starting;
+    const current = node;
+    const peerless = current !== null && typeof current.isConnected === 'function' && !current.isConnected();
+    if (current && started && !peerless) return current;
+    starting = (async () => {
+      if (current) {
+        node = null;
+        started = false;
         subscribed = false;
+        await retireNode(current);
       }
-    };
-    node.events.addEventListener(WakuEvent.Connection, connectionListener);
-    started = true;
-    return node;
+      const fresh = await withTimeout(createNode(config), config.peerTimeoutMs, 'waku node startup timed out');
+      node = fresh;
+      await subscribeOwnDecoder(fresh);
+      connectedByEvent = true;
+      connectionListener = (event) => {
+        if (event.detail === true) {
+          connectedByEvent = true;
+          const live = node;
+          if (live) subscribeOwnDecoder(live).catch(() => { subscribed = false; });
+        } else if (event.detail === false) {
+          connectedByEvent = false;
+          subscribed = false;
+        }
+      };
+      fresh.events.addEventListener(WakuEvent.Connection, connectionListener);
+      started = true;
+      return fresh;
+    })();
+    try {
+      return await starting;
+    } finally {
+      starting = null;
+    }
   }
 
   return {

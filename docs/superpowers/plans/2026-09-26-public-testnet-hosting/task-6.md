@@ -1,0 +1,22 @@
+# Task 6: Docs, review and close-out
+
+## 6.1 Public docs (subagent)
+
+- **Owns:** `README.md` (Status and "Public testnet" sections only), `docs/public-testnet.md` (new), `docs/embed.md` (new), `docs/demo-results.md` (a "Public testnet T01" section generated from `.runtime/public/report.json`). Timebox 90 min.
+- `docs/embed.md` is the seller-facing snippet: the script tag with the SRI hash read from `dist/browser/embed.sri.txt`, `<ssf-buy product="…">`, the `ssf:checkout` event shape, the popup-blocker fallback, and "purchases live on the storefront origin; tell buyers to bookmark it".
+- `docs/public-testnet.md` is a self-host guide mirroring `deploy/README.md` (Pi + Docker Compose + Cloudflare Tunnel), plus the trust statement: lightwalletd liveness trust, served-JS trust (Cloudflare terminates TLS and could alter served JavaScript; it cannot read encrypted files, Waku payloads or shielded payments), "testnet only, no real value", and replica limits: B on `ssf-replica` keeps files and backups when the Pi's storage is down, but the store itself is offline while the Pi is down.
+- Update `docs/public-testnet.md` and the T01 demo section to distinguish the **disposable, locally funded testnet automation wallet** from a user's personal wallet. Replace the existing blanket statement that agents cannot approve *any* payment with the precise boundary: no automated access to a user's wallet or seller seed; the separately created, capped testnet wallet may send only after the runner's recovery/QR gates. Document one-time external TAZ funding if no verified faucet works, pinned wallet/version, pre-payment profile/backup proof, two real testnet sends, independent seller viewing-only receipt and all eight stage results from the validated report. Do not publish wallet state, invoice identifiers, receiver, memo, payment URI, browser backup or UFVK. Optional CUA GUI coverage and `NOT_RUN`/refusals are separate; [the plan index](README.md#cua-scope-and-qualification-for-t01) remains the operator reference.
+- **Verify:** every command exists (grep scripts and `package.json`); a secret-shape grep finds 0 hits; there is no "production" or "mainnet ready" claim.
+
+## 6.2 Security and final review (1–2 read-only reviewers)
+
+- Package: the working-tree diff since 0.1 over all Task 2/3/5/6 Owns plus `deploy/**`.
+- Checklist: admin never exposed; the limiter covers both dispatchers; the embed postMessage checks origins both ways; CSP has no wildcard; no fixture adapters are reachable in `public-testnet`; a UFVK or URI never reaches logs; the Range handler has no off-by-one or overflow; the 8 MiB cap holds end to end; testnet params cannot be mixed with regtest state (`state_binding`). Review the T01 sender/recorder: testnet-only allowlist, two-send budget, invoice/QR exact match, durable buyer profile before payment, ambiguous-send resume without duplicate broadcast, seller-viewing-only import, true Pi build/log provenance, and report validation **before** writing. No private wallet data may reach CI or Git.
+- If Task 5.2 used CUA, check the bounded origin/profile scope, telemetry-off status, recording-off status and sanitized evidence. A Driver action or screenshot is not a scanner receipt, and no private payment screen should have been persisted.
+- Critical/Important → fixer → scoped re-review; stop and ask after 3 rounds.
+
+## 6.3 Close-out (orchestrator)
+
+- After Task 5.2c's real report exists, rerun the final gate on the Pi and locally: `npm test`, typecheck, `build:clean`, `test:browser`, cargo trio, `public-doctor --strict`, public smoke, and `node --experimental-strip-types scripts/public-t01.ts verify-report`. A prior local pass is not the post-T01 public gate; `NOT_RUN` and skipped browser/live cases do not satisfy it.
+- Commit now (the user's grant: commits at the end), split per Conventional Commits (feat/test/docs/ops), excluding `.runtime/`, `deploy/secrets/`, `pnpm-*`, `test-results/`. Push the commits (the deploy push grant covers this if still in the same deployment; otherwise ask).
+- Ledger: the T01 result from two actual CLI-wallet sends and eight scanner/storage/browser-backed stages, **plus a separate optional CUA GUI coverage result**, uptime since 4.5, and open items (store failover to the replica host, multi-tenant D4b, chunked files D5b, Logos Chat native client D1c). No funded automation wallet or compatible testnet sender means T01 remains blocked; unsupported CUA alone is `NOT_RUN` and cannot turn a real T01 into a failure or a fake PASS.

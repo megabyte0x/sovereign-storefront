@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -18,6 +19,7 @@ import { expect, test } from 'vitest';
 const root = process.cwd();
 const buildInputPaths = [
   'index.html',
+  'checkout.html',
   'package.json',
   'package-lock.json',
   'tsconfig.json',
@@ -97,7 +99,11 @@ function createRepository(browserBuildCommand?: string): { scratchDirectory: str
   return { scratchDirectory, repository };
 }
 
-function runCleanBuild(repository: string): void {
+function runCleanBuild(repository: string, restrictiveUmask = false): void {
+  if (restrictiveUmask) {
+    execFileSync('sh', ['-c', 'umask 077 && npm run build:clean'], { cwd: repository, stdio: 'pipe' });
+    return;
+  }
   execFileSync('npm', ['run', 'build:clean'], { cwd: repository, stdio: 'pipe' });
 }
 
@@ -119,7 +125,13 @@ test('clean build removes stale adapters and records source-linked provenance in
       writeFileSync(path, 'export const stale = true;\n');
     }
 
-    runCleanBuild(repository);
+    runCleanBuild(repository, true);
+    for (const path of ['dist', 'dist/browser', 'dist/service']) {
+      expect(statSync(resolve(repository, path)).mode & 0o777).toBe(0o755);
+    }
+    for (const path of ['dist/build-info.json', 'dist/service/main.js']) {
+      expect(statSync(resolve(repository, path)).mode & 0o777).toBe(0o644);
+    }
 
     for (const staleAdapterPath of staleAdapterPaths) {
       expect(existsSync(resolve(repository, staleAdapterPath))).toBe(false);
@@ -148,7 +160,7 @@ test('clean build removes stale adapters and records source-linked provenance in
   } finally {
     rmSync(scratchDirectory, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test('clean build refuses to write provenance when the repository snapshot changes during the build', () => {
   const mutationCommand = [

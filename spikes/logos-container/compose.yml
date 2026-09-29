@@ -1,0 +1,22 @@
+name: logos-container-spike
+services:
+  logos-a:
+    image: ${LOGOS_IMAGE:-ssf-logosctl:0.2.3-arm64}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    hostname: logos-a
+    volumes:
+      - ./state/node-a:/data
+    # Never 0.0.0.0. Cross-host sets LOGOS_A_BIND to `tailscale ip -4`.
+    ports:
+      - "${LOGOS_A_BIND:-127.0.0.1}:8091:8091"
+    environment:
+      QT_QPA_PLATFORM: offscreen
+  logos-b:
+    image: ${LOGOS_IMAGE:-ssf-logosctl:0.2.3-arm64}
+    hostname: logos-b
+    volumes:
+      - ./state/node-b:/data
+    environment:
+      QT_QPA_PLATFORM: offscreen

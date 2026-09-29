@@ -4,6 +4,7 @@ import type { Network } from '../contracts/live.ts';
 import { silentLogger, type OperationalLogger } from '../ops/log.ts';
 import type { Payments } from './payments.ts';
 import type { createInvoiceIssuer } from './issuance.ts';
+import { RateLimitedError } from './orders.ts';
 
 type InvoiceIssuer = ReturnType<typeof createInvoiceIssuer>;
 
@@ -48,7 +49,7 @@ type ResponseBody =
   | { type: 'status'; orderId: string; status: (SellerResponse & { type: 'status' })['status'] }
   | { type: 'delivery'; packageId: string; package: DeliveryPackage }
   | { type: 'acknowledged'; orderId: string; packageId: string }
-  | { type: 'error'; code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible' };
+  | { type: 'error'; code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible' | 'rate_limited' };
 
 /**
  * Owns seller business rules (checkout/status/recover/acknowledge) behind a
@@ -79,7 +80,7 @@ export function createSellerApplication(deps: SellerApplicationDeps): SellerAppl
   function respond(request: BuyerRequest, buyerKeyId: string, body: ResponseBody): SellerResponse {
     return { ...header(request, buyerKeyId), ...body } as SellerResponse;
   }
-  function errorResponse(request: BuyerRequest, buyerKeyId: string, code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible'): SellerResponse {
+  function errorResponse(request: BuyerRequest, buyerKeyId: string, code: 'unavailable' | 'invalid' | 'forbidden' | 'not_eligible' | 'rate_limited'): SellerResponse {
     return respond(request, buyerKeyId, { type: 'error', code });
   }
 
@@ -130,7 +131,8 @@ export function createSellerApplication(deps: SellerApplicationDeps): SellerAppl
               expectedAmountZat: body.expectedAmountZat,
             });
             return respond(body, signerKeyId, { type: 'invoice', invoice: invoiceToWire(invoice) });
-          } catch {
+          } catch (error) {
+            if (error instanceof RateLimitedError) return errorResponse(body, signerKeyId, 'rate_limited');
             return errorResponse(body, signerKeyId, 'unavailable');
           }
         }

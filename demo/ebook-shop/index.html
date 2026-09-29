@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="origin">
+    <title>Agent Mascot Books</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="https://store.agentmascot.app/embed.js" integrity="sha384-iaajWPse8DU/1ANONUP/fYVv4ASyfpuXS+gZINUa+850BbZY7JR03RFKyUIdQYsJ" crossorigin="anonymous" async></script>
+    <script>
+      window.addEventListener('ssf:checkout', function (event) {
+        var detail = event.detail || {};
+        var status = document.getElementById('checkout-status');
+        if (!status) return;
+        if (detail.state === 'invoiced') status.textContent = 'Invoice opened';
+        if (detail.state === 'delivered') status.textContent = 'Delivered';
+      });
+    </script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <p class="kicker">A small random-ebook shop</p>
+        <h1>Agent Mascot Books</h1>
+        <p class="lede">Two public-domain books. Pay shielded testnet Zcash in a popup on the storefront. Purchases stay there.</p>
+      </header>
+      <ul class="shelf">
+        <li class="card" data-version="gift-of-the-magi">
+          <div class="cover" aria-hidden="true"><span>Magi</span></div>
+          <div>
+            <h2>The Gift of the Magi</h2>
+            <p class="author">O. Henry</p>
+            <p class="blurb">A Christmas story about a watch chain, a set of combs, and two gifts that cross in the mail. Public-domain text.</p>
+          </div>
+          <ssf-buy product="gift-of-the-magi"></ssf-buy>
+        </li>
+        <li class="card" data-version="yellow-wallpaper">
+          <div class="cover" aria-hidden="true"><span>Yellow</span></div>
+          <div>
+            <h2>The Yellow Wallpaper</h2>
+            <p class="author">Charlotte Perkins Gilman</p>
+            <p class="blurb">A short story of a rented room, a barred pattern, and a mind under a rest cure. Public-domain text.</p>
+          </div>
+          <ssf-buy product="yellow-wallpaper"></ssf-buy>
+        </li>
+      </ul>
+      <p id="checkout-status" role="status" aria-live="polite"></p>
+      <footer>Zcash testnet demo. TAZ has no value.</footer>
+    </div>
+  </body>
+</html>

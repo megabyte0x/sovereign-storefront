@@ -1,0 +1,60 @@
+name: ssf-replica
+
+x-logging: &logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  logos-b:
+    image: ssf-logos:amd64
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    volumes:
+      - logos-b-data:/data
+      - logos-b-ipc:/tmp
+    environment:
+      QT_QPA_PLATFORM: offscreen
+      LOGOS_LISTEN_PORT: "8091"
+      LOGOS_DISC_PORT: "8090"
+    healthcheck:
+      # daemon status stays "running" after storage_module crashes; check the module.
+      test: ["CMD-SHELL", "/opt/logos/squashfs-root/usr/bin/logosctl --config-dir /data --json module ls | grep -q '\"storage_module\",\"status\":\"loaded\"'"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  replica-agent:
+    image: ssf-replica-agent:amd64
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    logging: *logging
+    build:
+      context: ..
+      dockerfile: deploy/images/replica-agent.Dockerfile
+    depends_on:
+      logos-b:
+        condition: service_healthy
+    volumes:
+      - logos-b-data:/data
+      - logos-b-ipc:/tmp
+      - /srv/ssf/replica.token:/var/lib/ssf/replica.token:ro
+    environment:
+      SSF_REPLICA_BIND: "0.0.0.0"
+      SSF_REPLICA_PORT: "8790"
+      SSF_REPLICA_TOKEN_FILE: /var/lib/ssf/replica.token
+      LOGOS_NODE_B: /data
+      LOGOSCTL: /opt/logos/squashfs-root/usr/bin/logosctl
+    ports:
+      - "${REPLICA_TAILNET_IP}:8790:8790"
+
+volumes:
+  logos-b-data:
+  logos-b-ipc:

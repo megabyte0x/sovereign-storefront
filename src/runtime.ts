@@ -169,9 +169,13 @@ async function startFixtureRuntime(config: RuntimeConfig, factories: RuntimeFact
 }
 
 export async function startRuntime(config: RuntimeConfig, factories: RuntimeFactories = {}): Promise<Runtime> {
-  if (config.mode !== 'real-demo') return startFixtureRuntime(config, factories);
+  if (config.mode !== 'real-demo' && config.mode !== 'public-testnet') return startFixtureRuntime(config, factories);
   const live = config.live;
-  if (!live) throw new ConfigError('real-demo requires live configuration');
+  if (!live) {
+    throw new ConfigError(config.mode === 'real-demo'
+      ? 'real-demo requires live configuration'
+      : 'public-testnet requires live configuration');
+  }
   const logger = factories.logger ?? silentLogger;
   const now = factories.now ?? Date.now;
   const intervalMs = factories.loopIntervalMs ?? DEFAULT_LOOP_INTERVAL_MS;
@@ -325,9 +329,14 @@ export async function startRuntime(config: RuntimeConfig, factories: RuntimeFact
       // Each replica probe is bounded; a timeout or error is "not ready". A
       // timed-out download may keep running in the adapter, but its result is
       // never observed.
-      const ok = product.ciphertextCid
-        ? await bounded(adapters.storage.verifyReplica(product.ciphertextCid, 'replica'), replicaProbeTimeoutMs, false)
-        : false;
+      const cid = product.ciphertextCid;
+      const digest = product.ciphertextDigest;
+      const sizeBytes = product.fileSize;
+      const ok = cid && digest && sizeBytes != null
+        ? await bounded(adapters.storage.verifyPublished(cid, digest, sizeBytes), replicaProbeTimeoutMs, false)
+        : cid
+          ? await bounded(adapters.storage.verifyReplica(cid, 'replica'), replicaProbeTimeoutMs, false)
+          : false;
       if (stopped) return readiness;
       replicaCache.set(product.version, { ok, checkedAt: now() });
       products[product.version] = allowNewCheckout({ productPublished: true, storageReplica: ok, scanner, messaging });

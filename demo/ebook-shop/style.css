@@ -1,0 +1,121 @@
+:root {
+  color-scheme: light;
+  --ink: #1c1612;
+  --paper: #f4efe6;
+  --card: #fffaf3;
+  --rule: #d9cbb8;
+  --magi: #6e2e2a;
+  --yellow: #c4a035;
+  --yellow-ink: #2c2410;
+  --muted: #6d6258;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--paper);
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  line-height: 1.45;
+}
+
+.wrap {
+  width: min(880px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2.5rem 0 3rem;
+}
+
+header h1 {
+  margin: 0.2rem 0 0.35rem;
+  font-size: 2.4rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.kicker,
+footer {
+  color: var(--muted);
+  font-family: "Source Sans 3", "Segoe UI", sans-serif;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lede {
+  max-width: 38rem;
+  margin: 0.8rem 0 0;
+}
+
+.shelf {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1.25rem;
+  margin: 2rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.card {
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.9rem;
+  background: var(--card);
+  border: 1px solid var(--rule);
+}
+
+.cover {
+  display: grid;
+  align-content: end;
+  min-height: 11rem;
+  padding: 1rem;
+  color: #fffaf3;
+  background: var(--magi);
+}
+
+.cover span {
+  font-size: 2.1rem;
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+
+.card[data-version="yellow-wallpaper"] .cover {
+  color: var(--yellow-ink);
+  background: var(--yellow);
+}
+
+h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 600;
+}
+
+.author,
+.blurb {
+  margin: 0.25rem 0 0;
+}
+
+.author {
+  color: var(--muted);
+  font-family: "Source Sans 3", "Segoe UI", sans-serif;
+  font-size: 0.92rem;
+}
+
+#checkout-status {
+  min-height: 1.4rem;
+  margin: 1.4rem 0 0;
+  font-family: "Source Sans 3", "Segoe UI", sans-serif;
+}
+
+footer {
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  text-transform: none;
+  letter-spacing: 0;
+}

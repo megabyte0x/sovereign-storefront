@@ -1,0 +1,7 @@
+# VPS cloudflared ingress. The ssf-store tunnel is locally managed, so routes
+# come from this file; the connector authenticates with --token-file. No
+# ingress for the admin port.
+ingress:
+  - hostname: store.agentmascot.app
+    service: http://seller:8787
+  - service: http_status:404

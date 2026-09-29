@@ -3,7 +3,21 @@ import type {
 } from '../contracts/types.ts';
 import type { BuyerRequest, DecodedWakuMessage, SellerResponse, StoredDelivery, WakuSession } from '../contracts/messages.ts';
 import type { Network } from '../contracts/live.ts';
-import { createWakuSession } from '../adapters/waku.ts';
+import { createWakuSession, routingInfoFor, wakuNetworkSettings, type WakuNetworkInput, type WakuNetworkSettings } from '../adapters/waku.ts';
+
+export function browserWakuNetworkSettings(input: WakuNetworkInput): WakuNetworkSettings {
+  return wakuNetworkSettings(input);
+}
+
+export function browserRoutingInfo(settings: WakuNetworkSettings, contentTopic: string) {
+  return routingInfoFor(settings, contentTopic);
+}
+
+/** Buyer-facing text for a signed seller error. `rate_limited` is an abuse cap, not a transport failure. */
+export function mapWakuSellerError(code: string): string {
+  if (code === 'rate_limited') return 'Too many open checkouts';
+  return `seller rejected request: ${code}`;
+}
 
 /**
  * Fixed single-product terms this storefront buys: the seller's own public
@@ -241,7 +255,7 @@ export function createWakuOrderTransport(
       throw new Error('response buyer identity does not match this credential');
     }
     if (response.type === 'error') {
-      throw new Error(`seller rejected request: ${response.code}`);
+      throw new Error(mapWakuSellerError(response.code));
     }
     return response;
   }

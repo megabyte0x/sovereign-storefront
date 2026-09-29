@@ -22,7 +22,7 @@ use crate::{
         AllocationIdentity, PersistedAllocations, validate_distinct_persisted_allocations,
     },
     cache::PersistentBlockCache,
-    config::{decode_regtest_orchard_ufvk, open_private_config, writer_lease_name},
+    config::{decode_orchard_ufvk, open_private_config, writer_lease_name},
     lease::WriterLease,
     private_fs::PrivateDir,
     projection::read_wallet_history,
@@ -247,7 +247,7 @@ fn validate_receipt(
     if receipt.amount_zat != REQUIRED_AMOUNT_ZAT
         || receipt.allocation_receiver_hex != allocation.orchard_receiver_hex
         || receipt.receiver_hex != allocation.orchard_receiver_hex
-        || receipt.pool != "orchard"
+        || !crate::projection::is_receipt_pool(&receipt.pool)
         || receipt.txid.is_empty()
         || receipt.mined_hash.is_empty()
     {
@@ -311,7 +311,7 @@ pub async fn run(
             .ensure_file(&writer_lease_name(&config.name))
             .map_err(|_| "scanner writer lease is unavailable safely")?,
     )?;
-    let ufvk = decode_regtest_orchard_ufvk(&params, &config.config.ufvk)?;
+    let ufvk = decode_orchard_ufvk(&params, "regtest", &config.config.ufvk)?;
     match stage {
         Stage::Prepare => {
             prepare(

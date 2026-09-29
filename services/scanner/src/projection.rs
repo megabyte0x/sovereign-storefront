@@ -8,14 +8,20 @@ use std::{fmt, path::Path};
 
 use rusqlite::{Connection, OpenFlags};
 use zcash_keys::address::Address;
-use zcash_protocol::local_consensus::LocalNetwork;
+use zcash_protocol::consensus::Parameters;
 
 const EXTERNAL_SCOPE: i64 = 0;
 const INTERNAL_SCOPE: i64 = 1;
 
-// `receiving_key_scopes`, `full_account_ids`, and `orchard_received_notes`
-// from the Cargo-resolved zakura-client-sqlite 0.1.0-rc5 migration graph.
-const REQUIRED_MIGRATIONS: [[u8; 16]; 3] = [
+// Pool codes in the wallet library's `v_received_outputs` view.
+const ORCHARD_POOL_CODE: i64 = 3;
+const IRONWOOD_POOL_CODE: i64 = 4;
+
+// `receiving_key_scopes`, `full_account_ids`, `orchard_received_notes` and
+// `ironwood_pool_code_views` from the Cargo-resolved zakura-client-sqlite
+// 0.1.0-rc5 migration graph. The last one puts NU6.3 Ironwood notes into
+// `v_received_outputs` with pool code 4.
+const REQUIRED_MIGRATIONS: [[u8; 16]; 4] = [
     [
         0xee, 0x89, 0xed, 0x2b, 0xc1, 0xc2, 0x42, 0x1e, 0x9e, 0x98, 0xc1, 0xe3, 0xe5, 0x4a, 0x7f,
         0xc2,
@@ -27,6 +33,10 @@ const REQUIRED_MIGRATIONS: [[u8; 16]; 3] = [
     [
         0x51, 0xd7, 0xa2, 0x73, 0xaa, 0x19, 0x41, 0x09, 0x93, 0x25, 0x80, 0xe4, 0xa5, 0x54, 0x50,
         0x48,
+    ],
+    [
+        0xa6, 0xef, 0x40, 0xc7, 0x05, 0x0a, 0x43, 0xc6, 0xa4, 0xe2, 0x2f, 0x03, 0x41, 0x68, 0xc9,
+        0x79,
     ],
 ];
 
@@ -78,6 +88,23 @@ const REQUIRED_OBJECTS: &[(&str, &str, &[&str])] = &[
         "orchard_received_note_spends",
         "table",
         &["orchard_received_note_id", "transaction_id"],
+    ),
+    (
+        "ironwood_received_notes",
+        "table",
+        &[
+            "id",
+            "transaction_id",
+            "action_index",
+            "account_id",
+            "recipient_key_scope",
+            "address_id",
+        ],
+    ),
+    (
+        "ironwood_received_note_spends",
+        "table",
+        &["ironwood_received_note_id", "transaction_id"],
     ),
 ];
 
@@ -150,12 +177,14 @@ pub struct Receipt {
     pub canonical: bool,
 }
 
-/// Reads all selected-account Orchard received rows, including spent and
-/// unmined rows, from a library-migrated wallet. No partial projection is
+/// Reads all selected-account Orchard and Ironwood received rows, including
+/// spent and unmined rows, from a library-migrated wallet. Since NU6.3 a
+/// payment to an Orchard receiver is recorded in the Ironwood pool, which
+/// shares the Orchard receiver. No partial projection is
 /// returned: malformed/missing ownership data is an unavailable snapshot.
 pub fn read_wallet_history(
     wallet_path: &Path,
-    params: &LocalNetwork,
+    params: &impl Parameters,
     account_id: &str,
 ) -> Result<WalletHistory, ProjectionError> {
     let account_uuid = decode_account_uuid(account_id)?;
@@ -178,42 +207,59 @@ pub fn read_wallet_history(
     let mut statement = connection
         .prepare(
             "SELECT t.txid, ro.output_index, ro.value,
-                    n.recipient_key_scope, ad.key_scope, ad.account_id, ad.address,
+                    COALESCE(n.recipient_key_scope, iw.recipient_key_scope),
+                    ad.key_scope, ad.account_id, ad.address,
                     t.block, t.mined_height, b.hash,
-                    EXISTS(
+                    CASE ro.pool
+                      WHEN ?2 THEN EXISTS(
                         SELECT 1 FROM orchard_received_note_spends AS spend
-                        WHERE spend.orchard_received_note_id = n.id
-                    ) AS spent
+                        WHERE spend.orchard_received_note_id = n.id)
+                      ELSE EXISTS(
+                        SELECT 1 FROM ironwood_received_note_spends AS spend
+                        WHERE spend.ironwood_received_note_id = iw.id)
+                    END AS spent,
+                    ro.pool
              FROM v_received_outputs AS ro
              JOIN transactions AS t ON t.id_tx = ro.transaction_id
              JOIN accounts AS a ON a.id = ro.account_id
              LEFT JOIN orchard_received_notes AS n
-               ON n.id = ro.id_within_pool_table
+               ON ro.pool = ?2
+              AND n.id = ro.id_within_pool_table
               AND n.transaction_id = ro.transaction_id
               AND n.action_index = ro.output_index
               AND n.account_id = ro.account_id
+             LEFT JOIN ironwood_received_notes AS iw
+               ON ro.pool = ?3
+              AND iw.id = ro.id_within_pool_table
+              AND iw.transaction_id = ro.transaction_id
+              AND iw.action_index = ro.output_index
+              AND iw.account_id = ro.account_id
              LEFT JOIN addresses AS ad ON ad.id = ro.address_id
              LEFT JOIN blocks AS b ON b.height = t.block
-             WHERE ro.account_id = ?1 AND ro.pool = 3
-             ORDER BY t.txid, ro.output_index",
+             WHERE ro.account_id = ?1 AND ro.pool IN (?2, ?3)
+             ORDER BY t.txid, ro.pool, ro.output_index",
         )
         .map_err(|_| ProjectionError::Unavailable)?;
     let rows = statement
-        .query_map([selected_account], |row| {
-            Ok(WalletRow {
-                txid: row.get(0)?,
-                output_index: row.get(1)?,
-                value: row.get(2)?,
-                note_scope: row.get(3)?,
-                address_scope: row.get(4)?,
-                address_account_id: row.get(5)?,
-                address: row.get(6)?,
-                scanned_block_height: row.get(7)?,
-                mined_height: row.get(8)?,
-                scanned_block_hash: row.get(9)?,
-                spent: row.get::<_, i64>(10)? != 0,
-            })
-        })
+        .query_map(
+            [selected_account, ORCHARD_POOL_CODE, IRONWOOD_POOL_CODE],
+            |row| {
+                Ok(WalletRow {
+                    txid: row.get(0)?,
+                    output_index: row.get(1)?,
+                    value: row.get(2)?,
+                    note_scope: row.get(3)?,
+                    address_scope: row.get(4)?,
+                    address_account_id: row.get(5)?,
+                    address: row.get(6)?,
+                    scanned_block_height: row.get(7)?,
+                    mined_height: row.get(8)?,
+                    scanned_block_hash: row.get(9)?,
+                    spent: row.get::<_, i64>(10)? != 0,
+                    pool_code: row.get(11)?,
+                })
+            },
+        )
         .map_err(|_| ProjectionError::Unavailable)?;
 
     let mut outputs = Vec::new();
@@ -262,11 +308,16 @@ pub fn read_wallet_history(
             (None, _, None) | (None, _, Some(_)) | (Some(_), None, _) => None,
             _ => return Err(ProjectionError::Unavailable),
         };
+        let pool = match row.pool_code {
+            ORCHARD_POOL_CODE => "orchard",
+            IRONWOOD_POOL_CODE => "ironwood",
+            _ => return Err(ProjectionError::Unavailable),
+        };
         let txid = hex::encode(txid);
         outputs.push(ProjectedOutput {
-            output_id: format!("{txid}:orchard:{output_index}"),
+            output_id: format!("{txid}:{pool}:{output_index}"),
             txid,
-            pool: "orchard".to_owned(),
+            pool: pool.to_owned(),
             output_index,
             account_id: account_id.to_owned(),
             scope: "external".to_owned(),
@@ -293,6 +344,7 @@ struct WalletRow {
     mined_height: Option<i64>,
     scanned_block_hash: Option<Vec<u8>>,
     spent: bool,
+    pool_code: i64,
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), ProjectionError> {
@@ -357,7 +409,7 @@ fn decode_account_uuid(account_id: &str) -> Result<Vec<u8>, ProjectionError> {
     hex::decode(compact).map_err(|_| ProjectionError::Unavailable)
 }
 
-fn external_orchard_receiver(params: &LocalNetwork, address: &str) -> Option<String> {
+fn external_orchard_receiver(params: &impl Parameters, address: &str) -> Option<String> {
     let Address::Unified(address) = Address::decode(params, address)? else {
         return None;
     };
@@ -378,7 +430,7 @@ pub fn receipt_from_output(output: ProjectedOutput, account_id: &str) -> Option<
     if output.origin != ProjectionOrigin::Received
         || output.account_id != account_id
         || output.scope != "external"
-        || output.pool != "orchard"
+        || !is_receipt_pool(&output.pool)
         || output.output_id.is_empty()
         || output.output_id.len() > 256
         || !is_lower_hex(&output.txid, 32)
@@ -415,6 +467,12 @@ pub fn receipt_from_output(output: ProjectedOutput, account_id: &str) -> Option<
         canonical: mined.is_some(),
         mined,
     })
+}
+
+/// Pools whose notes are addressed to the external Orchard receiver the
+/// scanner allocates: Orchard, and Ironwood after NU6.3.
+pub fn is_receipt_pool(pool: &str) -> bool {
+    matches!(pool, "orchard" | "ironwood")
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {

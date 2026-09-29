@@ -1,7 +1,6 @@
 import type { CryptoAdapter, StorageAdapter } from '../contracts/types.ts';
 import {
   FILE_FORMAT_VERSION,
-  FIRST_RELEASE_MAX_CIPHERTEXT_BYTES,
   FIRST_RELEASE_MAX_PLAINTEXT_BYTES,
   PayloadTooLarge,
   sha256Hex,
@@ -18,6 +17,8 @@ export type PublishInput = {
   crypto: CryptoAdapter;
   storage: StorageAdapter;
   replicaId: string;
+  /** Defaults to the real-demo 41-byte cap. Public-testnet passes its configured cap. */
+  maxPlaintextBytes?: number;
 };
 
 async function exportWrappedKey(crypto: CryptoAdapter, keyRef: string): Promise<Uint8Array> {
@@ -32,10 +33,12 @@ export async function publishProduct(input: PublishInput): Promise<ProductManife
   if (!(input.plaintext instanceof Uint8Array)) {
     throw new Error('malformed payload: plaintext');
   }
-  if (input.plaintext.byteLength > FIRST_RELEASE_MAX_PLAINTEXT_BYTES) {
-    throw new PayloadTooLarge(input.plaintext.byteLength, FIRST_RELEASE_MAX_PLAINTEXT_BYTES);
+  const cap = input.maxPlaintextBytes ?? FIRST_RELEASE_MAX_PLAINTEXT_BYTES;
+  if (input.plaintext.byteLength > cap) {
+    throw new PayloadTooLarge(input.plaintext.byteLength, cap);
   }
-  const catalogue = openCatalogue({ dbPath: input.dbPath, storage: input.storage });
+  const maxCiphertextBytes = cap + 32;
+  const catalogue = openCatalogue({ dbPath: input.dbPath, storage: input.storage, maxCiphertextBytes });
   try {
     catalogue.beginPublication({
       version: input.version,
@@ -44,8 +47,8 @@ export async function publishProduct(input: PublishInput): Promise<ProductManife
       network: input.network,
     });
     const { ciphertext, keyRef } = await input.crypto.encryptProduct(input.plaintext);
-    if (ciphertext.byteLength > FIRST_RELEASE_MAX_CIPHERTEXT_BYTES) {
-      throw new PayloadTooLarge(ciphertext.byteLength, FIRST_RELEASE_MAX_CIPHERTEXT_BYTES);
+    if (ciphertext.byteLength > maxCiphertextBytes) {
+      throw new PayloadTooLarge(ciphertext.byteLength, maxCiphertextBytes);
     }
     const ciphertextCid = await input.storage.publish(ciphertext);
     const replicaOk = await input.storage.verifyReplica(ciphertextCid, input.replicaId);

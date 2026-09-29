@@ -11,19 +11,22 @@ use std::{
 };
 
 use zcash_client_backend::{
-    data_api::Account as _,
-    proto::service::{ChainSpec, Empty, compact_tx_streamer_client::CompactTxStreamerClient},
+    data_api::{Account as _, AccountBirthday},
+    proto::service::{
+        BlockId, ChainSpec, Empty, compact_tx_streamer_client::CompactTxStreamerClient,
+    },
     sync,
 };
-use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     allocate::AllocationJournal,
     api::{ApiService, HttpRequest, HttpResponse},
     cache::PersistentBlockCache,
     config::{
-        acquire_config_writer_lease, decode_regtest_orchard_ufvk, open_runtime_paths,
-        persist_or_verify_birthday_attestation,
+        ScannerParams, acquire_config_writer_lease, decode_orchard_ufvk, open_runtime_paths,
+        pending_testnet_birthday, persist_or_verify_birthday_attestation,
+        trusted_birthday_from_tree_state, write_fetched_birthday_tree,
     },
     consensus::verify_lightd_consensus,
     enhance::{capped_backoff, fulfill_pending_transaction_requests},
@@ -113,9 +116,9 @@ pub struct PersistentScanner {
 struct LifecycleWorker {
     snapshots: Arc<SnapshotStore>,
     state: Arc<PrivateDir>,
-    wallet: Arc<Mutex<PersistentWalletDb>>,
+    wallet: Arc<Mutex<PersistentWalletDb<ScannerParams>>>,
     wallet_path: PathBuf,
-    params: LocalNetwork,
+    params: ScannerParams,
     endpoint: String,
     account_id: String,
 }
@@ -123,8 +126,9 @@ struct LifecycleWorker {
 impl PersistentScanner {
     pub fn open(config_path: &Path) -> Result<Self, &'static str> {
         let writer_lease = acquire_config_writer_lease(config_path)?;
+        ensure_testnet_birthday_tree(config_path)?;
         let runtime = open_runtime_paths(config_path)?;
-        let ufvk = decode_regtest_orchard_ufvk(&runtime.params, &runtime.ufvk)?;
+        let ufvk = decode_orchard_ufvk(&runtime.params, &runtime.chain.network, &runtime.ufvk)?;
         // Restored state must be explicitly acknowledged (new source epoch,
         // freshness reset) before any writable open or snapshot is served.
         verify_state_binding(&runtime.state)?;
@@ -320,6 +324,64 @@ async fn remote_tip(
     };
     tip.validate()?;
     Ok(tip)
+}
+
+/// Fetches `GetTreeState(birthday-1)` over TLS when a testnet config has no
+/// operator-attested tree, and persists that state as `birthdayTree`. Regtest
+/// and already-attested configs are unchanged.
+fn ensure_testnet_birthday_tree(config_path: &Path) -> Result<(), &'static str> {
+    let Some(pending) = pending_testnet_birthday(config_path)? else {
+        return Ok(());
+    };
+    let height = u64::from(pending.birthday - 1);
+    let tree = fetch_tree_state_blocking(&pending.endpoint, height)?;
+    let trusted = trusted_birthday_from_tree_state(&tree, "test", pending.birthday)?;
+    AccountBirthday::from_treestate(tree, None).map_err(|_| "scanner birthday is invalid")?;
+    write_fetched_birthday_tree(config_path, &trusted)
+}
+
+fn fetch_tree_state_blocking(
+    endpoint: &str,
+    height: u64,
+) -> Result<zcash_client_backend::proto::service::TreeState, &'static str> {
+    let endpoint = endpoint.to_owned();
+    thread::Builder::new()
+        .name("scanner-birthday".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .enable_io()
+                .build()
+                .map_err(|_| "scanner birthday tree state failed")?;
+            runtime.block_on(fetch_tree_state(&endpoint, height))
+        })
+        .map_err(|_| "scanner birthday tree state failed")?
+        .join()
+        .map_err(|_| "scanner birthday tree state failed")?
+}
+
+async fn fetch_tree_state(
+    endpoint: &str,
+    height: u64,
+) -> Result<zcash_client_backend::proto::service::TreeState, &'static str> {
+    let mut client = within_deadline(
+        GRPC_CONNECT_DEADLINE,
+        CompactTxStreamerClient::connect(endpoint.to_owned()),
+    )
+    .await
+    .map_err(|_| "scanner birthday tree state timed out")?
+    .map_err(|_| "scanner birthday tree state failed")?;
+    within_deadline(
+        GRPC_RPC_DEADLINE,
+        client.get_tree_state(BlockId {
+            height,
+            hash: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| "scanner birthday tree state timed out")?
+    .map_err(|_| "scanner birthday tree state failed")
+    .map(tonic::Response::into_inner)
 }
 
 fn checked_at() -> u64 {

@@ -1,0 +1,19 @@
+{
+  "entryLayer": "kernel",
+  "kernelConf": {
+    "clusterId": 1,
+    "numShardsInNetwork": 8,
+    "relay": true,
+    "filter": true,
+    "lightpush": true,
+    "rlnRelay": false,
+    "store": false,
+    "listenAddress": "127.0.0.1",
+    "tcpPort": 30303,
+    "websocketSupport": true,
+    "websocketPort": 8000,
+    "discv5Discovery": false,
+    "peerExchange": false,
+    "logLevel": "INFO"
+  }
+}

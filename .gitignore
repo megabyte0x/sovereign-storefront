@@ -7,6 +7,7 @@ services/scanner/target/
 services/test-wallet/runtime/
 services/test-wallet/target/
 tools/payment-test-wallet/target/
+tools/buyer-sender/target/
 .env
 .env.*
 *.key
@@ -21,3 +22,8 @@ spikes/**/wallets/
 playwright-report/
 test-results/
 coverage/
+*.ufvk
+spikes/**/state/
+pnpm-lock.yaml
+pnpm-workspace.yaml
+demo/**/.wrangler/

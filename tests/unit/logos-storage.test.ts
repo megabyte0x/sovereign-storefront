@@ -3,6 +3,8 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, expect, test, vi } from 'vitest';
+import { sha256Hex } from '../../src/adapters/crypto.ts';
+import { PUBLIC_MAX_PLAINTEXT_BYTES } from '../../src/contracts/public.ts';
 import {
   DOWNLOAD_DONE_EVENT,
   UPLOAD_DONE_EVENT,
@@ -333,4 +335,83 @@ test('detectLogosRuntime requires explicit env configuration; no hardcoded histo
 test('this file leaves no new $TMPDIR/ssf-logos-* dirs behind', () => {
   const leaked = [...logosTmpDirs()].filter((name) => !logosTmpBefore.has(name));
   expect(leaked).toEqual([]);
+});
+
+function uploadRunner(sessionId: string, event: Record<string, unknown> | null) {
+  return fakeRunner({
+    call: (configDir, method) => {
+      if (method === 'uploadUrl') return sessionId;
+      if (method === 'peerId') return `peer-${configDir}`;
+      if (method === 'connect') return { connected: true };
+      if (method === 'exists') return true;
+      if (method === 'manifests') return [];
+      return null;
+    },
+    waitForEvent: async (_configDir, eventName) => {
+      if (eventName !== UPLOAD_DONE_EVENT) return null;
+      return event;
+    },
+  });
+}
+
+test('an 8 MiB upload through the fake runner is correlated by sessionId', async () => {
+  const bytes = new Uint8Array(PUBLIC_MAX_PLAINTEXT_BYTES);
+  bytes[0] = 7;
+  const matched = uploadRunner('sess-8mib', { success: true, cid: 'cid-8mib', sessionId: 'sess-8mib' });
+  const adapter = makeAdapter(
+    runtime,
+    { runner: matched.runner, readFile: () => bytes, writeFile: () => undefined },
+    { maxBytes: PUBLIC_MAX_PLAINTEXT_BYTES },
+  );
+  await expect(adapter.publish(bytes)).resolves.toBe('cid-8mib');
+
+  const uncorrelated = uploadRunner('sess-8mib', { success: true, cid: 'cid-other' });
+  const rejected = makeAdapter(
+    runtime,
+    { runner: uncorrelated.runner, readFile: () => new Uint8Array([1]), writeFile: () => undefined },
+    { maxBytes: PUBLIC_MAX_PLAINTEXT_BYTES },
+  );
+  await expect(rejected.publish(new Uint8Array([1, 2, 3]))).rejects.toThrow(/session/);
+});
+
+test('the per-call upload temp file is removed in finally', async () => {
+  const workDir = mkdtempSync(join(unitScratch, 'tmp-'));
+  const { runner } = uploadRunner('sess-a', { success: true, cid: 'cid-a', sessionId: 'other-session' });
+  const adapter = makeAdapter(runtime, { runner, workDir }, { maxBytes: 1024 });
+  await expect(adapter.publish(new Uint8Array([1, 2, 3, 4]))).rejects.toThrow(/session/);
+  expect(readdirSync(workDir).filter((name) => name.startsWith('upload-'))).toEqual([]);
+});
+
+test('download validates size and digest', async () => {
+  const good = new Uint8Array([9, 8, 7, 6, 5]);
+  const digest = sha256Hex(good);
+  const tampered = new Uint8Array(good);
+  tampered[0] ^= 0xff;
+
+  function downloadAdapter(bytes: Uint8Array, manifest: Record<string, unknown>) {
+    const { runner } = fakeRunner({
+      call: (configDir, method) => {
+        if (method === 'manifests') return [{ cid: 'cid-digest', ...manifest }];
+        if (method === 'peerId') return `peer-${configDir}`;
+        if (method === 'exists') return true;
+        if (method === 'connect') return { connected: true };
+        return null;
+      },
+      waitForEvent: async (_configDir, eventName) => {
+        if (eventName === DOWNLOAD_DONE_EVENT) return { success: true, cid: 'cid-digest' };
+        return null;
+      },
+    });
+    return makeAdapter(
+      runtime,
+      { runner, readFile: () => bytes, writeFile: () => undefined },
+      { maxBytes: 100 },
+    );
+  }
+
+  await expect(downloadAdapter(tampered, { datasetSize: tampered.byteLength, digest }).fetch('cid-digest')).rejects.toThrow(/digest/);
+  const oversized = new Uint8Array(good.byteLength + 3);
+  oversized.set(good);
+  await expect(downloadAdapter(oversized, { datasetSize: good.byteLength, digest: sha256Hex(oversized) }).fetch('cid-digest')).rejects.toThrow(/size|incomplete/);
+  await expect(downloadAdapter(good, { datasetSize: good.byteLength, digest }).fetch('cid-digest')).resolves.toEqual(good);
 });

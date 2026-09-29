@@ -1,0 +1,13 @@
+{"subtask":"6.2","status":"done",
+ "changed_files":["tests/unit/public-t01-wallet.test.ts","tests/unit/public-t01.test.ts"],
+ "commands":[
+  {"cmd":"npx vitest run tests/unit/public-t01-wallet.test.ts tests/unit/public-t01.test.ts","exit":0},
+  {"cmd":"npx tsc --noEmit","exit":0}],
+ "evidence":[
+  "public-t01-wallet.test.ts: 32 tests pass (fake sender speaks frozen JSON contract, records argv + URI-file content)",
+  "public-t01.test.ts: 13 tests pass (was 2 failing: finalize 'zingo-cli' and display-byte-order)",
+  "display-byte-order failure was test-side: default paymentState fixture looks up TX(n) but that test keys mempool by internal(n); fixed via browser.paymentState override",
+  "walletSend covered: sent on 2nd poll, ambiguous after budget (5 resolves, 1 send), interval 0 => no polls/ambiguous",
+  "tsc --noEmit exit 0"],
+ "deviations":[],
+ "notes_for_next_subtask":"No script edits. walletSend tests live in public-t01-wallet.test.ts (no live test file exists), using injected run/ledgerPath/sleep and pollIntervalMs 1. pollIntervalMs 0 is guarded in the script (polls=0, returns ambiguous); tested. Removed the zingo walletBinary/transport tests and the balance-retry tests (balanceRetryDelayMs no longer exists in WalletDeps). Added extra cases: URI file removed on refusal, status unavailable, malformed status, pending-with-txid kept on 'no attempt recorded', exit 4 + mempool stays pending."}

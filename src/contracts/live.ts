@@ -30,6 +30,17 @@ export type ReceiverAllocation = AllocateReceiver & {
   paymentUri: string;
 };
 
+/**
+ * Pools whose notes pay the Orchard receiver the scanner allocates. After NU6.3
+ * a payment to an Orchard receiver is recorded in the Ironwood pool.
+ */
+export const RECEIPT_POOLS = ['orchard', 'ironwood'] as const;
+export type ReceiptPool = (typeof RECEIPT_POOLS)[number];
+
+export function isReceiptPool(value: unknown): value is ReceiptPool {
+  return typeof value === 'string' && (RECEIPT_POOLS as readonly string[]).includes(value);
+}
+
 export type Receipt = {
   outputId: string;
   txid: string;

@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, env, path::PathBuf, process::ExitCode};
 
 use sovereign_storefront_scanner::{
-    config::{ActivationHeights, validate_lightwalletd_endpoint},
+    config::{self, ActivationHeights, validate_lightwalletd_endpoint},
     consensus::verify_lightd_consensus,
     daemon::PersistentScanner,
     restore::{
@@ -266,6 +266,22 @@ fn run_service(config: PathBuf, serve: bool) -> ExitCode {
 async fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
         Some("init-view") => {
+            let args: Vec<String> = env::args().skip(2).collect();
+            if args.iter().any(|arg| arg == "--network") {
+                let (config, lightwalletd, birthday) =
+                    match config::parse_testnet_init_view_args(&args) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            eprintln!("scanner runtime initialization failed");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                if config::apply_testnet_init_view(&config, &lightwalletd, birthday).is_err() {
+                    eprintln!("scanner runtime initialization failed");
+                    return ExitCode::FAILURE;
+                }
+                return run_service(config, false);
+            }
             let Some(config) = service_config() else {
                 return ExitCode::FAILURE;
             };

@@ -1,0 +1,25 @@
+{"subtask":"4.2","status":"done",
+"changed_files":["tools/buyer-sender/src/pay.rs","tools/buyer-sender/src/main.rs"],
+"commands":[
+ {"cmd":"npm run build:buyer-sender > .runtime/public/diag/buyer-sender-4.2.log 2>&1","exit":0},
+ {"cmd":"grep -nE '^(error|warning)' .runtime/public/diag/buyer-sender-4.2.log","exit":1},
+ {"cmd":"ssf-buyer-sender --state-dir $TMPDIR/ssf-buyer-probe --lightwalletd https://127.0.0.1:1 pay --uri-file /dev/null --attempt-id <sha256('probe')>","exit":4},
+ {"cmd":"ssf-buyer-sender ... pay --uri-file /dev/null --attempt-id ABC","exit":2},
+ {"cmd":"ssf-buyer-sender ... pay --uri-file /dev/null --attempt-id <64 hex, no file>","exit":2},
+ {"cmd":"grep -nE 'raw_hex|to_uri|encode' tools/buyer-sender/src/main.rs","exit":1}
+],
+"evidence":[
+ "build: exit 0, 0 error/warning lines in buyer-sender-4.2.log",
+ "guard probe: printed {attemptId,txid,targetHeight:100,expiryHeight:120,broadcast:unknown}, exit 4, with --lightwalletd https://127.0.0.1:1 (no connect error surfaced)",
+ "bad id -> {\"error\":\"attempt id is invalid\"} exit 2; no attempt file -> falls through to read_uri_file(/dev/null) -> \"invoice file permissions are unsafe\" exit 2",
+ "probe dir removed; grep on main.rs finds no raw_hex/to_uri/encode",
+ "pay was never run against a real invoice or seed"
+],
+"deviations":[
+ {"file":"tools/buyer-sender/src/main.rs","line":31,"text":"type CommandResult = Result<(Value, u8), (u8, &'static str)>","why":"pay must print JSON with exit 3/4; the old Ok(Value) could only exit 0. import/status return (json,0); main emits the value and uses the code as the exit status"},
+ {"file":"tools/buyer-sender/src/main.rs","line":218,"text":"pub(crate) fn refuse","why":"pay.rs reuses it"},
+ {"file":"tools/buyer-sender/src/pay.rs","line":8,"text":"removed #![allow(dead_code)]","why":"all items are now used; the build is warning-free"},
+ {"file":"tools/buyer-sender/src/pay.rs","line":259,"text":"warmup circuit = bundle_version_for_branch(BranchId::for_height(params,min_target_height), orchard::ValuePool::Orchard).circuit_version()","why":"rc5 has no direct height->circuit helper; this is how the zakura-primitives builder derives the circuit version. Warmup is skipped if the branch has no Orchard revision"},
+ {"file":"tools/buyer-sender/src/pay.rs","line":0,"text":"new pre-attempt exit-2 errors: \"signed transaction cannot be read\", \"signed transaction expiry mismatch\", \"signed transaction cannot be encoded\", \"expiry height is invalid\", \"wallet is not imported\"","why":"brief fixes behaviour but not these strings"}
+],
+"notes_for_next_subtask":"pay.rs: pub fn attempt_output(&Attempt, Broadcast) -> Value (frozen pay/rebroadcast shape); fn broadcast_exit(Broadcast)->u8 (Accepted 0, else 3), private, so make it pub(crate) or reuse the match for rebroadcast;\npub fn pay_guard(&StateDir, id) -> Result<Option<(Value,u8)>,(u8,&str)> validates the id, then read_attempt; runs before chain.connect();\npub async fn pay(state, &dyn ChainFactory, &Path, id, delta) -> crate::CommandResult; main.rs pay() delegates to it.\nCommandResult is now Result<(Value, exit_code), (code, err)>: tx_status/rebroadcast must return (json, code).\nAfter write_attempt the only step is chain::broadcast, which cannot error, so post-attempt exits are always 0 or 3.\nProbe pitfall: StateDir needs a 0700 parent for --state-dir; `mkdir -m 700 -p a/b` leaves a at the umask mode, so chmod both levels."}

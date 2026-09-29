@@ -1,0 +1,14 @@
+{
+  "entryLayer": "messaging",
+  "mode": "Core",
+  "preset": "logos.test",
+  "messagingOverrides": {
+    "logLevel": "INFO",
+    "listen-address": "127.0.0.1",
+    "tcp-port": 30303,
+    "discv5-udp-port": 9000,
+    "websocketSupport": true,
+    "websocketPort": 8000,
+    "clusterId": 1
+  }
+}

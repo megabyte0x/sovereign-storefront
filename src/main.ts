@@ -80,7 +80,7 @@ export async function runMain(env: NodeJS.Dict<string>, deps: MainDeps): Promise
   let runtime: Runtime;
   try {
     const config = deps.loadConfig(env);
-    if (config.mode !== 'real-demo') {
+    if (config.mode !== 'real-demo' && config.mode !== 'public-testnet') {
       const seller = await deps.startSeller(config);
       stopResource = () => seller.close();
       if (stopping) return shutdown();

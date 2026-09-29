@@ -22,7 +22,7 @@ use zcash_keys::{
     address::UnifiedAddress,
     keys::{AddressGenerationError, UnifiedAddressRequest, UnifiedFullViewingKey},
 };
-use zcash_protocol::{local_consensus::LocalNetwork, value::Zatoshis};
+use zcash_protocol::{consensus::Parameters, local_consensus::LocalNetwork, value::Zatoshis};
 use zip32::DiversifierIndex;
 use zip321::{Payment, TransactionRequest};
 
@@ -31,15 +31,18 @@ use crate::allocate::{
 };
 
 /// Concrete persisted `WalletDb` type used by this view-only scanner.
-pub(crate) type PersistentWalletDb =
-    WalletDb<Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
+pub(crate) type PersistentWalletDb<P = LocalNetwork> =
+    WalletDb<Connection, P, SystemClock, UnwrapErr<SysRng>>;
 
 /// Opens and migrates the scanner's persisted wallet database without any
 /// spending material. Callers must supply a private, non-symlinked path.
-pub(crate) fn open_persistent_wallet_db(
+pub(crate) fn open_persistent_wallet_db<P>(
     path: &Path,
-    params: LocalNetwork,
-) -> Result<PersistentWalletDb, &'static str> {
+    params: P,
+) -> Result<PersistentWalletDb<P>, &'static str>
+where
+    P: Parameters + 'static,
+{
     let mut db = WalletDb::for_path(path, params, SystemClock, UnwrapErr(SysRng))
         .map_err(|_| "wallet database cannot be opened")?;
     init_wallet_db(&mut db, None).map_err(|_| "wallet database cannot be initialized")?;
@@ -187,19 +190,15 @@ pub fn external_orchard_receiver_hex(address: &UnifiedAddress) -> Option<String>
 ///
 /// It has no spending interface. Allocation always derives the journal-reserved
 /// index and therefore never allocates a replacement receiver during retry.
-pub(crate) struct WalletAllocationDeriver {
-    wallet: Arc<Mutex<PersistentWalletDb>>,
+pub(crate) struct WalletAllocationDeriver<P> {
+    wallet: Arc<Mutex<PersistentWalletDb<P>>>,
     account: AccountUuid,
-    params: LocalNetwork,
+    params: P,
 }
 
-impl WalletAllocationDeriver {
+impl<P> WalletAllocationDeriver<P> {
     #[cfg(test)]
-    pub(crate) fn new(
-        wallet: PersistentWalletDb,
-        account: AccountUuid,
-        params: LocalNetwork,
-    ) -> Self {
+    pub(crate) fn new(wallet: PersistentWalletDb<P>, account: AccountUuid, params: P) -> Self {
         Self::from_shared(Arc::new(Mutex::new(wallet)), account, params)
     }
 
@@ -207,9 +206,9 @@ impl WalletAllocationDeriver {
     /// allocation handling. This prevents in-process SQLite writer contention
     /// and lets lifecycle scans quiesce derivation for coherent snapshots.
     pub(crate) fn from_shared(
-        wallet: Arc<Mutex<PersistentWalletDb>>,
+        wallet: Arc<Mutex<PersistentWalletDb<P>>>,
         account: AccountUuid,
-        params: LocalNetwork,
+        params: P,
     ) -> Self {
         Self {
             wallet,
@@ -219,7 +218,7 @@ impl WalletAllocationDeriver {
     }
 }
 
-impl AllocationDeriver for WalletAllocationDeriver {
+impl<P: Parameters + Send + Sync> AllocationDeriver for WalletAllocationDeriver<P> {
     fn derive(&self, reserved: &ReservedAllocation) -> Result<ReceiverDerivation, &'static str> {
         let index: [u8; 11] = hex::decode(&reserved.index)
             .map_err(|_| "wallet allocation index is invalid")?
@@ -244,7 +243,7 @@ impl AllocationDeriver for WalletAllocationDeriver {
     }
 }
 
-impl WalletAllocationDeriver {
+impl<P: Parameters> WalletAllocationDeriver<P> {
     fn receiver_derivation(
         &self,
         address: UnifiedAddress,
@@ -262,6 +261,52 @@ impl WalletAllocationDeriver {
             receiver_hex,
         })
     }
+}
+
+/// Imports `ufvk` into a fresh wallet and allocates one Orchard-only unified address.
+/// The encoded address uses `params` (so testnet yields a `utest1` receiver).
+pub fn allocate_orchard_only_address<P>(
+    params: &P,
+    ufvk: &UnifiedFullViewingKey,
+    wallet_path: &Path,
+) -> Result<String, &'static str>
+where
+    P: Parameters + Clone + 'static,
+{
+    use zcash_protocol::consensus::{NetworkType, NetworkUpgrade};
+
+    let network = match params.network_type() {
+        NetworkType::Test => "test",
+        NetworkType::Regtest => "regtest",
+        NetworkType::Main => return Err("scanner network is not permitted"),
+    };
+    // Orchard receivers do not exist before NU5. A height-0 tip cannot allocate one.
+    let prior = params
+        .activation_height(NetworkUpgrade::Nu5)
+        .map(|height| u64::from(u32::from(height)).saturating_sub(1))
+        .unwrap_or(0);
+    let birthday = AccountBirthday::from_treestate(
+        zcash_client_backend::proto::service::TreeState {
+            network: network.to_owned(),
+            height: prior,
+            hash: "00".repeat(32),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: String::new(),
+            ironwood_tree: String::new(),
+        },
+        None,
+    )
+    .map_err(|_| "scanner birthday is invalid")?;
+    let mut db = open_persistent_wallet_db(wallet_path, params.clone())?;
+    let account = ensure_view_only_account(&mut db, "scanner", ufvk, &birthday)?;
+    let address = allocate_next_external_orchard_address(&mut db, account.id())
+        .map_err(|_| "wallet allocation failed")?
+        .ok_or("wallet allocation is unavailable")?;
+    if address.orchard().is_none() || address.transparent().is_some() {
+        return Err("wallet allocation is not orchard-only");
+    }
+    Ok(address.encode(params))
 }
 
 fn zip321_payment_uri(destination: &str, amount_zat: &str) -> Result<String, &'static str> {

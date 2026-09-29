@@ -151,3 +151,28 @@ the stack is a separate, deliberate step:
 ```sh
 npm run infra:down
 ```
+
+## public-testnet keys
+
+`SSF_MODE=public-testnet` reads these keys. It also reads the same live scanner, Waku and Logos keys as real-demo (`SSF_SCANNER_SOCKET`, `SSF_SCANNER_ACCOUNT_ID`, `SSF_SCANNER_CONFIG`, `SSF_WAKU_CONTENT_TOPIC`, `SSF_WAKU_PEER_TIMEOUT_MS`, `WAKU_BOOTSTRAP_PEERS`, `LOGOSCTL`, `LOGOS_NODE_A`, `LOGOS_NODE_B`, `SSF_SELLER_PUBLIC_KEY`) and the shared seller keys (`SSF_DB_PATH`, `SSF_INVOICE_TTL_MS`, bind host/port, `SSF_ADAPTER_*` = `real`). Inline `SSF_ADMIN_TOKEN` is rejected. `SSF_MAX_CIPHERTEXT_BYTES` is not free-set: the ciphertext cap is the plaintext cap plus 32. No bootstrap peer is added when the Waku cluster keys are absent.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `SSF_MODE` | required | Must be `public-testnet`. |
+| `SSF_NETWORK` | required | Must be `test`. `regtest` and `main`/`mainnet` are rejected. |
+| `SSF_PUBLIC_ORIGIN` | required | `https://<host>` with no path. This deployment uses `https://store.agentmascot.app`. |
+| `SSF_MAX_PLAINTEXT_BYTES` | required | At most `8388608` (8 MiB). |
+| `SSF_MIN_CONFIRMATIONS` | optional | Defaults to `10`. Must be at least `3`. |
+| `SSF_MAX_HEALTH_AGE_MS` | required | At most `300000`. |
+| `SSF_EMBED_ORIGINS` | required | Comma-separated `https://` origins, or the literal `*`. |
+| `SSF_WAKU_CLUSTER_ID` | optional | Integer. Set only together with `SSF_WAKU_SHARDS`. Absent means no `live.waku.network`. |
+| `SSF_WAKU_SHARDS` | optional | Comma-separated integers. Set only together with `SSF_WAKU_CLUSTER_ID`. |
+| `SSF_MAX_OPEN_INVOICES_PER_BUYER` | optional | Defaults to `3`. Applies in every mode. |
+| `SSF_MAX_INVOICES_PER_MINUTE` | optional | Defaults to `30`. Applies in every mode. |
+| `SSF_ADMIN_TOKEN_FILE` | required | Absolute path to a `0600` admin token file. |
+| `SSF_SCANNER_SOCKET` | required | Absolute Unix socket path, at most 100 bytes. |
+| `SSF_SCANNER_ACCOUNT_ID` | required | Scanner account the seller pins. |
+| `SSF_SCANNER_CONFIG` | required | `0600` `scanner.json` whose `chain.network` is `test`. |
+| `SSF_WAKU_CONTENT_TOPIC` | required | Waku content topic. |
+| `SSF_WAKU_PEER_TIMEOUT_MS` | optional | Waku peer wait. Has a built-in default. |
+| `WAKU_BOOTSTRAP_PEERS` | required | Comma-separated wss multiaddrs already in the environment. |

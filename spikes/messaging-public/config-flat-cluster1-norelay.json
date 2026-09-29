@@ -1,0 +1,16 @@
+{
+  "logLevel": "INFO",
+  "listenAddress": "127.0.0.1",
+  "tcpPort": 30303,
+  "clusterId": 1,
+  "numShardsInNetwork": 8,
+  "relay": false,
+  "store": false,
+  "filter": true,
+  "lightpush": true,
+  "rlnRelay": false,
+  "peerExchange": false,
+  "discv5Discovery": false,
+  "websocketSupport": true,
+  "websocketPort": 8000
+}

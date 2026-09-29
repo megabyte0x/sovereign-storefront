@@ -1,0 +1,19 @@
+{
+  "shop": "Agent Mascot Books",
+  "books": [
+    {
+      "version": "gift-of-the-magi",
+      "title": "The Gift of the Magi",
+      "author": "O. Henry",
+      "cover": "Magi",
+      "blurb": "A Christmas story about a watch chain, a set of combs, and two gifts that cross in the mail. Public-domain text."
+    },
+    {
+      "version": "yellow-wallpaper",
+      "title": "The Yellow Wallpaper",
+      "author": "Charlotte Perkins Gilman",
+      "cover": "Yellow",
+      "blurb": "A short story of a rented room, a barred pattern, and a mind under a rest cure. Public-domain text."
+    }
+  ]
+}

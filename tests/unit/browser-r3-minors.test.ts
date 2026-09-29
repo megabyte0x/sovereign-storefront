@@ -7,6 +7,7 @@ import type { SellerResponse, WakuConfig, WakuSession } from '../../src/contract
 import { createWakuSession, type WakuNode } from '../../src/adapters/waku.ts';
 import { createCredentialAdapter } from '../../src/adapters/credentials.ts';
 import type { BrowserPurchase, CredentialAdapter, OrderStatus, PurchaseStore } from '../../src/contracts/types.ts';
+import { encodeDeliveryEnvelope } from '../../src/adapters/crypto.ts';
 import { createBrowserTransport, startBrowserApp, type ProductViewModel } from '../../src/browser/app.ts';
 import { createWakuOrderTransport } from '../../src/browser/waku-transport.ts';
 import { openPurchaseStore, type IDBFactoryLike } from '../../src/browser/purchases.ts';
@@ -192,6 +193,14 @@ describe('M3 ack is sent only after a verified decrypt', () => {
     const record = await purchaseFor(credentials, FIXTURE_PRODUCT.sellerKeyId);
     const calls: string[] = [];
     let acks = 0;
+    const ciphertext = new Uint8Array([1, 2, 3]);
+    const digestHex = createHash('sha256').update(ciphertext).digest('hex');
+    const encryptedEnvelope = encodeDeliveryEnvelope({
+      orderId: 'order-a',
+      productVersion: 'book-v1',
+      buyerKeyId: 'buyer',
+      digestHex,
+    }, new Uint8Array([1]));
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = new URL(String(input), 'http://127.0.0.1').pathname;
       calls.push(`${init?.method ?? 'GET'} ${path}`);
@@ -202,11 +211,11 @@ describe('M3 ack is sent only after a verified decrypt', () => {
       if (path === '/api/recover') {
         return json({
           orderId: 'order-a', productVersion: 'book-v1', buyerKeyId: 'buyer',
-          encryptedEnvelope: Buffer.from('not-an-envelope').toString('base64'),
+          encryptedEnvelope: Buffer.from(encryptedEnvelope).toString('base64'),
           packageId: 'aa'.repeat(32),
         });
       }
-      if (path.startsWith('/ciphertext/')) return new Response(new Uint8Array([1, 2, 3]));
+      if (path.startsWith('/ciphertext/')) return new Response(ciphertext);
       if (path === '/api/acknowledge') { acks += 1; return json({ ok: true }); }
       return new Response('not found', { status: 404 });
     });

@@ -19,6 +19,8 @@ export type AdminPublishDeps = {
   storage: StorageAdapter;
   logger: OperationalLogger;
   maxBodyBytes?: number;
+  /** Forwarded to publishProduct. Omitted keeps the real-demo 41-byte default. */
+  maxPlaintextBytes?: number;
 };
 
 export type AdminPublishHandler = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
@@ -133,6 +135,7 @@ export function createAdminPublishHandler(deps: AdminPublishDeps): AdminPublishH
         crypto: deps.crypto,
         storage: deps.storage,
         replicaId: 'replica',
+        ...(deps.maxPlaintextBytes === undefined ? {} : { maxPlaintextBytes: deps.maxPlaintextBytes }),
       });
       deps.logger.log({ event: 'admin.publish', ok: true, code: 201 });
       sendJson(res, 201, { version: manifest.version, ciphertextCid: manifest.ciphertextCid, replica: true });

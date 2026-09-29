@@ -11,6 +11,7 @@ import type {
   ChainIdentity,
   ReceiverAllocation,
   ReceiverRef,
+  ReceiptPool,
   ReceiptSource,
   ScanSnapshot,
 } from '../contracts/live.ts';
@@ -48,10 +49,16 @@ export class MemoryScanner implements Scanner, ReceiptSource {
   private accountId = 'fixture-account';
   private allocated = new Map<string, ReceiverAllocation>();
   private receiverByOutput = new Map<string, ReceiverRef>();
+  private poolByOutput = new Map<string, ReceiptPool>();
 
   /** Fixture-only: bind a receipt's outputId to the exact receiver it paid, so snapshot() reports real attribution. */
   setReceiptReceiver(outputId: string, receiver: ReceiverRef): void {
     this.receiverByOutput.set(outputId, receiver);
+  }
+
+  /** Fixture-only: report a receipt in a pool other than Orchard (NU6.3 Ironwood). */
+  setReceiptPool(outputId: string, pool: ReceiptPool): void {
+    this.poolByOutput.set(outputId, pool);
   }
 
   /** Fixture-only: set the chain identity's network label to match the configured product network. */
@@ -153,7 +160,7 @@ export class MemoryScanner implements Scanner, ReceiptSource {
         return {
           outputId: receipt.outputId,
           txid: hexId(receipt.outputId, 32),
-          pool: 'orchard' as const, outputIndex,
+          pool: this.poolByOutput.get(receipt.outputId) ?? 'orchard', outputIndex,
           accountId: receiver?.accountId ?? this.accountId,
           scope: receiver?.scope ?? 'external' as const,
           receiverHex: receiver?.receiverHex ?? '02'.repeat(43),

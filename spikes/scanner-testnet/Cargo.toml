@@ -1,0 +1,20 @@
+[package]
+name = "scanner-testnet-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+async-trait = "=0.1.92"
+getrandom = "=0.4.3"
+rand_core = "=0.10.1"
+rusqlite = "=0.37.0"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tonic = { version = "=0.14.6", features = ["tls-ring"] }
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc5", features = ["orchard", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc5", features = ["orchard"] }
+zakura_pczt = { package = "zakura-pczt", version = "=0.1.0-rc3", features = ["io-finalizer"] }
+zcash_keys = { package = "zakura-keys", version = "=1.2.0", features = ["orchard"] }
+zcash_protocol = { version = "=0.10.6", default-features = false, features = ["std"] }
+zip32 = { version = "=0.2.1", default-features = false }

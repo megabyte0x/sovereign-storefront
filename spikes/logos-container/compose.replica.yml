@@ -1,0 +1,10 @@
+name: logos-container-replica
+services:
+  logos-b:
+    image: ${LOGOS_IMAGE:-ssf-logosctl:0.2.3-amd64}
+    hostname: logos-b
+    volumes:
+      - ./state/node-b:/data
+    environment:
+      QT_QPA_PLATFORM: offscreen
+      LOGOS_LISTEN_PORT: "8091"

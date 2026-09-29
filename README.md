@@ -2,15 +2,27 @@
 
 ## Status
 
-Research and product hypothesis (sections 1–10 below). A bounded MVP now exists on `feat/mvp-build` against the approved design. **Approval of the plan is not evidence the product works.** The live integrated demo did **not** overall pass. Adapters are not PASS when live constructs memory. Replica absence fails fast. Skipped Waku and QR checks do not count as passing.
+Public testnet hosting and the seller embed are documented, but a live storefront is not evidence of a completed purchase. No `.runtime/public/report.json` is present in this worktree, so no public T01 stages or purchase result are reported here. T01 remains **NOT_RUN**: no wallet payment was authorized. CUA GUI coverage is separately **NOT_RUN**; no supported Driver platform/version or durable buyer-profile recovery was verified.
 
-Setup and executed evidence (do not treat the research sections as proof):
+Setup and executed evidence (do not treat the research or a rendered checkout as proof of payment):
 
+- [Public testnet self-hosting guide](docs/public-testnet.md) · [Seller embed guide](docs/embed.md)
+- [Demo results](docs/demo-results.md) — historical regtest results only; not public testnet evidence
 - [Runbook](docs/runbook.md) — setup, ports, key ownership, limits
 - [Design](docs/mvp-design.md) · [Design decisions](docs/design-decisions.md)
 - [Build plan](docs/mvp-build-plan.md)
 - [Integration gates A–C](docs/integration-report.md)
-- [Demo results](docs/demo-results.md)
+
+## Public testnet
+
+This testnet-only deployment uses a seller service and view-only scanner on a Raspberry Pi, with a separate Logos Storage replica on `ssf-replica` and Cloudflare Tunnel for the storefront. Testnet TAZ has no real value. Cloudflare terminates TLS and could alter JavaScript served to buyers; it cannot read encrypted files, Waku payloads or shielded payments merely by terminating TLS. Replica B keeps encrypted files and backups when the Pi's storage is down, but the storefront itself is offline while the Pi is down.
+
+- [Self-hosting and trust boundaries](docs/public-testnet.md)
+- [Add a Buy button to your site](docs/embed.md)
+
+T01 remains **NOT_RUN**: the bounded, disposable testnet-wallet runner, funded buyer wallet, and verified deployment-evidence preflight are not available in this worktree. If implemented and fully gated, that separate test-only wallet may send only after persistent-profile recovery and exact QR-to-invoice checks; automation must never access a user's personal wallet or the seller's spending seed. Funding from a verified faucet or a one-time external testnet transfer is a prerequisite, not purchase evidence. Completion requires two real testnet sends, an independent seller viewing-only receipt, and all eight validated stage results. No payment was initiated and no public purchase result is claimed.
+
+CUA GUI coverage is separately **NOT_RUN**. Driver platform/release and desktop support were not established or exercised; no Driver version was recorded. Profile persistence/recovery is unverified. The earlier Driver-owned checkout closed with its session, and the detached browser that reopened later was not proven to use the same durable profile. No structured Driver refusals were recorded because no qualified Driver run occurred; no CUA observations qualify as a pass. See the [plan's CUA scope and qualification reference](docs/superpowers/plans/2026-09-26-public-testnet-hosting/README.md#cua-scope-and-qualification-for-t01).
 
 ## Live demo (local target L)
 

@@ -238,6 +238,51 @@ test('decryptDownload rejects corruption before plaintext and returns an attachm
   expect(await decryptSsf1(key, ciphertext)).toEqual(FIXTURE_V1);
 });
 
+test('public-testnet publishes and decrypts a configured 8 MiB product', async () => {
+  const maxPlaintextBytes = 8 * 1024 * 1024;
+  const maxCiphertextBytes = maxPlaintextBytes + 32;
+  const plaintext = new Uint8Array(maxPlaintextBytes).fill(0x5a);
+  const storage = createMemoryStorageAdapter({ maxBytes: maxCiphertextBytes });
+  const credentials = createCredentialAdapter();
+  const buyer = await credentials.createPurchaseCredential();
+  const crypto = createCryptoAdapter({
+    credentials,
+    maxPlaintextBytes,
+  });
+  const published = await publishProduct({
+    dbPath,
+    version: 'book-large',
+    description: 'Large bounded fixture',
+    amountZat: '100000000',
+    network: 'test',
+    plaintext,
+    crypto,
+    storage,
+    replicaId: 'replica-b',
+    maxPlaintextBytes,
+  });
+  catalogue = openCatalogue({ dbPath, storage, maxCiphertextBytes, probes: probes() });
+  const ciphertext = await catalogue.getPublishedCiphertext('book-large');
+  expect(ciphertext.byteLength).toBe(maxCiphertextBytes);
+  const envelope = await crypto.sealDelivery({
+    orderId: 'order-large',
+    productVersion: 'book-large',
+    buyerKeyId: buyer.buyerKeyId,
+    productKeyRef: published.sellerKeyRef!,
+  });
+  const blob = await decryptDownload({
+    orderId: 'order-large',
+    productVersion: 'book-large',
+    buyerKeyId: buyer.buyerKeyId,
+    encryptedEnvelope: envelope,
+  }, ciphertext, {
+    crypto,
+    credentialId: buyer.credentialId,
+    maxCiphertextBytes,
+  });
+  expect(new Uint8Array(await blob.arrayBuffer())).toEqual(plaintext);
+}, 60_000);
+
 test('publish rejects oversize plaintext before upload', async () => {
   const storage = createMemoryStorageAdapter();
   const crypto = createCryptoAdapter();
