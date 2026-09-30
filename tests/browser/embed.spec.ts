@@ -16,7 +16,7 @@ const DESTINATION =
 
 test.use({
   launchOptions: {
-    executablePath: '/usr/bin/chromium',
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ?? '/usr/bin/chromium',
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   },
 });

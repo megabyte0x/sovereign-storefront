@@ -16,7 +16,7 @@ import {
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ORIGIN = 'http://127.0.0.1:4175';
-const CHROMIUM = '/usr/bin/chromium';
+const CHROMIUM = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ?? '/usr/bin/chromium';
 const CHROMIUM_ARGS = ['--no-sandbox', '--disable-dev-shm-usage'];
 const CONFIG_DESTINATION =
   'uregtest1zconfigdestinationqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
@@ -130,8 +130,8 @@ test('checkout requests stay first-party with no credentials in URLs or plaintex
 
   const scripts = await page.locator('script').evaluateAll((nodes) =>
     nodes.map((node) => ({
-      src: node.getAttribute('src'),
-      text: node.textContent ?? '',
+      src: (node as unknown as { getAttribute(name: string): string | null }).getAttribute('src'),
+      text: (node as unknown as { textContent: string | null }).textContent ?? '',
     })),
   );
   for (const script of scripts) {

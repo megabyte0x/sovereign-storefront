@@ -39,7 +39,7 @@ export type VisibleStatus = {
   exceptions: string[];
 };
 
-type RenderRoot = {
+export type RenderRoot = {
   innerHTML: string;
   querySelector(selector: string): unknown;
 };
@@ -138,7 +138,7 @@ export function buyerVisibleStatus(status: OrderStatus): VisibleStatus {
   const verificationLabel = status.verification === 'unavailable'
     ? 'Scanner unavailable'
     : status.verification === 'stale'
-      ? 'Scanner stale — reconnect'
+      ? 'Scanner stale: reconnect'
       : 'Verification available';
   return {
     paymentLabel,
@@ -378,6 +378,22 @@ export function renderPurchasesView(root: RenderRoot, input: { purchases: Browse
   }
 }
 
+export type BrowserViewRenderer = {
+  product: typeof renderProductView;
+  checkout: typeof renderCheckoutView;
+  status: typeof renderStatusView;
+  purchases: typeof renderPurchasesView;
+  catalogue: (root: RenderRoot, input: {
+    items: ProductSummary[];
+    product: ProductViewModel;
+    availability: ServiceAvailability;
+    sellerKeyId: string;
+    minConfirmations: number;
+  }) => void;
+  missing: (root: RenderRoot) => void;
+  error: (root: RenderRoot) => void;
+};
+
 export type BrowserHooks = {
   buyerVisibleStatus: typeof buyerVisibleStatus;
   encodeZip321: typeof encodeZip321;
@@ -475,6 +491,7 @@ export type PublicWakuConfig = {
 export type TransportMode = 'fixture' | 'waku' | 'unavailable';
 
 export type BrowserAppDeps = {
+  renderer?: BrowserViewRenderer;
   fetch?: typeof fetch;
   credentials?: CredentialAdapter;
   openStore?: (options: PurchaseStoreOptions) => Promise<PurchaseStore>;
@@ -757,7 +774,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
   }
 
   const showProduct = (): void => {
-    renderProductView(root, {
+    (deps.renderer?.product ?? renderProductView)(root, {
       product,
       availability,
       sellerKeyId: product.sellerKeyId,
@@ -768,6 +785,16 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
   const showHome = (): void => {
     if (catalogueItems.length === 0) {
       showProduct();
+      return;
+    }
+    if (deps.renderer) {
+      deps.renderer.catalogue(root, {
+        items: catalogueItems,
+        product,
+        availability,
+        sellerKeyId: product.sellerKeyId,
+        minConfirmations,
+      });
       return;
     }
     const rows = catalogueItems.map((item) => (
@@ -786,7 +813,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
   };
 
   const showCheckout = (purchase: BrowserPurchase): void => {
-    renderCheckoutView(root, {
+    (deps.renderer?.checkout ?? renderCheckoutView)(root, {
       purchase,
       now: Date.now(),
       persisted: true,
@@ -798,7 +825,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
     const store = await storePromise;
     const purchases = await store.list();
     const skipped = (purchases as { skipped?: number }).skipped ?? 0;
-    renderPurchasesView(root, {
+    (deps.renderer?.purchases ?? renderPurchasesView)(root, {
       purchases,
       ...(skipped > 0 ? { notice: 'Some purchases could not be read' } : {}),
     });
@@ -806,22 +833,27 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
 
   const onBuy = async (): Promise<void> => {
     if (!allowNewCheckout(availability)) return;
-    const store = await storePromise;
-    const draft = {
-      version: 1 as const,
-      requestId: newRequestId(),
-      productVersion: product.version,
-      sellerOrigin: origin,
-      sellerKeyId: product.sellerKeyId,
-    };
-    await beginCheckout(store, checkoutTransport, credentials, draft, { network: checkoutNetwork });
-    const saved = await store.get(draft.requestId);
-    if (!saved) {
-      throw new Error('purchase draft was not persisted');
+    try {
+      const store = await storePromise;
+      const draft = {
+        version: 1 as const,
+        requestId: newRequestId(),
+        productVersion: product.version,
+        sellerOrigin: origin,
+        sellerKeyId: product.sellerKeyId,
+      };
+      await beginCheckout(store, checkoutTransport, credentials, draft, { network: checkoutNetwork });
+      const saved = await store.get(draft.requestId);
+      if (!saved) {
+        throw new Error('purchase draft was not persisted');
+      }
+      showCheckout(saved);
+      postedPurchase = saved;
+      postCheckout(saved);
+    } catch {
+      if (deps.renderer) deps.renderer.error(root);
+      else root.innerHTML = `<section id="view-error"><h1>Checkout could not start</h1><p>Your purchase record may still be in this browser. Open My purchases to inspect it.</p>${navPurchasesMarkup()}</section>`;
     }
-    showCheckout(saved);
-    postedPurchase = saved;
-    postCheckout(saved);
   };
 
   const onCopy = async (target: unknown): Promise<void> => {
@@ -861,7 +893,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
       notice = 'Backup could not be imported';
     }
     if (typeof input.value === 'string') input.value = '';
-    renderPurchasesView(root, { purchases: await store.list(), notice });
+    (deps.renderer?.purchases ?? renderPurchasesView)(root, { purchases: await store.list(), notice });
   };
 
   const onOpenPurchase = async (requestId: string): Promise<void> => {
@@ -875,7 +907,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
       // purchase's credential, for both the status and the recover call.
       await withTransport(credentialId, async (transport) => {
         const orderStatus = await transport.status(orderId, credentialId);
-        renderStatusView(root, orderStatus);
+        (deps.renderer?.status ?? renderStatusView)(root, orderStatus);
         try {
           const pkg = await transport.recover(orderId, credentialId);
           const maxCiphertextBytes = checkoutNetwork === 'regtest'
@@ -903,7 +935,7 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
     } catch {
       // No verified answer (Waku failed to start, no peers, timeout): show the
       // existing "verification unavailable" state. Never retry over HTTP.
-      renderStatusView(root, VERIFICATION_UNAVAILABLE);
+      (deps.renderer?.status ?? renderStatusView)(root, VERIFICATION_UNAVAILABLE);
     }
   };
 
@@ -936,7 +968,8 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
   });
 
   if (routeProduct && !routeFound) {
-    root.innerHTML = `<section id="view-missing"><h1>Product not found</h1>${navPurchasesMarkup()}</section>`;
+    if (deps.renderer) deps.renderer.missing(root);
+    else root.innerHTML = `<section id="view-missing"><h1>Product not found</h1>${navPurchasesMarkup()}</section>`;
   } else if (routeProduct) {
     showProduct();
   } else {
@@ -947,10 +980,5 @@ export async function startBrowserApp(root: RenderRoot, deps: BrowserAppDeps = {
 }
 
 exposeHooks();
-const doc = (globalThis as { document?: { getElementById(id: string): RenderRoot | null } }).document;
-const appRoot = doc?.getElementById('app');
-if (appRoot) {
-  void startBrowserApp(appRoot);
-}
 
 export { BEARER_SECRET_WARNING };

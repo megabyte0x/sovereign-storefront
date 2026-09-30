@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { build, defineConfig, type Plugin } from 'vite';
+import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 function embedBundle(): Plugin {
   let built = false;
@@ -37,7 +39,8 @@ function embedBundle(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [embedBundle()],
+  plugins: [react(), tailwindcss(), embedBundle()],
+  resolve: { alias: { '@': resolve('src') } },
   build: {
     outDir: 'dist/browser',
     emptyOutDir: true,

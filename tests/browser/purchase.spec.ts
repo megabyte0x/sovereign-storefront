@@ -34,7 +34,7 @@ declare const location: { origin: string };
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ORIGIN = 'http://127.0.0.1:4174';
-const CHROMIUM = '/usr/bin/chromium';
+const CHROMIUM = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ?? '/usr/bin/chromium';
 const CHROMIUM_ARGS = ['--no-sandbox', '--disable-dev-shm-usage'];
 
 const DESTINATION =
@@ -139,6 +139,49 @@ test('ordinary flow has no email or registration requirement', async ({ page }) 
   expect(await page.locator('input[type="email"]').count()).toBe(0);
   expect(await page.locator('input[type="password"]').count()).toBe(0);
   await expect(page.locator('#app')).not.toContainText(/register|sign up|create account/i);
+});
+
+test('buyer interface gives product and purchase recovery distinct navigation', async ({ page }) => {
+  await ready(page);
+  await expect(page.getByRole('banner')).toContainText('Sovereign Storefront');
+  await expect(page.getByRole('main')).toContainText('Purchase details');
+  await expect(page.getByRole('button', { name: 'My purchases' })).toBeVisible();
+  await expect(page.locator('#view-catalogue a[href="/p/book-v1"]')).toBeVisible();
+  await expect(page.locator('#testnet-badge')).toHaveCount(1);
+  await expect(page.locator('#confirmation-floor')).toHaveCount(1);
+});
+
+test('wallet request disappears when an open invoice expires', async ({ page }) => {
+  await page.clock.install();
+  await ready(page);
+  await page.locator('#buy').click();
+  await expect(page.locator('#open-uri')).toBeVisible();
+  await page.clock.fastForward(86_410_000);
+  await expect(page.locator('#payment[data-payment="blocked"]')).toBeVisible();
+  await expect(page.locator('#open-uri')).toHaveCount(0);
+});
+
+test('multi-item catalogue keeps purchase recovery accessible', async ({ page }) => {
+  await page.route('**/api/products', async (route) => {
+    const response = await route.fetch();
+    const products = await response.json() as Array<{ version: string; title: string }>;
+    await route.fulfill({ response, json: [...products, { ...products[0], version: 'book-v2', title: 'Second book' }] });
+  });
+  await ready(page);
+  await expect(page.locator('#view-catalogue a[href="/p/book-v2"]')).toBeVisible();
+  await page.locator('#nav-purchases').click();
+  await expect(page.locator('#view-purchases')).toBeVisible();
+  await expect(page.locator('#backup-warning')).toContainText('bearer');
+  await expect(page.locator('#export-backup')).toBeVisible();
+  await expect(page.locator('#import-backup')).toBeVisible();
+});
+
+test('checkout request failure remains visible with recovery navigation', async ({ page }) => {
+  await ready(page);
+  await page.route('**/api/orders', (route) => route.fulfill({ status: 503, body: 'unavailable' }));
+  await page.locator('#buy').click();
+  await expect(page.getByRole('alert')).toContainText('Checkout could not start');
+  await expect(page.locator('#nav-purchases')).toBeVisible();
 });
 
 test('product view shows fixed ZEC price, file details, seller identity and testnet badge', async ({ page }) => {

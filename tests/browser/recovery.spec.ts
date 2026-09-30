@@ -6,7 +6,7 @@ import { expect, test, chromium, type Page } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const ORIGIN = 'http://127.0.0.1:4173';
+let ORIGIN = '';
 
 type Harness = {
   purchases: typeof import('../../src/browser/purchases.ts');
@@ -28,7 +28,7 @@ declare const document: {
     setAttribute(name: string, value: string): void;
   } | null;
 };
-const CHROMIUM = '/usr/bin/chromium';
+const CHROMIUM = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ?? '/usr/bin/chromium';
 const CHROMIUM_ARGS = ['--no-sandbox', '--disable-dev-shm-usage'];
 
 const HARNESS_HTML = `<!DOCTYPE html>
@@ -176,7 +176,7 @@ test.beforeAll(async () => {
   vite = await createServer({
     root: ROOT,
     appType: 'custom',
-    server: { host: '127.0.0.1', port: 4173, strictPort: true },
+    server: { host: '127.0.0.1', port: 0 },
     plugins: [{
       name: 'recovery-harness',
       configureServer(server) {
@@ -193,6 +193,9 @@ test.beforeAll(async () => {
     }],
   });
   await vite.listen();
+  const address = vite.httpServer?.address();
+  if (!address || typeof address === 'string') throw new Error('recovery harness did not bind a TCP port');
+  ORIGIN = `http://127.0.0.1:${address.port}`;
 });
 
 test.afterAll(async () => {

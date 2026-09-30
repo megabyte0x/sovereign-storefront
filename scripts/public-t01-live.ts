@@ -190,7 +190,7 @@ export function createPlaywrightDriver(options: { headless?: boolean } = {}): Br
           const uriEl = popup.locator('#zip321-uri');
           await uriEl.waitFor({ timeout: 150_000 });
           const shown = (await uriEl.textContent())?.trim() ?? '';
-          const svg = await popup.locator('[data-zip321-qr] svg').evaluate((el) => el.outerHTML);
+          const svg = await popup.locator('[data-zip321-qr] svg').evaluate((el) => (el as unknown as { outerHTML: string }).outerHTML);
           const bitmap = rasterizeSvg(svg);
           const qr = decodeQr(bitmap.data, bitmap.width, bitmap.height)?.data ?? '';
           const created = (await readPurchases(popup)).filter((row) => !before.has(row.requestId)

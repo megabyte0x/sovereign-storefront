@@ -124,7 +124,7 @@ test('embed buy opens a testnet invoice and the shop receives invoiced', async (
   await expect(uri).toBeVisible({ timeout: 150_000 });
   const shown = (await uri.textContent())?.trim() ?? '';
   expect(shown).toMatch(/^zcash:utest1/);
-  const svg = await popup.locator('[data-zip321-qr] svg').evaluate((el) => el.outerHTML);
+  const svg = await popup.locator('[data-zip321-qr] svg').evaluate((el) => (el as unknown as { outerHTML: string }).outerHTML);
   const bitmap = rasterizeSvg(svg);
   const decoded = decodeQr(bitmap.data, bitmap.width, bitmap.height);
   expect(decoded?.data, 'jsqr failed to decode the rendered QR').toBe(shown);
