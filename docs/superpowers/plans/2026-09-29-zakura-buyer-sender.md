@@ -3,6 +3,9 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **User direction (2026-09-29):** implement option 2 from the zingo-cli incident review. Do not interleave test cases with development: Tasks 1–5 build the feature, Task 6 writes every test, Task 7 runs the live verification.
+>
+> **User direction (2026-09-30):** keep the fresh funded VPS wallet as the final T01 buyer. Historical zingo wallet migration, backup, and archival in Tasks 7.1–7.4 and 7.7 are waived. Do not access or delete that older wallet.
+> The ARM-only `pay` build-step timing in Task 7.5 is also superseded by user direction. The VPS `status` wall time was measured at 2.14 seconds; no additional payment is authorized or needed to time the build step.
 
 **Goal:** Replace zingo-cli (and with it Nym, the local zingolib patch, the two build variants and text parsing) as the T01 buyer wallet with a small Rust sender built on the Zakura Common / Zakura wallet crates the seller scanner already pins. Make every send idempotent and self-resolving so a failed broadcast never needs the manual expire-and-reset routine.
 
@@ -227,6 +230,6 @@ Preconditions: purchase A is `sent` in `buyer-sends.json`, the T01 runner has ex
 | Persist before broadcast | Attempt file exists whenever exit is 0/3/4 (4.6, 6.1) |
 | No manual expiry | `resolve` sets `expired` from chain data (5.5, 6.2) |
 | Never a second transaction per invoice | Exit 4 guard plus pending-blocks rule (4.1, 5.5, 6.1, 6.2) |
-| Same wallet and funds | UFVK digest equality and balance parity (7.3, 7.4) |
+| Final buyer wallet and funds (revised by 2026-09-30 user direction) | Fresh funded VPS wallet; two sender payments, two persisted attempts, zero pending, 99,780,000 zat spendable after both amount-plus-fee deductions. Original-wallet parity and archival are waived. |
 | Real payment | Purchase B receipt in the seller scanner and the checker (7.6) |
 | One crypto family | `cargo tree -d` shows no duplicate zakura/zcash crates (1.2) |

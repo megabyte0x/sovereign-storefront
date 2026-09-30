@@ -1,6 +1,27 @@
 # Demo results (Task 10)
 
-This is an execution record. It is **not** a production-readiness statement, security audit, or capacity plan. Skipped checks do not count as passing. Overall live demo: **not pass**.
+This is an execution record. It is **not** a production-readiness statement, security audit, or capacity plan. Skipped checks do not count as passing. The historical local regtest run below did not pass; the separate public-testnet T01 run recorded here passed.
+
+## Public-testnet T01 on the VPS — 2026-09-29
+
+**PASS: eight of eight stages.** The run completed at 18:04:53 UTC; its private report was then finalized and independently validated. Playwright 1.55 drove persistent, isolated browser profiles on `ssf-replica` with its matching Chromium headless shell. The buyer was a fresh VPS testnet wallet using `ssf-buyer-sender 0.1.0 (zakura-client-backend 0.1.0-rc5)` against `https://testnet.zec.rocks:443/`.
+
+One approved faucet claim funded that buyer with 1 TAZ. It did not count as a purchase. The sender paid two distinct 100,000-zat invoices with a 10,000-zat fee each; its final status was 99,780,000 spendable zatoshis, two sends, zero pending. The seller scanner and a separate view-only checker matched both mined payments. The seller, scanner, Logos origin, independent checker, and browser service were healthy after the run. Both seller orders had exactly one delivery package and reached `acknowledged` after their existing buyer profiles were reopened without another payment.
+
+| Stage | Result | Evidence |
+|---|---|---|
+| `embed-invoice` | PASS | Popup invoice persisted; QR matched its URI; the same order survived a browser restart and backup import into a fresh profile before payment. |
+| `receipt-observed` | PASS | Seller scanner matched the first sender transaction to a 100,000-zat Ironwood receipt. |
+| `three-confirmations` | PASS | First payment reached three confirmations and the seller reported it paid. |
+| `bytes-match` | PASS | Decrypted *Gift of the Magi* plaintext matched the published fixture SHA-256. |
+| `recover-without-repay` | PASS | Relaunched buyer profile recovered the same plaintext without another send. |
+| `restart-between` | PASS | Seller stopped with the second payment at one confirmation; the independent checker observed at least three while it was stopped. After restart the seller confirmed the payment, and the delivered plaintext matched the second fixture. |
+| `origin-stop` | PASS | Purchase A's backup worked in a fresh profile while Logos origin A was stopped; replica B served matching plaintext, then A was restored. |
+| `funds-received` | PASS | Independent view-only checker found both mined 100,000-zat payments. |
+
+The origin and replica now share the VPS, so `origin-stop` proves node fallback on one host, not survival of a host outage. This was a fresh funded buyer and a fresh T01 run. The user chose the new VPS wallet as the final T01 buyer and waived importing or archiving the earlier zingo wallet on offline `haprocrates`; no backup or deletion was performed. The first completed run closed its browser pages at download start, before Waku acknowledgments finished. A no-payment reopen of each profile completed both acknowledgments; the runner now waits for the seller's acknowledgment before accepting a download.
+
+## Historical local regtest run
 
 Network label for every live payment below: **zakura/regtest**. `status.node.chain` was `"test"` while `network` was `Regtest`. That is not public Zcash testnet.
 

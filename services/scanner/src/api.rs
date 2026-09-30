@@ -355,7 +355,7 @@ where
         SocketProbe::Stale => {
             after_probe();
             match parent
-                .remove_socket_if_identity(socket_name, identity)
+                .remove_socket_if_identity(socket_name, &identity)
                 .map_err(|_| "scanner stale socket is unsafe")?
             {
                 true => Ok(()),
@@ -471,7 +471,7 @@ impl Drop for BoundSocket<'_> {
     fn drop(&mut self) {
         let _ = self
             .parent
-            .remove_socket_if_identity(self.socket_name, self.identity);
+            .remove_socket_if_identity(self.socket_name, &self.identity);
     }
 }
 

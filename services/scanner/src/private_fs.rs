@@ -32,10 +32,13 @@ pub struct PrivateDir {
 
 /// Stable identity captured from a validated directory entry before an
 /// operation that must never delete a later replacement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct SocketIdentity {
     device: u64,
     inode: u64,
+    // Keep the observed inode allocated until the pathname check and unlink.
+    // A new socket can otherwise reuse its number immediately after removal.
+    _observed: OwnedFd,
 }
 
 impl PrivateDir {
@@ -176,12 +179,19 @@ impl PrivateDir {
         name: &str,
     ) -> Result<Option<SocketIdentity>, &'static str> {
         validate_component(name)?;
-        match fstatat(&self.dir, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Ok(stat) => {
+        match openat(
+            &self.dir,
+            name,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(observed) => {
+                let stat = fstat(&observed).map_err(|_| "private socket cannot be inspected")?;
                 validate_socket_stat(&stat)?;
                 Ok(Some(SocketIdentity {
                     device: stat.st_dev,
                     inode: stat.st_ino,
+                    _observed: observed,
                 }))
             }
             Err(Errno::ENOENT) => Ok(None),
@@ -195,17 +205,13 @@ impl PrivateDir {
     pub(crate) fn remove_socket_if_identity(
         &self,
         name: &str,
-        expected: SocketIdentity,
+        expected: &SocketIdentity,
     ) -> Result<bool, &'static str> {
         validate_component(name)?;
         match fstatat(&self.dir, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(stat) => {
                 validate_socket_stat(&stat)?;
-                let observed = SocketIdentity {
-                    device: stat.st_dev,
-                    inode: stat.st_ino,
-                };
-                if observed != expected {
+                if stat.st_dev != expected.device || stat.st_ino != expected.inode {
                     return Ok(false);
                 }
                 unlinkat(&self.dir, name, UnlinkatFlags::NoRemoveDir)

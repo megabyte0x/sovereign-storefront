@@ -32,7 +32,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RUNTIME = path.join(ROOT, '.runtime/public');
 const STATE_FILE = path.join(RUNTIME, 't01-run.json');
-const PROFILES = path.join(RUNTIME, 't01-profiles');
+const PROFILES = process.env.SSF_T01_PROFILES ?? path.join(RUNTIME, 't01-profiles');
 const DOWNLOADS = path.join(RUNTIME, 't01-downloads');
 const REPORT = path.join(RUNTIME, 'report.json');
 const FIXTURES = path.join(RUNTIME, 'fixtures/fixtures.json');
@@ -54,6 +54,19 @@ const decodeQr: JsQrFn = typeof jsQrModule === 'function'
 function privateDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
+}
+
+function browserProfileDir(dir: string): void {
+  privateDir(dir);
+  const user = process.env.SSF_T01_BROWSER_USER;
+  if (!user) return;
+  const root = path.resolve(PROFILES);
+  const profile = path.resolve(dir);
+  if (!/^[a-z_][a-z0-9_-]*$/.test(user) || !profile.startsWith(`${root}${path.sep}`)) {
+    throw new Error('browser profile path or user is invalid');
+  }
+  const result = spawnSync('chown', ['-R', `${user}:${user}`, root]);
+  if (result.status !== 0 || result.error) throw new Error('browser profile ownership could not be set');
 }
 
 function writePrivateJson(file: string, value: unknown): void {
@@ -126,12 +139,16 @@ export function createPlaywrightDriver(options: { headless?: boolean } = {}): Br
   const open = async (profile: string): Promise<BrowserContext> => {
     const existing = contexts.get(profile);
     if (existing) return existing;
-    privateDir(profile);
+    browserProfileDir(profile);
+    const browserDownloads = path.join(PROFILES, '.downloads');
+    browserProfileDir(browserDownloads);
     const context = await chromium.launchPersistentContext(profile, {
       executablePath: process.env.SSF_T01_CHROMIUM ?? '/usr/bin/chromium',
       headless: options.headless ?? true,
+      chromiumSandbox: true,
       acceptDownloads: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      downloadsPath: browserDownloads,
+      args: ['--disable-dev-shm-usage'],
     });
     contexts.set(profile, context);
     return context;
@@ -223,9 +240,13 @@ export function createPlaywrightDriver(options: { headless?: boolean } = {}): Br
     async importBackup(profile, file) {
       await withPage(profile, async (page) => {
         await openPurchases(page);
-        await page.locator('#import-backup').setInputFiles(file);
+        await page.locator('#import-backup').setInputFiles({
+          name: path.basename(file),
+          mimeType: 'application/octet-stream',
+          buffer: readFileSync(file),
+        });
         const status = page.locator('#import-status');
-        await status.waitFor({ timeout: 30_000 });
+        await status.filter({ hasText: 'Backup imported' }).waitFor({ timeout: 30_000 });
         if ((await status.textContent())?.trim() !== 'Backup imported') throw new Error('backup import refused');
       });
     },
@@ -236,13 +257,19 @@ export function createPlaywrightDriver(options: { headless?: boolean } = {}): Br
       return withPage(profile, async (page) => {
         const downloaded = page.waitForEvent('download', { timeout: 180_000 }).catch(() => null);
         if ((await openOrder(page, requestId)) !== 'Paid') return null;
+        const orderId = (await readPurchases(page)).find((row) => row.requestId === requestId)?.orderId;
+        if (!orderId) return null;
         const download = await downloaded;
         if (!download || !download.suggestedFilename().endsWith('.bin')) return null;
         privateDir(DOWNLOADS);
         const target = path.join(DOWNLOADS, `${requestId}-${Date.now()}.bin`);
         await download.saveAs(target);
         chmodSync(target, 0o600);
-        return createHash('sha256').update(readFileSync(target)).digest('hex');
+        const digest = createHash('sha256').update(readFileSync(target)).digest('hex');
+        // The storefront sends its Waku acknowledgement after starting the
+        // download. Keep the page and its transport alive until the seller
+        // records it; closing here can cancel an otherwise valid ack.
+        return (await waitForSellerAcknowledgement(orderId)) ? digest : null;
       });
     },
     async closeAll() {
@@ -253,8 +280,30 @@ export function createPlaywrightDriver(options: { headless?: boolean } = {}): Br
 }
 
 function ssh(script: string, timeoutMs = 120_000): { code: number; stdout: string } {
-  const result = spawnSync('tailscale', ['ssh', PI, 'sh', '-s'], { input: script, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+  const local = process.env.SSF_T01_LOCAL_VPS === '1';
+  const result = spawnSync(local ? 'sh' : 'tailscale', local ? ['-s'] : ['ssh', PI, 'sh', '-s'], {
+    input: script, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024,
+  });
   return { code: result.error || result.signal ? 1 : result.status ?? 1, stdout: result.stdout ?? '' };
+}
+
+async function waitForSellerAcknowledgement(orderId: string): Promise<boolean> {
+  if (!/^[0-9a-f]{32}$/.test(orderId)) return false;
+  const script = `set -eu
+docker exec -i ssf-public-seller-1 node -e '
+const fs=require("fs");const {DatabaseSync}=require("node:sqlite");
+const env=Object.fromEntries(fs.readFileSync(process.env.SSF_ENV_FILE,"utf8").split(/\\n/).filter(line=>line.includes("=")).map(line=>[line.slice(0,line.indexOf("=")),line.slice(line.indexOf("=")+1)]));
+const db=new DatabaseSync(env.SSF_DB_PATH,{readOnly:true});
+const row=db.prepare("SELECT state FROM delivery_state WHERE order_id=?").get("${orderId}");
+process.stdout.write(row?.state==="acknowledged"?"yes":"no");'
+`;
+  const deadline = Date.now() + 60_000;
+  do {
+    const result = ssh(script, 10_000);
+    if (result.code === 0 && result.stdout.trim() === 'yes') return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  } while (true);
 }
 
 const SELLER_SNAPSHOT_SCRIPT = String.raw`set -eu
@@ -442,7 +491,8 @@ export async function preflightChecks(): Promise<string[]> {
     return status.spendableZat >= BigInt(needed) * (BigInt(AMOUNT_ZAT) + FEE_RESERVE_ZAT);
   });
   if (!state) {
-    await check('browser profile directory already used by an earlier run', async () => !existsSync(PROFILES));
+    await check('browser profile directory already used by an earlier run', async () =>
+      !['a', 'a-import', 'b', 'origin'].some((label) => existsSync(path.join(PROFILES, label))));
   }
   return blockers;
 }
@@ -452,7 +502,7 @@ function liveDeps(driver: BrowserDriver): T01Deps {
     products: [...PRODUCTS],
     expectedPlaintextSha256: fixtures(),
     amountZat: AMOUNT_ZAT,
-    pollMs: 10_000,
+    pollMs: 2_000,
     timeoutMs: 45 * 60_000,
     freshProfile: (label) => path.join(PROFILES, label),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -481,7 +531,7 @@ function liveDeps(driver: BrowserDriver): T01Deps {
 /** No-payment browser rehearsal: invoice, relaunch recovery, backup export/import, QR check. */
 async function dryRun(): Promise<number> {
   const driver = createPlaywrightDriver();
-  const root = path.join(RUNTIME, 't01-dry-run', String(Date.now()));
+  const root = path.join(PROFILES, 'dry-run', String(Date.now()));
   try {
     const profile = path.join(root, 'buyer');
     const invoice = await driver.openInvoice(profile, PRODUCTS[0]);

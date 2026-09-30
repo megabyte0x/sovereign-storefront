@@ -144,7 +144,8 @@ export function parsePublicCapture(text: string): PublicCapture {
 }
 
 export function collectPublicCapture(): PublicCapture {
-  const result = spawnSync('tailscale', ['ssh', PUBLIC_TARGET, 'sh', '-s'], {
+  const local = process.env.SSF_T01_LOCAL_VPS === '1';
+  const result = spawnSync(local ? 'sh' : 'tailscale', local ? ['-s'] : ['ssh', PUBLIC_TARGET, 'sh', '-s'], {
     input: PUBLIC_REMOTE_SCRIPT,
     encoding: 'utf8',
     timeout: 30_000,
